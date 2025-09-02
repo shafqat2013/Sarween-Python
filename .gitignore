@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.pyc
+
+# Project artifacts (keep out of git)
+mini_captures/
+*.npy
+mini_database.csv
