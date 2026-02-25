@@ -1,0 +1,14 @@
+{
+  "map_path": "dnd1.jpg",
+  "mtime": 1756804444,
+  "size": 2635437,
+  "cols": 23,
+  "rows": 16,
+  "screen_w": 2560,
+  "screen_h": 1600,
+  "border_ratio": 0.1,
+  "alpha": 0.6,
+  "proc_w": 1280,
+  "proc_h": 720,
+  "print_mode": false
+}

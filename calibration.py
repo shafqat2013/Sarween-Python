@@ -1,8 +1,11 @@
+# calibration.py
 import os
 import cv2
 import numpy as np
 import time
 import setup as s
+import json
+import hashlib
 
 from screeninfo import get_monitors
 
@@ -37,6 +40,10 @@ _BLENDED_WINDOW_OPEN = False
 BLENDED_WINDOW_NAME = "Blended ArUco Markers"
 BLENDED_OUTPUT_PATH = "blended_output.jpg"
 
+# NEW: cache directory for blended outputs
+BLENDED_CACHE_DIR = "blended_cache"
+_BLENDED_META_PATH = None
+
 # NEW: window sizing helper (resize only once)
 _WINDOW_SIZED = set()
 def _ensure_window(name: str, w: int, h: int):
@@ -52,6 +59,52 @@ def _get_mode() -> str:
     cfg = s.load_last_selection() or {}
     mode = (cfg.get("mode") or "self_hosted").strip().lower()
     return mode if mode in ("foundry", "self_hosted") else "self_hosted"
+
+def _get_map_path() -> str:
+    cfg = s.load_last_selection() or {}
+    p = (cfg.get("map_path") or "maps/dnd1.jpg")
+    return str(p)
+
+def _make_blended_cache_key(map_path: str, cols: int, rows: int, screen_w: int, screen_h: int) -> str:
+    try:
+        st = os.stat(map_path)
+        mtime = int(st.st_mtime)
+        fsize = int(st.st_size)
+    except Exception:
+        mtime = 0
+        fsize = 0
+    payload = {
+        "map_path": os.path.basename(map_path),
+        "mtime": mtime,
+        "size": fsize,
+        "cols": int(cols),
+        "rows": int(rows),
+        "screen_w": int(screen_w),
+        "screen_h": int(screen_h),
+        "border_ratio": float(border_ratio),
+        "alpha": float(alpha),
+        "proc_w": int(PROC_WARP_W),
+        "proc_h": int(PROC_WARP_H),
+        "print_mode": bool(PRINT_MODE),
+    }
+    raw = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return hashlib.md5(raw).hexdigest(), payload
+
+def _set_blended_paths_for_key(key: str):
+    global BLENDED_OUTPUT_PATH, _BLENDED_META_PATH
+    os.makedirs(BLENDED_CACHE_DIR, exist_ok=True)
+    BLENDED_OUTPUT_PATH = os.path.join(BLENDED_CACHE_DIR, f"blended_{key}.jpg")
+    _BLENDED_META_PATH = os.path.join(BLENDED_CACHE_DIR, f"blended_{key}.json")
+
+def _write_blended_meta(payload: dict):
+    global _BLENDED_META_PATH
+    if not _BLENDED_META_PATH:
+        return
+    try:
+        with open(_BLENDED_META_PATH, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception:
+        pass
 
 
 def get_blended_display_image(allow_generate=False):
@@ -78,7 +131,7 @@ def get_blended_display_image(allow_generate=False):
 
 
 def show_blended_display_window():
-    # NEW: In Foundry mode, never show this window
+    # In Foundry mode, never show this window
     if _get_mode() == "foundry":
         return
 
@@ -117,15 +170,13 @@ def _foundry_wait_for_scene_grid():
 
     print("[CAL] Foundry mode: waiting for Foundry sceneInfo... (press ESC in this window to cancel)")
 
-    # tiny OpenCV window to allow ESC cancel without adding tkinter
     name = "Foundry Wait"
     _ensure_window(name, 520, 120)
 
     while True:
-        # request repeatedly (harmless)
         try:
             fo.request_scene_info()
-        except Exception as e:
+        except Exception:
             pass
 
         info = None
@@ -159,7 +210,7 @@ def _foundry_wait_for_scene_grid():
 
         cv2.imshow(name, canvas)
         key = cv2.waitKey(250) & 0xFF
-        if key == 27:  # ESC
+        if key == 27:
             cv2.destroyWindow(name)
             raise SystemExit("Cancelled waiting for Foundry scene info.")
 
@@ -365,7 +416,7 @@ def generate_grid_with_sliders(img):
             break
 
         key = cv2.waitKey(30) & 0xFF
-        if key == 27:  # ESC
+        if key == 27:
             running[0] = False
 
     cv2.destroyWindow(window_name)
@@ -413,9 +464,10 @@ def generate_aruco_marker_tiles(cell_px, border_px):
 def prepare_map_asset():
     mode = _get_mode()
 
-    background_img = cv2.imread('maps/dnd1.jpg')
+    map_path = _get_map_path()
+    background_img = cv2.imread(map_path)
     if background_img is None:
-        raise FileNotFoundError("Could not load maps/dnd1.jpg")
+        raise FileNotFoundError(f"Could not load {map_path}")
 
     if mode == "foundry":
         cols, rows, info = _foundry_wait_for_scene_grid()
@@ -425,8 +477,6 @@ def prepare_map_asset():
     s.grid_cols = cols
     s.grid_rows = rows
 
-    # In Foundry mode, we don't need to generate/show a blended output map.
-    # BUT we still compute warp/proc sizing to keep the rest of your pipeline consistent.
     if getattr(s, "selected_display", None):
         screen_width = int(s.selected_display["width"])
         screen_height = int(s.selected_display["height"])
@@ -434,7 +484,18 @@ def prepare_map_asset():
         screen_width = 1280
         screen_height = 720
 
-    # still build the grid image (useful for debugging + consistent cell_px)
+    # NEW: configure cache paths for this run (self-hosted only)
+    if mode == "self_hosted":
+        key, meta = _make_blended_cache_key(map_path, cols, rows, screen_width, screen_height)
+        _set_blended_paths_for_key(key)
+
+        if os.path.exists(BLENDED_OUTPUT_PATH):
+            img = cv2.imread(BLENDED_OUTPUT_PATH)
+            if img is not None:
+                global _BLENDED_IMG_CACHE
+                _BLENDED_IMG_CACHE = img
+                return img, img.shape[0], img.shape[1], cols, rows, None, None
+
     background_img = generate_grid(background_img, cols, rows)
 
     bg_h, bg_w = background_img.shape[:2]
@@ -448,10 +509,8 @@ def prepare_map_asset():
     cell_px = _compute_cell_px(map_w, map_h, cols, rows)
     border_px = _compute_border_px(cell_px)
 
-    # In foundry mode, we do NOT show blended output, but we can still create the canvas
     canvas = add_white_border(resized_bg, border_px)
 
-    # If you still want your ArUco marker tiles for other uses, keep this.
     generate_aruco_marker_tiles(cell_px, border_px)
 
     img_h, img_w = canvas.shape[:2]
@@ -469,11 +528,18 @@ def prepare_map_asset():
 def generate_display():
     global _BLENDED_IMG_CACHE, _BLENDED_WINDOW_OPEN
 
-    # NEW: Foundry mode never generates/shows blended output
     if _get_mode() == "foundry":
         return
 
     blended_img, img_h, img_w, cols, rows, cell_px, border_px = prepare_map_asset()
+
+    # If prepare_map_asset() returned a cached image, it returned cell_px/border_px as None.
+    # In that case, just show and return.
+    if cell_px is None or border_px is None:
+        _ensure_window(BLENDED_WINDOW_NAME, 1280, 720)
+        cv2.imshow(BLENDED_WINDOW_NAME, blended_img)
+        _BLENDED_WINDOW_OPEN = True
+        return
 
     map_x0 = border_px
     map_y0 = border_px
@@ -514,6 +580,22 @@ def generate_display():
     _BLENDED_IMG_CACHE = blended_img
     cv2.imwrite(BLENDED_OUTPUT_PATH, blended_img)
 
+    # Write cache metadata if available
+    try:
+        map_path = _get_map_path()
+        if getattr(s, "selected_display", None):
+            screen_width = int(s.selected_display["width"])
+            screen_height = int(s.selected_display["height"])
+        else:
+            screen_width = 1280
+            screen_height = 720
+        key, meta = _make_blended_cache_key(map_path, cols, rows, screen_width, screen_height)
+        _set_blended_paths_for_key(key)
+        _write_blended_meta(meta)
+        cv2.imwrite(BLENDED_OUTPUT_PATH, blended_img)
+    except Exception:
+        pass
+
     _ensure_window(BLENDED_WINDOW_NAME, 1280, 720)
     cv2.imshow(BLENDED_WINDOW_NAME, blended_img)
     _BLENDED_WINDOW_OPEN = True
@@ -523,10 +605,8 @@ def calibrate():
     mode = _get_mode()
 
     if mode == "foundry":
-        # Foundry mode: no blended display; just compute grid + warp params
         prepare_map_asset()
     else:
-        # Self-hosted: generate_display() already calls prepare_map_asset()
         generate_display()
 
     print("✅ Calibration Complete.")

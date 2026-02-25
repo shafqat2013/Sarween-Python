@@ -1139,6 +1139,11 @@ def begin_session(on_mini_moved, camera_index=None,
         show_ident_view = bool(tog.get("show_identify", False))
         show_blended_view = bool(tog.get("show_blended", False))
 
+        show_motion_warp_view = bool(tog.get("show_motion_warp", False))
+        show_motion_cam_view  = bool(tog.get("show_motion_cam", False))
+        show_shadowfree_view  = bool(tog.get("show_shadowfree", False))
+        show_final_mask_view  = bool(tog.get("show_final_mask", False))
+
         # ── Window rendering (toggled) ─────────────────────────────────────────
         if show_windows and show_cam_view:
             ensure_window("Camera + Detections", 1280, 720)
@@ -1176,6 +1181,36 @@ def begin_session(on_mini_moved, camera_index=None,
                 min_solidity=min_solidity,
                 max_k=12
             )
+            
+            # NEW: separate mask windows
+            if show_windows and show_motion_warp_view:
+                ensure_window("Motion (warp)", 1280, 720)
+                cv2.imshow("Motion (warp)", motion_warp)
+            else:
+                try: cv2.destroyWindow("Motion (warp)")
+                except Exception: pass
+
+            if show_windows and show_motion_cam_view:
+                ensure_window("Motion (camera)", 1280, 720)
+                cv2.imshow("Motion (camera)", motion_cam)
+            else:
+                try: cv2.destroyWindow("Motion (camera)")
+                except Exception: pass
+
+            if show_windows and show_shadowfree_view:
+                ensure_window("Shadow-free mask", 1280, 720)
+                cv2.imshow("Shadow-free mask", shadowfree_cam)
+            else:
+                try: cv2.destroyWindow("Shadow-free mask")
+                except Exception: pass
+
+            if show_windows and show_final_mask_view:
+                ensure_window("Final mask (annotated)", 1280, 720)
+                cv2.imshow("Final mask (annotated)", final_mask_annot)
+            else:
+                try: cv2.destroyWindow("Final mask (annotated)")
+                except Exception: pass
+
             debug_grid = _make_mask_debug_view(motion_warp, motion_cam, shadowfree_cam, final_mask_annot)
 
             ensure_window("Mask Debug (2x2)", 1280, 720)
@@ -1289,7 +1324,7 @@ def begin_session(on_mini_moved, camera_index=None,
         now = time.perf_counter()
         if now - last_print >= 1.0:
             fps = fps_count / (now - last_print)
-            print(f"[CV] FPS: {fps:.1f}", flush=True)
+            panel.set_status(fps=fps)
             fps_count = 0
             last_print = now
 

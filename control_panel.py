@@ -39,9 +39,14 @@ class ControlPanel:
         self._toggles: Dict[str, bool] = {
             "show_live_camera": False,
             "show_homography": False,
-            "show_masks": False,
             "show_identify": False,
             "show_blended": False,   # self-hosted only; safe to keep in both
+
+            # NEW: split mask views
+            "show_motion_warp": False,
+            "show_motion_cam": False,
+            "show_shadowfree": False,
+            "show_final_mask": False,
         }
 
         # One-shot actions (cleared after pop_actions)
@@ -54,7 +59,7 @@ class ControlPanel:
         # Tk root
         self.root = tk.Tk()
         self.root.title("Sarween Control Panel")
-        self.root.geometry("520x340")
+        self.root.geometry("520x380")
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -77,14 +82,19 @@ class ControlPanel:
         self.var_markers = tk.StringVar(value="Markers: --")
         self.var_missing = tk.StringVar(value="Missing: --")
         self.var_foundry = tk.StringVar(value="Foundry: (n/a)")
+        self.var_fps = tk.StringVar(value="FPS: --")
         self.var_hint = tk.StringVar(value="")
 
         # Checkbutton vars
         self._var_show_live = tk.BooleanVar(value=self._toggles["show_live_camera"])
         self._var_show_h = tk.BooleanVar(value=self._toggles["show_homography"])
-        self._var_show_masks = tk.BooleanVar(value=self._toggles["show_masks"])
         self._var_show_ident = tk.BooleanVar(value=self._toggles["show_identify"])
         self._var_show_blended = tk.BooleanVar(value=self._toggles["show_blended"])
+
+        self._var_show_motion_warp = tk.BooleanVar(value=self._toggles["show_motion_warp"])
+        self._var_show_motion_cam = tk.BooleanVar(value=self._toggles["show_motion_cam"])
+        self._var_show_shadowfree = tk.BooleanVar(value=self._toggles["show_shadowfree"])
+        self._var_show_final_mask = tk.BooleanVar(value=self._toggles["show_final_mask"])
 
         # Layout
         outer = ttk.Frame(self.root)
@@ -100,6 +110,7 @@ class ControlPanel:
         ttk.Label(status_box, textvariable=self.var_lock).pack(anchor="w")
         ttk.Label(status_box, textvariable=self.var_markers).pack(anchor="w")
         ttk.Label(status_box, textvariable=self.var_missing).pack(anchor="w")
+        ttk.Label(status_box, textvariable=self.var_fps).pack(anchor="w")
 
         # Foundry status only meaningful in foundry mode, but safe to show always
         ttk.Label(status_box, textvariable=self.var_foundry).pack(anchor="w", pady=(6, 0))
@@ -128,13 +139,6 @@ class ControlPanel:
 
         ttk.Checkbutton(
             toggles_box,
-            text="Masks Debug (2x2)",
-            variable=self._var_show_masks,
-            command=self._sync_toggles_from_ui
-        ).pack(anchor="w")
-
-        ttk.Checkbutton(
-            toggles_box,
             text="Identify Debug",
             variable=self._var_show_ident,
             command=self._sync_toggles_from_ui
@@ -144,6 +148,42 @@ class ControlPanel:
             toggles_box,
             text="Blended ArUco Markers (self-hosted)",
             variable=self._var_show_blended,
+            command=self._sync_toggles_from_ui
+        ).pack(anchor="w")
+
+        ttk.Separator(outer).pack(fill="x", pady=10)
+
+        # NEW: mask views
+        masks_box = ttk.Frame(outer)
+        masks_box.pack(fill="x")
+
+        ttk.Label(masks_box, text="Masks").pack(anchor="w")
+
+        ttk.Checkbutton(
+            masks_box,
+            text="Motion (warp)",
+            variable=self._var_show_motion_warp,
+            command=self._sync_toggles_from_ui
+        ).pack(anchor="w", pady=(6, 0))
+
+        ttk.Checkbutton(
+            masks_box,
+            text="Motion (camera)",
+            variable=self._var_show_motion_cam,
+            command=self._sync_toggles_from_ui
+        ).pack(anchor="w")
+
+        ttk.Checkbutton(
+            masks_box,
+            text="Shadow-free mask",
+            variable=self._var_show_shadowfree,
+            command=self._sync_toggles_from_ui
+        ).pack(anchor="w")
+
+        ttk.Checkbutton(
+            masks_box,
+            text="Final mask (annotated)",
+            variable=self._var_show_final_mask,
             command=self._sync_toggles_from_ui
         ).pack(anchor="w")
 
@@ -164,10 +204,6 @@ class ControlPanel:
 
         ttk.Label(outer, textvariable=self.var_hint, foreground="#cccccc").pack(anchor="w", pady=(10, 0))
 
-        # Start hidden? caller can show/hide
-        # Default: show (so you can see it immediately if desired)
-        # You can call panel.hide() initially in tracking until lock is acquired.
-
     # ─────────────────────────────────────────────────────────
     # UI event handlers
     # ─────────────────────────────────────────────────────────
@@ -185,9 +221,13 @@ class ControlPanel:
         with self._lock:
             self._toggles["show_live_camera"] = bool(self._var_show_live.get())
             self._toggles["show_homography"] = bool(self._var_show_h.get())
-            self._toggles["show_masks"] = bool(self._var_show_masks.get())
             self._toggles["show_identify"] = bool(self._var_show_ident.get())
             self._toggles["show_blended"] = bool(self._var_show_blended.get())
+
+            self._toggles["show_motion_warp"] = bool(self._var_show_motion_warp.get())
+            self._toggles["show_motion_cam"] = bool(self._var_show_motion_cam.get())
+            self._toggles["show_shadowfree"] = bool(self._var_show_shadowfree.get())
+            self._toggles["show_final_mask"] = bool(self._var_show_final_mask.get())
 
     def _act_capture(self):
         with self._lock:
@@ -231,6 +271,7 @@ class ControlPanel:
         locked: bool | None = None,
         marker_count: int | None = None,
         missing_ids: List[int] | None = None,
+        fps: float | None = None,
     ):
         """
         Update the status labels.
@@ -268,6 +309,12 @@ class ControlPanel:
             self.var_foundry.set(ftxt)
         except Exception:
             pass
+
+        if fps is not None:
+            try:
+                self.var_fps.set(f"FPS: {float(fps):.1f}")
+            except Exception:
+                pass
 
     def get_toggles(self) -> Dict[str, bool]:
         with self._lock:

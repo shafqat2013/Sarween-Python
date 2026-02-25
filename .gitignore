@@ -6,3 +6,10 @@ __pycache__/
 mini_captures/
 *.npy
 mini_database.csv
+
+# Deprecated
+Deprecated/
+
+# Large map assets
+maps/Digital/
+maps/Print/

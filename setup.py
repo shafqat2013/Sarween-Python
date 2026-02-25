@@ -1,3 +1,4 @@
+# setup.py
 # all functions for hardware detection and selection
 # ===========================
 import subprocess
@@ -15,6 +16,8 @@ from screeninfo import get_monitors
 # CONFIGURATION
 # ===========================
 CONFIG_FILE = "hardware_config.json"
+MAPS_DIR = "maps"
+MAP_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
 MODE_SELF_HOSTED = "self_hosted"
 MODE_FOUNDRY = "foundry"
@@ -23,6 +26,21 @@ MODE_LABELS = {
     MODE_FOUNDRY: "Foundry",
 }
 MODE_LABEL_TO_VALUE = {v: k for k, v in MODE_LABELS.items()}
+
+
+def _list_map_files():
+    try:
+        if not os.path.isdir(MAPS_DIR):
+            return []
+        files = []
+        for fn in sorted(os.listdir(MAPS_DIR)):
+            if fn.startswith("."):
+                continue
+            if fn.lower().endswith(MAP_EXTS):
+                files.append(os.path.join(MAPS_DIR, fn))
+        return files
+    except Exception:
+        return []
 
 
 def load_last_selection():
@@ -36,7 +54,7 @@ def load_last_selection():
     return {}
 
 
-def save_last_selection(display_index=None, webcam_index=None, mode=None):
+def save_last_selection(display_index=None, webcam_index=None, mode=None, map_path=None):
     data = load_last_selection()
     if display_index is not None:
         data["display_index"] = int(display_index)
@@ -44,6 +62,8 @@ def save_last_selection(display_index=None, webcam_index=None, mode=None):
         data["webcam_index"] = int(webcam_index)
     if mode is not None:
         data["mode"] = str(mode)
+    if map_path is not None:
+        data["map_path"] = str(map_path)
     with open(CONFIG_FILE, "w") as f:
         json.dump(data, f)
 
@@ -52,6 +72,7 @@ config_data = load_last_selection()
 last_display_index = config_data.get("display_index")
 last_webcam_device_index = config_data.get("webcam_index")
 last_mode = config_data.get("mode", MODE_SELF_HOSTED)
+last_map_path = config_data.get("map_path")
 
 # ===========================
 # HARDWARE DETECTION
@@ -144,7 +165,7 @@ def preview_webcam_device(device_index: int):
 
 
 def unified_selection_window(displays, webcams, default_display_index=None,
-                             default_webcam_device_index=None, default_mode=None):
+                             default_webcam_device_index=None, default_mode=None, default_map_path=None):
 
     disp_options = [f"{d['index']}: {d['width']}x{d['height']}" for d in displays]
     cam_options = [f"{w['index']}: {w['model']} ({w['resolution']})" for w in webcams]
@@ -153,13 +174,22 @@ def unified_selection_window(displays, webcams, default_display_index=None,
     disp_index_by_pos = [d["index"] for d in displays]
     cam_device_by_pos = [w["index"] for w in webcams]
 
+    map_files = _list_map_files()
+    map_options = [os.path.basename(p) for p in map_files]
+
     selection = {"value": None}
 
     def submit():
+        sel_mode = MODE_LABEL_TO_VALUE[mode_combo.get()]
+        sel_map = None
+        if sel_mode == MODE_SELF_HOSTED and map_files and map_combo.current() >= 0:
+            sel_map = map_files[map_combo.current()]
+
         selection["value"] = {
             "display_index": disp_index_by_pos[display_combo.current()],
             "webcam_index": cam_device_by_pos[webcam_combo.current()],
-            "mode": MODE_LABEL_TO_VALUE[mode_combo.get()]
+            "mode": sel_mode,
+            "map_path": sel_map
         }
         window.destroy()
 
@@ -169,9 +199,18 @@ def unified_selection_window(displays, webcams, default_display_index=None,
     def preview_webcam():
         preview_webcam_device(cam_device_by_pos[webcam_combo.current()])
 
+    def on_mode_change(event=None):
+        sel_mode = MODE_LABEL_TO_VALUE.get(mode_combo.get(), MODE_SELF_HOSTED)
+        if sel_mode == MODE_FOUNDRY:
+            map_combo.configure(state="disabled")
+            map_label.configure(state="disabled")
+        else:
+            map_combo.configure(state="readonly" if map_options else "disabled")
+            map_label.configure(state="normal")
+
     window = tk.Tk()
     window.title("Sarween Setup")
-    window.geometry("520x260")
+    window.geometry("520x320")
     window.resizable(False, False)
     window.bind("<Escape>", cancel)
 
@@ -197,6 +236,29 @@ def unified_selection_window(displays, webcams, default_display_index=None,
     mode_combo = ttk.Combobox(frame, values=mode_options, state="readonly", width=40)
     mode_combo.grid(row=2, column=1)
     mode_combo.set(MODE_LABELS.get(default_mode, MODE_LABELS[MODE_SELF_HOSTED]))
+    mode_combo.bind("<<ComboboxSelected>>", on_mode_change)
+
+    # NEW: Map selection (self-hosted only)
+    map_label = ttk.Label(frame, text="Map (self-hosted)")
+    map_label.grid(row=3, column=0, sticky="e", padx=10)
+    map_combo = ttk.Combobox(frame, values=map_options, state="readonly", width=40)
+    map_combo.grid(row=3, column=1)
+
+    # Default map selection
+    default_idx = 0
+    if default_map_path and map_files:
+        try:
+            base = os.path.basename(default_map_path)
+            if base in map_options:
+                default_idx = map_options.index(base)
+        except Exception:
+            pass
+    if map_options:
+        map_combo.current(default_idx)
+    else:
+        map_combo.configure(state="disabled")
+
+    on_mode_change()
 
     btns = ttk.Frame(window)
     btns.pack(pady=10)
@@ -226,10 +288,10 @@ def initialize():
         webcams=webcams,
         default_display_index=last_display_index,
         default_webcam_device_index=last_webcam_device_index,
-        default_mode=last_mode
+        default_mode=last_mode,
+        default_map_path=last_map_path
     )
 
-    # ✅ THIS IS THE IMPORTANT CHANGE
     if sel is None:
         print("Setup cancelled. Exiting program.")
         raise SystemExit(0)
@@ -237,7 +299,8 @@ def initialize():
     save_last_selection(
         display_index=sel["display_index"],
         webcam_index=sel["webcam_index"],
-        mode=sel["mode"]
+        mode=sel["mode"],
+        map_path=sel.get("map_path")
     )
 
     selected_display = next(d for d in displays if d["index"] == sel["display_index"])
@@ -247,5 +310,6 @@ def initialize():
     print("Final selected display:", selected_display)
     print("Final selected webcam:", selected_webcam)
     print("Final selected mode:", selected_mode)
+    print("Final selected map:", sel.get("map_path"))
 
     return selected_display, selected_webcam, selected_mode
