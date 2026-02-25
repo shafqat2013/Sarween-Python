@@ -1,0 +1,17 @@
+{
+  "id": "sarween",
+  "title": "Computer Vision for TTRPG",
+  "description": "Moves tokens using external input.",
+  "version": "1.0.0",
+  "authors": [
+    { "name": "Shaf" }
+  ],
+  "compatibility": {
+    "minimum": "13",
+    "verified": "13"
+  },
+  "esmodules": [
+    "module.js"
+  ],
+  "socket": true
+}

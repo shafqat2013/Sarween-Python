@@ -16,59 +16,62 @@ from screeninfo import get_monitors
 # ===========================
 CONFIG_FILE = "hardware_config.json"
 
+MODE_SELF_HOSTED = "self_hosted"
+MODE_FOUNDRY = "foundry"
+MODE_LABELS = {
+    MODE_SELF_HOSTED: "Self Hosted",
+    MODE_FOUNDRY: "Foundry",
+}
+MODE_LABEL_TO_VALUE = {v: k for k, v in MODE_LABELS.items()}
+
+
 def load_last_selection():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
         except Exception:
             pass
     return {}
 
-def save_last_selection(display_index=None, webcam_index=None):
+
+def save_last_selection(display_index=None, webcam_index=None, mode=None):
     data = load_last_selection()
     if display_index is not None:
-        data["display_index"] = display_index
+        data["display_index"] = int(display_index)
     if webcam_index is not None:
-        data["webcam_index"] = webcam_index
+        data["webcam_index"] = int(webcam_index)
+    if mode is not None:
+        data["mode"] = str(mode)
     with open(CONFIG_FILE, "w") as f:
         json.dump(data, f)
 
+
 config_data = load_last_selection()
 last_display_index = config_data.get("display_index")
-last_webcam_index = config_data.get("webcam_index")
+last_webcam_device_index = config_data.get("webcam_index")
+last_mode = config_data.get("mode", MODE_SELF_HOSTED)
 
 # ===========================
 # HARDWARE DETECTION
 # ===========================
 selected_display = None
 selected_webcam = None
+selected_mode = None
+
 
 def detect_setup():
     displays = []
     webcams = []
+
     try:
-        result = subprocess.run(["system_profiler", "SPDisplaysDataType"], capture_output=True, text=True)
+        result = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType"],
+            capture_output=True,
+            text=True
+        )
 
-        # Built-in / External
-        built_in_displays = re.findall(r"Built-In", result.stdout)
-        print("Built-in displays detected." if built_in_displays else "No built-in displays detected.")
-        external_displays = re.findall(r"External", result.stdout)
-        print("External displays detected." if external_displays else "No external displays detected.")
-
-        # Mirroring
-        mirroring = re.findall(r"Mirror:\s+On", result.stdout)
-        print("Display mirroring detected." if mirroring else "No display mirroring detected.")
-
-        # Scaling
-        scaling = re.findall(r"Scaling:\s+On", result.stdout)
-        print("Display scaling detected." if scaling else "No display scaling detected.")
-
-        # Rotation
-        rotation = re.findall(r"Rotation:\s+(\d+)", result.stdout)
-        print(f"Display rotation detected: {rotation[0]} degrees." if rotation else "No display rotation detected.")
-
-        # Resolutions
         resolutions = re.findall(r"Resolution:\s+(\d+) x (\d+)", result.stdout)
         for i, (w, h) in enumerate(resolutions):
             displays.append({
@@ -78,34 +81,13 @@ def detect_setup():
                 "x": 0,
                 "y": 0
             })
-        if not displays:
-            print("No displays found.")
-    except Exception as e:
-        print(f"Error detecting displays with system_profiler, using backup method: {e}")
+
+    except Exception:
         displays = detect_displays_backup()
 
-    print('Displays:')
-    print(displays)
-
-    try:
-        result = subprocess.run(["system_profiler", "SPCameraDataType"], capture_output=True, text=True)
-        modelid = re.findall(r"Model ID:\s+(\w+)", result.stdout)
-        for i, model in enumerate(modelid):
-            webcams.append({
-                "index": i,
-                "model": model
-            })
-    except Exception as e:
-        print(f"Error detecting webcams with system_profiler, using backup method: {e}")
-        webcams = detect_webcams_backup()
-
-    print('Webcams:')
-    print(webcams)
-
-    print('Switching to CV to get resolution:')
     webcams = detect_webcams_backup()
-    print(webcams)
     return displays, webcams
+
 
 def detect_displays_backup():
     displays = []
@@ -119,10 +101,10 @@ def detect_displays_backup():
         })
     return displays
 
+
 def detect_webcams_backup():
     webcams = []
-    webcam_count = 5
-    for i in range(webcam_count):
+    for i in range(6):
         cap = cv2.VideoCapture(i)
         if cap.isOpened():
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -135,76 +117,17 @@ def detect_webcams_backup():
             cap.release()
     return webcams
 
+
 # ===========================
 # GUI SELECTION
 # ===========================
 
-def dropdown_selection_with_preview(title, prompt, options, preview_function=None, default_index=None):
-    selection = {"value": None}
-
-    def submit():
-        selected_index = combo.current()
-        if selected_index >= 0:
-            selection["value"] = selected_index
-            window.destroy()
-
-    def preview():
-        index = combo.current()
-        if index >= 0 and preview_function:
-            preview_function(index)
-
-    def cancel(event=None):
-        window.destroy()
-
-    window = tk.Tk()
-    window.title(title)
-    window.geometry("400x180")
-    window.resizable(False, False)
-    window.bind('<Escape>', cancel)
-
-    # ===========================
-    # DARK MODE STYLING
-    # ===========================
-    style = ttk.Style()
-    style.theme_use('default')  # Prevent Aqua override on macOS
-    window.configure(bg="#2e2e2e")
-    style.configure("TLabel", foreground="white", background="#2e2e2e")
-    style.configure("TButton", foreground="white", background="#3c3c3c")
-    style.configure("TCombobox",
-                    foreground="white",
-                    fieldbackground="#3c3c3c",
-                    background="#2e2e2e")
-
-    # ===========================
-    # UI Elements
-    # ===========================
-    label = ttk.Label(window, text=prompt, style="TLabel")
-    label.pack(pady=10)
-
-    combo = ttk.Combobox(window, values=options, state="readonly", width=50, style="TCombobox")
-    combo.pack()
-    if default_index is not None and 0 <= default_index < len(options):
-        combo.current(default_index)
-
-    frame = ttk.Frame(window)
-    frame.pack(pady=10)
-
-    preview_btn = ttk.Button(frame, text="Preview", command=preview, style="TButton")
-    preview_btn.pack(side=tk.LEFT, padx=10)
-
-    select_btn = ttk.Button(frame, text="Select", command=submit, style="TButton")
-    select_btn.pack(side=tk.LEFT, padx=10)
-
-    window.mainloop()
-    return selection["value"]
-
-def preview_webcam(index):
-    cap = cv2.VideoCapture(index)
+def preview_webcam_device(device_index: int):
+    cap = cv2.VideoCapture(int(device_index))
     if not cap.isOpened():
-        print(f"⚠️ Could not open webcam {index}")
+        print(f"⚠️ Could not open webcam {device_index}")
         return
 
-    print(f"📷 Previewing webcam {index}... (Press ESC to close early)")
     start_time = time.time()
     cv2.namedWindow("Webcam Preview")
 
@@ -219,88 +142,110 @@ def preview_webcam(index):
     cap.release()
     cv2.destroyAllWindows()
 
-def webcam_selection(webcams):
-    global last_webcam_index
-    if not webcams:
-        print("No webcams found.")
-        return None
 
-    options = [f"{w['index']}: {w['model']} ({w['resolution']})" for w in webcams]
-    index = dropdown_selection_with_preview(
-        title="Select Webcam",
-        prompt="Select the webcam you want to use:",
-        options=options,
-        preview_function=preview_webcam,
-        default_index=last_webcam_index
-    )
-    if index is None:
-        print("No webcam selected.")
-        return None
+def unified_selection_window(displays, webcams, default_display_index=None,
+                             default_webcam_device_index=None, default_mode=None):
 
-    last_webcam_index = index
-    save_last_selection(webcam_index=index)
-    return webcams[index]
+    disp_options = [f"{d['index']}: {d['width']}x{d['height']}" for d in displays]
+    cam_options = [f"{w['index']}: {w['model']} ({w['resolution']})" for w in webcams]
+    mode_options = [MODE_LABELS[MODE_SELF_HOSTED], MODE_LABELS[MODE_FOUNDRY]]
 
-def display_selection(displays):
-    global last_display_index
-    if not displays:
-        print("No displays found.")
-        return None
+    disp_index_by_pos = [d["index"] for d in displays]
+    cam_device_by_pos = [w["index"] for w in webcams]
 
-    options = [f"{d['index']}: {d['width']}x{d['height']}" for d in displays]
-    index = dropdown_selection_with_preview(
-        title="Select Display",
-        prompt="Select the display you want to use:",
-        options=options,
-        preview_function=None,
-        default_index=last_display_index
-    )
-    if index is None:
-        print("No display selected.")
-        return None
+    selection = {"value": None}
 
-    last_display_index = index
-    save_last_selection(display_index=index)
-    return displays[index]
+    def submit():
+        selection["value"] = {
+            "display_index": disp_index_by_pos[display_combo.current()],
+            "webcam_index": cam_device_by_pos[webcam_combo.current()],
+            "mode": MODE_LABEL_TO_VALUE[mode_combo.get()]
+        }
+        window.destroy()
 
-def default_to_external_display(displays):
-    if len(displays) > 1:
-        external_displays = [d for d in displays if d['x'] != 0 or d['y'] != 0]
-        if external_displays:
-            external = max(external_displays, key=lambda d: d['width'] * d['height'])
-            print(f"Using External Display: {external['width']}x{external['height']}")
-            return external
-    print("Using External Display.")
-    return displays[1]
+    def cancel(event=None):
+        window.destroy()
+
+    def preview_webcam():
+        preview_webcam_device(cam_device_by_pos[webcam_combo.current()])
+
+    window = tk.Tk()
+    window.title("Sarween Setup")
+    window.geometry("520x260")
+    window.resizable(False, False)
+    window.bind("<Escape>", cancel)
+
+    label = ttk.Label(window, text="Select your hardware + mode")
+    label.pack(pady=10)
+
+    frame = ttk.Frame(window)
+    frame.pack(pady=10)
+
+    ttk.Label(frame, text="Display").grid(row=0, column=0, sticky="e", padx=10)
+    display_combo = ttk.Combobox(frame, values=disp_options, state="readonly", width=40)
+    display_combo.grid(row=0, column=1)
+    if default_display_index in disp_index_by_pos:
+        display_combo.current(disp_index_by_pos.index(default_display_index))
+
+    ttk.Label(frame, text="Webcam").grid(row=1, column=0, sticky="e", padx=10)
+    webcam_combo = ttk.Combobox(frame, values=cam_options, state="readonly", width=40)
+    webcam_combo.grid(row=1, column=1)
+    if default_webcam_device_index in cam_device_by_pos:
+        webcam_combo.current(cam_device_by_pos.index(default_webcam_device_index))
+
+    ttk.Label(frame, text="Mode").grid(row=2, column=0, sticky="e", padx=10)
+    mode_combo = ttk.Combobox(frame, values=mode_options, state="readonly", width=40)
+    mode_combo.grid(row=2, column=1)
+    mode_combo.set(MODE_LABELS.get(default_mode, MODE_LABELS[MODE_SELF_HOSTED]))
+
+    btns = ttk.Frame(window)
+    btns.pack(pady=10)
+
+    ttk.Button(btns, text="Preview Webcam", command=preview_webcam).pack(side=tk.LEFT, padx=5)
+    ttk.Button(btns, text="Select", command=submit).pack(side=tk.LEFT, padx=5)
+    ttk.Button(btns, text="Cancel", command=cancel).pack(side=tk.LEFT, padx=5)
+
+    window.mainloop()
+    return selection["value"]
+
 
 # ===========================
 # INITIALIZE
 # ===========================
 
 def initialize():
-    #login, detect attached hardware, select webcam, select display, select map, store in database
-    
-    global selected_display, selected_webcam
+    """
+    If the user cancels setup, EXIT THE PROGRAM.
+    """
+    global selected_display, selected_webcam, selected_mode
+
     displays, webcams = detect_setup()
 
-    if len(displays) == 0:
-        print('No displays detected.')
-    elif len(displays) == 1:
-        print('No external display detected, defaulting to primary display.')
-        selected_display = displays[0]
-    elif len(displays) == 2:
-        print('1 external display detected, defaulting to external display.')
-        selected_display = displays[1]
-        #default_to_external_display(displays)
-    else:
-        print('Multiple displays detected, please select manually.')
-        selected_display = display_selection(displays)
+    sel = unified_selection_window(
+        displays=displays,
+        webcams=webcams,
+        default_display_index=last_display_index,
+        default_webcam_device_index=last_webcam_device_index,
+        default_mode=last_mode
+    )
 
-    if len(webcams) == 0:
-        print('No cameras detected.')
-    elif len(webcams) == 1:
-        print('Defaulting to primary camera.')
-        selected_webcam = webcams[0]
-    else:
-        print('Multiple cameras detected, please select manually.')
-        selected_webcam = webcam_selection(webcams)
+    # ✅ THIS IS THE IMPORTANT CHANGE
+    if sel is None:
+        print("Setup cancelled. Exiting program.")
+        raise SystemExit(0)
+
+    save_last_selection(
+        display_index=sel["display_index"],
+        webcam_index=sel["webcam_index"],
+        mode=sel["mode"]
+    )
+
+    selected_display = next(d for d in displays if d["index"] == sel["display_index"])
+    selected_webcam = next(w for w in webcams if w["index"] == sel["webcam_index"])
+    selected_mode = sel["mode"]
+
+    print("Final selected display:", selected_display)
+    print("Final selected webcam:", selected_webcam)
+    print("Final selected mode:", selected_mode)
+
+    return selected_display, selected_webcam, selected_mode
