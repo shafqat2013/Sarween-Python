@@ -9,21 +9,19 @@ import websockets
 # Foundry configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
-SCENE_ID = "pKZNLeOehA3WJuYC"
+# SCENE_ID is not hardcoded — it is populated when Foundry sends sceneInfo on
+# connect (see recv_loop / set_scene_params). Moves queued before sceneInfo
+# arrives will use whatever value is set here at that point; in practice the
+# module.js sends sceneInfo proactively on open so the window is very small.
+SCENE_ID = ""
 
 # Default token (used if we can't resolve a specific mapping)
 DEFAULT_TOKEN_ID = "1"  # fallback
 
 # Map from mini_id (or logical mini key) -> Foundry tokenId.
-# Many different mini_ids can point to the same tokenId.
-MINI_TO_TOKEN = {
-    "936478": "MH95ZnoQkuIIIqoL",
-    "863792": "MH95ZnoQkuIIIqoL",
-    "626666": "MH95ZnoQkuIIIqoL",
-    "353367": "MH95ZnoQkuIIIqoL",
-    "511420": "MH95ZnoQkuIIIqoL",
-    "111111": "MoAbjfUrvJEkD4IK",
-}
+# Populated at runtime from mini_token_map.json via _load_mapping().
+# Do not hardcode IDs here — use the assignment flow in-game instead.
+MINI_TO_TOKEN = {}
 
 # Persist mappings across runs
 MAP_PATH = Path(__file__).with_name("mini_token_map.json")
@@ -292,6 +290,12 @@ async def send_loop(websocket):
 
     while True:
         mini_id, cell_label = await _move_queue.get()
+
+        if not SCENE_ID:
+            print(f"FoundryOutput | sceneInfo not yet received from Foundry; "
+                  f"dropping move for mini {mini_id}. "
+                  f"This should resolve once Foundry connects and sends sceneInfo.")
+            continue
 
         token_id = _resolve_token_id_for_mini(mini_id)
         if token_id == DEFAULT_TOKEN_ID:

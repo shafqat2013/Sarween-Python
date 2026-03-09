@@ -15,13 +15,19 @@ _camera_params_cache = None
 def get_camera_params():
     """
     Returns (camera_matrix, dist_coeffs), loading once on first use.
+    Returns (None, None) if calibration files are missing — callers must handle this.
     """
     global _camera_params_cache
     if _camera_params_cache is None:
-        _camera_params_cache = (
-            np.load("camera_matrix.npy"),
-            np.load("dist_coeffs.npy")
-        )
+        if os.path.exists("camera_matrix.npy") and os.path.exists("dist_coeffs.npy"):
+            _camera_params_cache = (
+                np.load("camera_matrix.npy"),
+                np.load("dist_coeffs.npy")
+            )
+        else:
+            print("⚠️ Camera calibration files not found (camera_matrix.npy / dist_coeffs.npy). "
+                  "Undistortion will be skipped. Run webcam calibration if needed.")
+            _camera_params_cache = (None, None)
     return _camera_params_cache
 
 
@@ -230,7 +236,8 @@ def capture_background(camera_index=None):
     if not ret or frame is None:
         print("❌ Could not capture background.")
         return None
-    frame = cv2.undistort(frame, camera_matrix, dist_coeffs)
+    if camera_matrix is not None and dist_coeffs is not None:
+        frame = cv2.undistort(frame, camera_matrix, dist_coeffs)
     gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur  = cv2.GaussianBlur(gray, (21, 21), 0)
     return blur
@@ -250,7 +257,8 @@ def capture_background_full(camera_index=None):
     if not ret or frame is None:
         print("❌ Could not capture background.")
         return None
-    frame = cv2.undistort(frame, camera_matrix, dist_coeffs)
+    if camera_matrix is not None and dist_coeffs is not None:
+        frame = cv2.undistort(frame, camera_matrix, dist_coeffs)
     gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur  = cv2.GaussianBlur(gray, (21,21), 0)
     return {"bgr": frame, "blur": blur}
@@ -300,22 +308,39 @@ def combine_masks_componentwise(motion_mask, shadowfree_mask,
     """
     Keep connected components from motion_mask if enough of their pixels also pass
     the shadow-free mask. Returns a clean binary mask (0/255).
+
+    Fully vectorised — no Python loop over components, so cost is constant
+    regardless of how many blobs are active after a movement.
     """
-    mot = (motion_mask > 0).astype(np.uint8) * 255
-    sh  = (shadowfree_mask > 0).astype(np.uint8) * 255
+    mot = (motion_mask > 0).astype(np.uint8)
+    sh  = (shadowfree_mask > 0).astype(np.uint8)
 
     num, labels, stats, _ = cv2.connectedComponentsWithStats(mot, connectivity=8)
-    out = np.zeros_like(mot)
 
-    for i in range(1, num):
-        area = int(stats[i, cv2.CC_STAT_AREA])
-        if area < min_comp_area:
-            continue
-        comp = (labels == i).astype(np.uint8) * 255
-        overlap = cv2.bitwise_and(comp, sh)
-        ratio = cv2.countNonZero(overlap) / float(area)
-        if ratio >= keep_ratio:
-            out = cv2.bitwise_or(out, comp)
+    if num <= 1:
+        # No foreground components at all
+        return np.zeros_like(mot)
+
+    # stats shape: (num, 5) — column CC_STAT_AREA is index 4
+    areas = stats[1:, cv2.CC_STAT_AREA].astype(np.float32)  # skip background (0)
+
+    # Per-label overlap count: sum sh pixels per label using np.bincount
+    sh_flat  = sh.ravel()
+    lab_flat = labels.ravel()
+    # bincount gives sum of sh pixels in each label bucket
+    overlap_counts = np.bincount(lab_flat, weights=sh_flat.astype(np.float32), minlength=num)
+    overlap_counts = overlap_counts[1:]  # skip background
+
+    # Vectorised accept/reject: both area and ratio conditions at once
+    ratios = overlap_counts / np.maximum(areas, 1.0)
+    keep = (areas >= min_comp_area) & (ratios >= keep_ratio)  # bool array, length num-1
+
+    if not keep.any():
+        return np.zeros_like(mot)
+
+    # Build accepted-label set and map labels → keep mask in one numpy op
+    kept_labels = np.where(keep)[0] + 1  # +1 because we skipped background
+    out = np.isin(labels, kept_labels).astype(np.uint8) * 255
 
     k1 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_open,  k_open))
     k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close, k_close))
@@ -479,7 +504,7 @@ def save_mini_from_frame_and_contour(
     roi_mask_tight = roi_mask_full[y0:y1, x0:x1]
     roi_bgr = frame_bgr[y0:y1, x0:x1]
 
-    # HSV hist (3D, but we’ll collapse to HS at load time)
+    # HSV hist (3D, but we'll collapse to HS at load time)
     roi_hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     hist = cv2.calcHist([roi_hsv], [0, 1, 2], roi_mask_tight, [32, 32, 8], [0, 180, 0, 256, 0, 256])
     hs = hist.sum()
@@ -624,7 +649,7 @@ def capture_mini(
         print("❌ Could not capture mini.")
         return None
 
-    frame_bgr = cv2.undistort(frame_bgr, camera_matrix, dist_coeffs)
+    frame_bgr = cv2.undistort(frame_bgr, camera_matrix, dist_coeffs) if (camera_matrix is not None and dist_coeffs is not None) else frame_bgr
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (21, 21), 0)
 
@@ -664,10 +689,28 @@ def capture_mini(
 # ──────────────────────────────────────────────────────────────────────────────
 # DB loader (HS-collapsed hist + ORB + name)
 # ──────────────────────────────────────────────────────────────────────────────
+_db_not_found_warned: set = set()
+
+def _ensure_db_exists(db_csv_path=DB_CSV):
+    """Create an empty mini_database.csv with the correct header if it doesn't exist."""
+    if os.path.exists(db_csv_path):
+        return
+    try:
+        os.makedirs(os.path.dirname(db_csv_path), exist_ok=True)
+        with open(db_csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=DB_HEADER_V3)
+            writer.writeheader()
+        print(f"ℹ️ Created empty mini database at {db_csv_path}. Use Capture to add minis.")
+    except Exception as e:
+        print(f"⚠️ Could not create mini database at {db_csv_path}: {e}")
+
+
 def load_mini_database(db_csv_path=DB_CSV):
     entries = []
     if not os.path.exists(db_csv_path):
-        print(f"ℹ️ DB not found at {db_csv_path}.")
+        if db_csv_path not in _db_not_found_warned:
+            _db_not_found_warned.add(db_csv_path)
+            _ensure_db_exists(db_csv_path)
         return entries
 
     _migrate_db_to_v3_if_needed(db_csv_path)

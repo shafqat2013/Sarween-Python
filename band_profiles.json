@@ -1,0 +1,19 @@
+{
+  "yellow": {
+    "ranges": [
+      {
+        "lower": [
+          24,
+          138,
+          156
+        ],
+        "upper": [
+          29,
+          254,
+          220
+        ]
+      }
+    ],
+    "expected_diameter_squares": 0.7593551211562412
+  }
+}
