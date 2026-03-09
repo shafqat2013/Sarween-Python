@@ -539,7 +539,7 @@ class CVCoreSession:
         # Warp once, then extract gray — avoids warping the same frame twice
         warp_bgr = cv2.warpPerspective(cam_bgr, H_use, (int(self.warp_w), int(self.warp_h)))
         gray = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2GRAY)
-        warp_blur = cv2.GaussianBlur(gray, (11, 11), 0)
+        warp_blur = cv2.GaussianBlur(gray, (21, 21), 0)
         _t1 = time.perf_counter()
 
         bg_u8 = np.clip(self.BG_warp_f32, 0, 255).astype(np.uint8)
@@ -554,22 +554,12 @@ class CVCoreSession:
         change_ratio = (changed / max(1.0, roi_area))
         _t2 = time.perf_counter()
 
-        # ── Temporal persistence filter ────────────────────────────────────
+        # ── Temporal persistence filter (disabled — was shrinking blobs) ──
         now = time.perf_counter()
         dt = now - self._last_frame_time
         self._last_frame_time = now
         if dt > 0:
             self._fps_estimate = 0.9 * self._fps_estimate + 0.1 * (1.0 / dt)
-
-        min_frames = max(1, int(round(self._fps_estimate * self._motion_min_ms / 1000.0)))
-
-        active = (motion_warp > 0).astype(np.uint8)
-        self._motion_persist_acc = np.where(
-            active,
-            np.clip(self._motion_persist_acc.astype(np.int16) + 1, 0, min_frames + 1).astype(np.uint8),
-            np.uint8(0),
-        )
-        motion_warp = np.where(self._motion_persist_acc >= min_frames, np.uint8(255), np.uint8(0)).astype(np.uint8)
         _t3 = time.perf_counter()
 
         alpha_bg = self.bg_alpha_fast if change_ratio >= self.fog_change_ratio else self.bg_alpha_slow
