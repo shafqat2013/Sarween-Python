@@ -236,6 +236,9 @@ def roi_masks(
     warp_w: int,
     warp_h: int,
     corner_ids: Dict[str, int],
+    grid_w: int = 23,
+    grid_h: int = 16,
+    edge_cells: float = 1.0,
 ):
     corners, ids, _ = detect_markers(cam_bgr)
     if ids is None or H_view is None:
@@ -255,6 +258,17 @@ def roi_masks(
     mask_cam = np.zeros((h, w), dtype=np.uint8)
     cv2.fillConvexPoly(mask_cam, poly_cam.astype(np.int32), 255)
     mask_warp = cv2.warpPerspective(mask_cam, H_view, (warp_w, warp_h), flags=cv2.INTER_NEAREST)
+
+    # Expand mask_warp outward by edge_cells grid squares so minis sitting on
+    # the border edges are not clipped. Homography is unchanged — only the
+    # blob-gating mask is wider.
+    cell_w = int(round(warp_w / float(grid_w) * edge_cells))
+    cell_h = int(round(warp_h / float(grid_h) * edge_cells))
+    kw = max(3, cell_w * 2 + 1)
+    kh = max(3, cell_h * 2 + 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh))
+    mask_warp = cv2.dilate(mask_warp, kernel, iterations=1)
+
     return mask_cam, mask_warp
 
 
@@ -494,7 +508,7 @@ class CVCoreSession:
                 self._H_inv = np.linalg.inv(H_view).astype(np.float32)
             except Exception:
                 self._H_inv = np.eye(3, dtype=np.float32)
-            self.last_mask_cam, self.last_mask_warp = roi_masks(cam_bgr, H_view, self.warp_w, self.warp_h, CORNER_IDS)
+            self.last_mask_cam, self.last_mask_warp = roi_masks(cam_bgr, H_view, self.warp_w, self.warp_h, CORNER_IDS, grid_w=self.grid_w, grid_h=self.grid_h)
             self.lock_lost_reason = ""
             self.lock_miss_streak = 0
         else:
