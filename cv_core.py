@@ -1,1076 +1,722 @@
-# band_tracking.py
+# cv_core.py
 #
-# Band-tracking engine (color bands / circular markers) for Sarween.
+# Shared CV pipeline core for Sarween.
+# This module owns the parts that BOTH engines should share:
+# - camera open + optional undistortion
+# - ArUco detection + homography solve + ROI masks (mask_cam/mask_warp)
+# - warp-space background EMA + motion mask
+# - shadow-free mask + final combined mask (camera-space)
 #
-# This file contains:
-# 1) The band detection primitives (detect_bands, helpers)
-# 2) A begin_session(...) runner that uses cv_core.CVCoreSession to share
-#    camera/undistortion, ArUco lock, warp, and shared masking pipeline.
+# It does NOT do:
+# - mini DB matching / capture picker / name logic
+# - band color detection (that belongs in band_tracking.py)
+# - any control panel UI (engines can consume status/bundles and render)
 #
-# Configuration:
-# - Requires a JSON file "band_profiles.json" next to this file (repo root).
-#   Format example:
-#   {
-#     "red": {
-#       "ranges": [{"lower":[0,120,80],"upper":[10,255,255]}, {"lower":[170,120,80],"upper":[179,255,255]}],
-#       "expected_diameter_squares": 1.0
-#     },
-#     "blue": {
-#       "ranges": [{"lower":[95,120,80],"upper":[130,255,255]}],
-#       "expected_diameter_squares": 1.0
-#     }
-#   }
+# Typical usage (engine side):
 #
-# Identity:
-# - mini_id emitted to on_mini_moved is the color_name (e.g. "red").
+#   import cv_core as core
+#
+#   sess = core.CVCoreSession(camera_index=..., warp_w=..., warp_h=..., grid_w=..., grid_h=...)
+#   for bundle in sess.frames():
+#       if not bundle["locked"]:
+#           continue
+#       # blob engine: use bundle["final_mask_cam"] + bundle["cam_bgr"]
+#       # band engine: use bundle["warp_bgr"] (or warp cam using bundle["H_use"])
+#
+#   sess.close()
 
 from __future__ import annotations
 
-import json
-import math
+import os
 import time
-import random
+import traceback
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, Any, Iterator, Optional, Tuple, List
 
 import cv2
 import numpy as np
 
 import setup as s
-import cv_core as core
-import foundryoutput as fo
-from control_panel import ControlPanel, rc_to_a1
+import mini_tracking as mt
 
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Window helper — provided by cv_core
-# ──────────────────────────────────────────────────────────────────────────────
-ensure_window = core.ensure_window
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Data structures
-# ──────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class HSVRange:
-    lower: Tuple[int, int, int]  # (H,S,V)
-    upper: Tuple[int, int, int]
-
-@dataclass
-class ColorProfile:
-    # Some colors (notably red) may need two ranges
-    ranges: List[HSVRange]
-    expected_diameter_squares: float = 1.0
-
-@dataclass
-class BandDetection:
-    color_name: str
-    cx: float
-    cy: float
-    contour_area: float
-    circularity: float
-    ellipse_eccentricity: Optional[float]
-    score: float
-    bbox: Tuple[int, int, int, int]  # x,y,w,h in WARP space
+try:
+    import foundryoutput as fo
+except Exception:
+    fo = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Core helpers (detection)
+# Defaults / constants (copied from your tracking.py)
 # ──────────────────────────────────────────────────────────────────────────────
+DEFAULT_GRID_W = 23
+DEFAULT_GRID_H = 16
+DEFAULT_WARP_W = 1280
+DEFAULT_WARP_H = 720
+DEFAULT_H = np.eye(3, dtype=np.float32)
 
-def _mask_for_profile(hsv_img: np.ndarray, profile: ColorProfile) -> np.ndarray:
-    mask = None
-    for r in profile.ranges:
-        m = cv2.inRange(
-            hsv_img,
-            np.array(r.lower, dtype=np.uint8),
-            np.array(r.upper, dtype=np.uint8),
-        )
-        mask = m if mask is None else cv2.bitwise_or(mask, m)
-    if mask is None:
-        mask = np.zeros(hsv_img.shape[:2], dtype=np.uint8)
-    return mask
+DEST_PAD_PX = 8
 
-def _cleanup_mask(mask: np.ndarray, grid_px: float) -> np.ndarray:
-    # Close small gaps inside the band blob, then open to remove thin noise
-    # and HSV bleed from adjacent colors (e.g. yellow bleeding into orange).
-    # Using slightly larger open kernel than close so stray pixels are stripped
-    # more aggressively than genuine gaps are filled.
-    k_close = max(3, int(round(grid_px * 0.08)) | 1)
-    k_open  = max(3, int(round(grid_px * 0.12)) | 1)
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close, k_close))
-    kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_open,  k_open))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_open,  iterations=1)
-    return mask
+BG_ALPHA_SLOW = 0.02
+BG_ALPHA_FAST = 0.15
+FOG_CHANGE_RATIO = 0.08
+WARP_MOTION_THRESH = 30
 
-def _contour_centroid(cnt: np.ndarray) -> Optional[Tuple[float, float]]:
-    M = cv2.moments(cnt)
-    if abs(M["m00"]) < 1e-6:
-        return None
-    cx = M["m10"] / M["m00"]
-    cy = M["m01"] / M["m00"]
-    return float(cx), float(cy)
+ARUCO_EVERY_N = 30
+ARUCO_EVERY_N_FAST = 5
 
-def _contour_circularity(cnt: np.ndarray) -> float:
-    area = cv2.contourArea(cnt)
-    peri = cv2.arcLength(cnt, True)
-    if peri <= 1e-6:
-        return 0.0
-    return float(4.0 * math.pi * area / (peri * peri))
-
-def _ellipse_eccentricity(cnt: np.ndarray) -> Optional[float]:
-    if len(cnt) < 5:
-        return None
-    ellipse = cv2.fitEllipse(cnt)
-    (cx, cy), (MA, ma), angle = ellipse
-    a = max(MA, ma) / 2.0
-    b = min(MA, ma) / 2.0
-    if a <= 1e-6:
-        return None
-    e = math.sqrt(max(0.0, 1.0 - (b * b) / (a * a)))
-    return float(e)
-
-def _score_candidate(
-    area: float,
-    circularity: float,
-    ecc: Optional[float],
-    expected_area: float,
-    prev_xy: Optional[Tuple[float, float]],
-    xy: Tuple[float, float],
-    grid_px: float,
-) -> float:
-    # area closeness (log scale-ish)
-    area_ratio = area / max(1.0, expected_area)
-    area_term = math.exp(-abs(math.log(max(1e-6, area_ratio))) * 1.2)
-
-    # circularity preference
-    circ_term = max(0.0, min(1.0, (circularity - 0.25) / 0.55))
-
-    # eccentricity: tolerate some tilt
-    ecc_term = 1.0
-    if ecc is not None:
-        ecc_term = math.exp(-max(0.0, ecc - 0.55) * 3.0)
-
-    # distance to previous — strong anchor so each color sticks to its last
-    # known position and doesn't jump across the board to another mini.
-    # Decays over 2 grid squares; if no prior position, neutral (1.0).
-    dist_term = 1.0
-    if prev_xy is not None:
-        dx = xy[0] - prev_xy[0]
-        dy = xy[1] - prev_xy[1]
-        d = math.hypot(dx, dy)
-        dist_term = math.exp(-d / max(1.0, grid_px * 2.0))
-
-    # motion_boost: slightly favour blobs that are currently moving,
-    # but do NOT gate on it — stationary minis must still be detected.
-    base = (0.35 * area_term + 0.25 * circ_term + 0.10 * ecc_term + 0.30 * dist_term)
-    return float(base)
-
-def warp_centroid_to_cell(cx: float, cy: float, grid_w: int, grid_h: int, warp_w: int, warp_h: int) -> Tuple[int, int]:
-    cell_w = warp_w / float(grid_w)
-    cell_h = warp_h / float(grid_h)
-    col = int(np.clip(cx / cell_w, 0, grid_w - 1))
-    row = int(np.clip(cy / cell_h, 0, grid_h - 1))
-    return col, row
-
-def detect_bands(
-    warp_bgr: np.ndarray,
-    color_profiles: Dict[str, ColorProfile],
-    grid_px: float,
-    prev_state: Optional[Dict[str, Any]] = None,
-    motion_mask: Optional[np.ndarray] = None,
-) -> Tuple[Dict[str, Optional[BandDetection]], Dict[str, Any]]:
-    """
-    Two-mode detection per color:
-
-    SEARCHING — motion pixels exist on the board.
-                Hard-gate HSV detection to the motion region only.
-                Find the best color-matching blob inside that window.
-
-    HOLDING   — no motion anywhere (minis are stationary).
-                Do NOT scan the whole board — that causes false positives.
-                Hold the last known position from prev_state and emit a
-                synthetic detection so consensus keeps ticking correctly.
-    """
-    if prev_state is None:
-        prev_state = {}
-
-    hsv = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2HSV)
-    detections: Dict[str, Optional[BandDetection]] = {}
-    new_state: Dict[str, Any] = {}
-
-    expected_radius = 0.5 * grid_px
-    expected_area = math.pi * expected_radius * expected_radius * 0.55
-
-    min_area = (grid_px * grid_px) * 0.05
-    max_area = (grid_px * grid_px) * 2.00
-
-    # Build ring-annulus search windows from motion contours.
-    # We don't just dilate the whole motion mask — that covers the entire mini
-    # body and lets non-ring color blobs through.  Instead, for each motion
-    # contour we erode its filled mask to get the interior, subtract to get the
-    # outer ring border, and use that as the search region.  This means the HSV
-    # match only fires on the actual band pixels, not the mini body.
-    any_motion = False
-    motion_search: Optional[np.ndarray] = None
-    if motion_mask is not None:
-        any_motion = cv2.countNonZero(motion_mask) > 0
-        if any_motion:
-            # Find contours of the motion blobs
-            cnts_info = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            motion_cnts = cnts_info[0] if len(cnts_info) == 2 else cnts_info[1]
-
-            ring_map = np.zeros(motion_mask.shape[:2], dtype=np.uint8)
-            for mc in motion_cnts:
-                mc_area = float(cv2.contourArea(mc))
-                if mc_area < 4:
-                    continue
-
-                # Work on a tight crop around the contour — avoids eroding a
-                # full 1280×720 image with a potentially huge kernel each frame.
-                bx, by, bw, bh = cv2.boundingRect(mc)
-                pad = 4
-                x0 = max(0, bx - pad)
-                y0 = max(0, by - pad)
-                x1 = min(motion_mask.shape[1], bx + bw + pad)
-                y1 = min(motion_mask.shape[0], by + bh + pad)
-
-                crop_h, crop_w = y1 - y0, x1 - x0
-                filled_crop = np.zeros((crop_h, crop_w), dtype=np.uint8)
-                shifted = mc.astype(np.int32) - np.array([[[x0, y0]]])
-                cv2.drawContours(filled_crop, [shifted], -1, 255, thickness=-1)
-
-                equiv_r = math.sqrt(mc_area / math.pi)
-                ring_thickness = max(2, int(round(equiv_r * 0.90)))
-                # Cap kernel to crop size so erode doesn't exceed the image
-                ring_thickness = min(ring_thickness, min(crop_h, crop_w) // 2 - 1)
-                k = max(3, ring_thickness * 2 + 1)
-                ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-                interior_crop = cv2.erode(filled_crop, ek, iterations=1)
-                ring_crop = cv2.subtract(filled_crop, interior_crop)
-                ring_crop = cv2.dilate(ring_crop, None, iterations=2)
-
-                ring_map[y0:y1, x0:x1] = cv2.bitwise_or(
-                    ring_map[y0:y1, x0:x1], ring_crop
-                )
-
-            motion_search = ring_map if cv2.countNonZero(ring_map) > 0 else \
-                cv2.dilate(motion_mask, None, iterations=4)  # fallback for tiny blobs
-
-    for color_name, profile in color_profiles.items():
-        prev = prev_state.get(color_name, {})
-        prev_xy: Optional[Tuple[float, float]] = prev.get("last_xy")
-
-        # ── HOLDING: no motion → hold last known position ──────────────────
-        if not any_motion:
-            if prev_xy is not None:
-                px, py = prev_xy
-                half = grid_px * 0.5
-                synth = BandDetection(
-                    color_name=color_name,
-                    cx=px, cy=py,
-                    contour_area=expected_area,
-                    circularity=1.0,
-                    ellipse_eccentricity=0.0,
-                    score=1.0,
-                    bbox=(int(px - half), int(py - half), int(half * 2), int(half * 2)),
-                )
-                detections[color_name] = synth
-                new_state[color_name] = {"last_xy": prev_xy, "last_score": 1.0}
-            else:
-                detections[color_name] = None
-                new_state[color_name] = {"last_xy": None, "last_score": 0.0}
-            continue
-
-        # ── SEARCHING: restrict HSV detection to motion region ─────────────
-        color_mask = _mask_for_profile(hsv, profile)
-        color_mask = _cleanup_mask(color_mask, grid_px)
-        search_mask = cv2.bitwise_and(color_mask, motion_search)
-
-        cnts_info = cv2.findContours(search_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cnts = cnts_info[0] if len(cnts_info) == 2 else cnts_info[1]
-
-        best: Optional[BandDetection] = None
-
-        for cnt in cnts:
-            area = float(cv2.contourArea(cnt))
-            if area < min_area or area > max_area:
-                continue
-
-            cxy = _contour_centroid(cnt)
-            if cxy is None:
-                continue
-            cx, cy = cxy
-
-            circ = _contour_circularity(cnt)
-            if circ < 0.15:
-                continue
-
-            ecc = _ellipse_eccentricity(cnt)
-            if ecc is not None and ecc > 0.92:
-                continue
-
-            x, y, w, h = cv2.boundingRect(cnt)
-            if max(w, h) / max(1.0, min(w, h)) > 3.5:
-                continue
-
-            score = _score_candidate(
-                area=area,
-                circularity=circ,
-                ecc=ecc,
-                expected_area=expected_area * (profile.expected_diameter_squares ** 2),
-                prev_xy=prev_xy,
-                xy=(cx, cy),
-                grid_px=grid_px,
-            )
-
-            cand = BandDetection(
-                color_name=color_name,
-                cx=cx, cy=cy,
-                contour_area=area,
-                circularity=circ,
-                ellipse_eccentricity=ecc,
-                score=score,
-                bbox=(int(x), int(y), int(w), int(h)),
-            )
-
-            if best is None or cand.score > best.score:
-                best = cand
-
-        detections[color_name] = best
-        if best is not None:
-            new_state[color_name] = {"last_xy": (best.cx, best.cy), "last_score": float(best.score)}
-        else:
-            # Motion exists but this color wasn't in it — hold last position
-            new_state[color_name] = {"last_xy": prev_xy, "last_score": 0.0}
-
-    # ── Spatial exclusivity (only during SEARCHING) ─────────────────────────
-    if any_motion:
-        color_names = list(detections.keys())
-        conflict_threshold = grid_px * 1.0
-        nulled: set = set()
-        for i in range(len(color_names)):
-            for j in range(i + 1, len(color_names)):
-                a_name, b_name = color_names[i], color_names[j]
-                if a_name in nulled or b_name in nulled:
-                    continue
-                a_det = detections[a_name]
-                b_det = detections[b_name]
-                if a_det is None or b_det is None:
-                    continue
-                if math.hypot(a_det.cx - b_det.cx, a_det.cy - b_det.cy) < conflict_threshold:
-                    if a_det.score >= b_det.score:
-                        detections[b_name] = None
-                        new_state[b_name]["last_xy"] = prev_state.get(b_name, {}).get("last_xy")
-                        nulled.add(b_name)
-                    else:
-                        detections[a_name] = None
-                        new_state[a_name]["last_xy"] = prev_state.get(a_name, {}).get("last_xy")
-                        nulled.add(a_name)
-
-    return detections, new_state
-
+LOCK_DROP_AFTER = 10  # consecutive ArUco misses before dropping lock
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Calibration helpers
+# Shared window / display helpers
 # ──────────────────────────────────────────────────────────────────────────────
+_WINDOW_SIZED: set = set()
 
-def _auto_band_name() -> str:
-    return time.strftime("band_%Y%m%d_%H%M%S")
-
-def _hue_ranges_from_samples(h_samples: np.ndarray, s_samples: np.ndarray, v_samples: np.ndarray) -> List[HSVRange]:
-    """
-    Build 1 or 2 HSV ranges from samples, handling hue wrap-around (red/magenta).
-    Uses robust percentiles.
-    """
-    if h_samples.size == 0:
-        return []
-
-    # Percentiles
-    h_lo = float(np.percentile(h_samples, 5))
-    h_hi = float(np.percentile(h_samples, 95))
-    s_lo = int(max(30, np.percentile(s_samples, 10)))
-    v_lo = int(max(30, np.percentile(v_samples, 10)))
-    s_hi = int(min(255, np.percentile(s_samples, 99)))
-    v_hi = int(min(255, np.percentile(v_samples, 99)))
-
-    # If the hue spread is huge, assume wrap-around and split into two clusters by circular distance to median
-    # Simple approach: try splitting at 90 degrees in hue space (0..179).
-    if (h_hi - h_lo) > 90:
-        # Consider near-0 and near-179 as a wrap case:
-        # Build two ranges: [0..h_lo2] and [h_hi2..179]
-        # Use tighter percentiles around the extremes.
-        low_cluster = h_samples[h_samples < 45]
-        high_cluster = h_samples[h_samples > 135]
-        ranges: List[HSVRange] = []
-        if low_cluster.size > 10:
-            lo2 = int(max(0, np.percentile(low_cluster, 5)))
-            hi2 = int(min(179, np.percentile(low_cluster, 95)))
-            ranges.append(HSVRange(lower=(lo2, s_lo, v_lo), upper=(hi2, s_hi, v_hi)))
-        if high_cluster.size > 10:
-            lo3 = int(max(0, np.percentile(high_cluster, 5)))
-            hi3 = int(min(179, np.percentile(high_cluster, 95)))
-            ranges.append(HSVRange(lower=(lo3, s_lo, v_lo), upper=(hi3, s_hi, v_hi)))
-        return ranges if ranges else [HSVRange(lower=(int(h_lo), s_lo, v_lo), upper=(int(h_hi), s_hi, v_hi))]
-
-    return [HSVRange(lower=(int(max(0, h_lo)), s_lo, v_lo), upper=(int(min(179, h_hi)), s_hi, v_hi))]
-
-
-def calibrate_profile_from_bundle(
-    bundle: core.FrameBundle,
-    *,
-    min_pixels: int = 150,
-) -> Optional[ColorProfile]:
-    """
-    Calibrate a band profile by sampling ONLY the ring border pixels of the
-    largest moving contour — not its interior.
-
-    The ring is a thin colored strip around the base of the mini.  Sampling the
-    full contour interior floods the HSV data with the mini body color (grey
-    plastic, etc.) and produces a range that matches everything.
-
-    Strategy:
-      1. Find the largest moving contour (the whole mini footprint).
-      2. Build a filled mask of that contour.
-      3. Erode it by ~30% of the contour's inscribed-circle radius to get the
-         interior.
-      4. Subtract interior from filled -> ring-border pixels only.
-      5. Sample HSV from those pixels with tighter percentiles (vivid pixels only).
-    """
-    if (not bundle.locked) or (bundle.warp_bgr is None) or (bundle.motion_warp is None) or (bundle.mask_warp is None):
-        return None
-
-    # Motion mask within ROI
-    fg = cv2.bitwise_and(bundle.motion_warp, bundle.mask_warp)
-    fg = cv2.erode(fg, None, iterations=1)
-    fg = cv2.dilate(fg, None, iterations=1)
-
-    cnts_info = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = cnts_info[0] if len(cnts_info) == 2 else cnts_info[1]
-    if not cnts:
-        return None
-
-    # Choose largest moving contour as the mini footprint
-    cnt = max(cnts, key=cv2.contourArea)
-    area = float(cv2.contourArea(cnt))
-    if area < float(min_pixels):
-        return None
-
-    # Filled mask of the whole mini footprint
-    filled = np.zeros(fg.shape[:2], dtype=np.uint8)
-    cv2.drawContours(filled, [cnt.astype(np.int32)], -1, 255, thickness=-1)
-
-    # Estimate ring thickness: ~30% of the equivalent circle radius.
-    # This peels off the outer ring while leaving the interior separate.
-    equiv_radius = math.sqrt(area / math.pi)
-    ring_thickness = max(2, int(round(equiv_radius * 0.90)))
-
-    erode_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (ring_thickness * 2 + 1, ring_thickness * 2 + 1)
-    )
-    interior = cv2.erode(filled, erode_kernel, iterations=1)
-
-    # Ring = filled minus interior
-    ring_mask = cv2.subtract(filled, interior)
-
-    # Sample HSV from ring pixels only
-    hsv = cv2.cvtColor(bundle.warp_bgr, cv2.COLOR_BGR2HSV)
-    h  = hsv[:, :, 0][ring_mask > 0].astype(np.float32)
-    s_ = hsv[:, :, 1][ring_mask > 0].astype(np.float32)
-    v  = hsv[:, :, 2][ring_mask > 0].astype(np.float32)
-
-    if h.size < min_pixels:
-        # Ring too thin — fall back to full contour
-        print(f"BAND CAL | Ring pixels too few ({h.size}), falling back to full contour")
-        h  = hsv[:, :, 0][filled > 0].astype(np.float32)
-        s_ = hsv[:, :, 1][filled > 0].astype(np.float32)
-        v  = hsv[:, :, 2][filled > 0].astype(np.float32)
-        if h.size < min_pixels:
-            return None
-
-    # Tighter percentiles — vivid ring pixels only, not washed-out antialiasing
-    h_lo = float(np.percentile(h,   8))
-    h_hi = float(np.percentile(h,  92))
-    s_lo = int(max(60,  np.percentile(s_,  15)))   # enforce minimum saturation
-    v_lo = int(max(40,  np.percentile(v,   15)))
-    s_hi = int(min(255, np.percentile(s_,  98)))
-    v_hi = int(min(255, np.percentile(v,   98)))
-
-    # Detect hue wrap-around (red/magenta spans 0 and 179)
-    ranges: List[HSVRange] = []
-    if (h_hi - h_lo) > 90:
-        low_cluster  = h[h <  45]
-        high_cluster = h[h > 135]
-        if low_cluster.size > 10:
-            lo2 = int(max(0,   np.percentile(low_cluster,   5)))
-            hi2 = int(min(179, np.percentile(low_cluster,  95)))
-            ranges.append(HSVRange(lower=(lo2, s_lo, v_lo), upper=(hi2, s_hi, v_hi)))
-        if high_cluster.size > 10:
-            lo3 = int(max(0,   np.percentile(high_cluster,  5)))
-            hi3 = int(min(179, np.percentile(high_cluster, 95)))
-            ranges.append(HSVRange(lower=(lo3, s_lo, v_lo), upper=(hi3, s_hi, v_hi)))
-        if not ranges:
-            ranges = [HSVRange(lower=(int(h_lo), s_lo, v_lo), upper=(int(h_hi), s_hi, v_hi))]
-    else:
-        ranges = [HSVRange(lower=(int(max(0, h_lo)), s_lo, v_lo), upper=(int(min(179, h_hi)), s_hi, v_hi))]
-
-    # Store measured ring diameter as a fraction of one grid square so the
-    # area scorer knows what size to expect during detection.
-    ring_diameter_squares = (equiv_radius * 2.0) / bundle.warp_w * bundle.grid_w \
-        if bundle.warp_w > 0 else 1.0
-
-    print(f"BAND CAL | ring_px={h.size}  H={h_lo:.0f}-{h_hi:.0f}  "
-          f"S={s_lo}-{s_hi}  V={v_lo}-{v_hi}  "
-          f"ring_diam_sq={ring_diameter_squares:.2f}")
-
-    return ColorProfile(ranges=ranges, expected_diameter_squares=ring_diameter_squares)
-
-
-def _profiles_to_jsonable(profiles: Dict[str, ColorProfile]) -> Dict[str, dict]:
-    out: Dict[str, dict] = {}
-    for name, prof in profiles.items():
-        out[name] = {
-            "ranges": [{"lower": list(r.lower), "upper": list(r.upper)} for r in prof.ranges],
-            "expected_diameter_squares": float(prof.expected_diameter_squares),
-        }
-    return out
-
-
-def save_profiles(path: Path, profiles: Dict[str, ColorProfile]) -> None:
-    path.write_text(json.dumps(_profiles_to_jsonable(profiles), indent=2), encoding="utf-8")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Profiles loading
-# ──────────────────────────────────────────────────────────────────────────────
-
-_PROFILES_PATH = Path(__file__).with_name("band_profiles.json")
-
-def _load_profiles(path: Path = _PROFILES_PATH) -> Dict[str, ColorProfile]:
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Missing {path.name}. Create it to define HSV ranges for band tracking."
-        )
-
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or not data:
-        raise ValueError(f"{path.name} must be a non-empty JSON object.")
-
-    out: Dict[str, ColorProfile] = {}
-    for color_name, cfg in data.items():
-        if not isinstance(cfg, dict):
-            continue
-        ranges_cfg = cfg.get("ranges")
-        if not isinstance(ranges_cfg, list) or not ranges_cfg:
-            continue
-        ranges: List[HSVRange] = []
-        for r in ranges_cfg:
-            if not isinstance(r, dict):
-                continue
-            lo = r.get("lower")
-            hi = r.get("upper")
-            if (
-                isinstance(lo, list) and len(lo) == 3 and
-                isinstance(hi, list) and len(hi) == 3
-            ):
-                ranges.append(HSVRange(tuple(int(x) for x in lo), tuple(int(x) for x in hi)))
-        if not ranges:
-            continue
-        exp = cfg.get("expected_diameter_squares", 1.0)
+def ensure_window(name: str, w: int = 1280, h: int = 720) -> None:
+    """Create a resizable window and size it once."""
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    if name not in _WINDOW_SIZED:
         try:
-            exp = float(exp)
+            cv2.resizeWindow(name, int(w), int(h))
         except Exception:
-            exp = 1.0
-        out[str(color_name)] = ColorProfile(ranges=ranges, expected_diameter_squares=exp)
-
-    if not out:
-        raise ValueError(f"{path.name} did not contain any valid profiles.")
-    return out
+            pass
+        _WINDOW_SIZED.add(name)
 
 
-def render_calibration_preview(
-    bundle: "core.FrameBundle",
-    profiles=None,
-    min_pixels: int = 150,
-) -> "np.ndarray":
-    """
-    Fast calibration preview. Uses bundle.motion_warp (already 200ms-filtered).
-    Cheap: cropped erode, contour drawing instead of addWeighted, no detect_bands.
-    """
-    vis = bundle.warp_bgr.copy() if bundle.warp_bgr is not None else np.zeros((100, 100, 3), dtype=np.uint8)
+def show_homography_view(
+    cam_frame: np.ndarray,
+    H_view: Optional[np.ndarray],
+    warp_w: int,
+    warp_h: int,
+    grid_w: int,
+    grid_h: int,
+) -> None:
+    """Render a warped+gridded debug view of the current homography."""
+    count = 0
+    if ARUCO_DET is not None:
+        gray = cv2.cvtColor(cam_frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = ARUCO_DET.detectMarkers(gray)
+        if ids is not None and len(ids) > 0:
+            count = len(ids)
 
-    if bundle.motion_warp is None or bundle.mask_warp is None:
-        cv2.putText(vis, "No motion data", (12, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
-        return vis
+    if H_view is not None:
+        pad = int(DEST_PAD_PX)
+        canvas_w = int(warp_w + 2 * pad)
+        canvas_h = int(warp_h + 2 * pad)
 
-    fg = cv2.bitwise_and(bundle.motion_warp, bundle.mask_warp)
-    cnts_info = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = cnts_info[0] if len(cnts_info) == 2 else cnts_info[1]
+        T = np.array([[1, 0, pad], [0, 1, pad], [0, 0, 1]], dtype=np.float32)
+        H_pad = T @ H_view
 
-    for cnt in cnts:
-        cv2.drawContours(vis, [cnt.astype(np.int32)], -1, (80, 80, 80), 1)
+        warped_dbg = cv2.warpPerspective(cam_frame, H_pad, (canvas_w, canvas_h))
 
-    if not cnts:
-        cv2.putText(vis, "No motion detected — move the mini", (12, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2, cv2.LINE_AA)
+        xs = np.linspace(0, warp_w, grid_w + 1)
+        ys = np.linspace(0, warp_h, grid_h + 1)
+        xs_i = np.unique(np.round(xs + pad).astype(int))
+        ys_i = np.unique(np.round(ys + pad).astype(int))
+
+        thick = 2
+        lt = cv2.LINE_AA
+        for xg in xs_i[1:-1]:
+            cv2.line(warped_dbg, (int(xg), pad), (int(xg), pad + warp_h - 1), (0, 255, 0), thick, lt)
+        for yg in ys_i[1:-1]:
+            cv2.line(warped_dbg, (pad, int(yg)), (pad + warp_w - 1, int(yg)), (0, 255, 0), thick, lt)
+        cv2.rectangle(warped_dbg, (pad, pad), (pad + warp_w - 1, pad + warp_h - 1), (0, 255, 0), thick, lt)
     else:
-        best = max(cnts, key=cv2.contourArea)
-        area = float(cv2.contourArea(best))
-        x, y, w, h = cv2.boundingRect(best)
+        warped_dbg = np.zeros((warp_h, warp_w, 3), dtype=np.uint8)
 
-        if area < min_pixels:
-            cv2.drawContours(vis, [best.astype(np.int32)], -1, (0, 0, 255), 2)
-            cv2.putText(vis, f"Too small (area={int(area)}, need {min_pixels})", (12, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
+    cv2.putText(warped_dbg, f"ArUco markers: {count}", (12, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.putText(warped_dbg, f"ArUco markers: {count}", (12, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
+
+    ensure_window("Homography view (debug)", 1280, 720)
+    cv2.imshow("Homography view (debug)", warped_dbg)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ArUco detector
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    import cv2.aruco as aruco  # type: ignore
+    ARUCO_DICT = aruco.getPredefinedDictionary(aruco.DICT_6X6_250)
+    ARUCO_PARAMS = aruco.DetectorParameters()
+    ARUCO_DET = aruco.ArucoDetector(ARUCO_DICT, ARUCO_PARAMS)
+except Exception:
+    ARUCO_DET = None
+
+CORNER_IDS = {"TL": 0, "TR": 1, "BR": 2, "BL": 3}
+REQUIRED_IDS = set(CORNER_IDS.values())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Camera undistortion (lazy, copied)
+# ──────────────────────────────────────────────────────────────────────────────
+_camera_params_cache: Optional[Tuple[Optional[np.ndarray], Optional[np.ndarray]]] = None
+
+
+def get_camera_params() -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    global _camera_params_cache
+    if _camera_params_cache is None:
+        if os.path.exists("camera_matrix.npy") and os.path.exists("dist_coeffs.npy"):
+            _camera_params_cache = (
+                np.load("camera_matrix.npy"),
+                np.load("dist_coeffs.npy"),
+            )
         else:
-            # Cropped erode — only the bounding box, not the full frame
-            pad = 4
-            x0, y0 = max(0, x - pad), max(0, y - pad)
-            x1 = min(fg.shape[1], x + w + pad)
-            y1 = min(fg.shape[0], y + h + pad)
-            crop_h, crop_w = y1 - y0, x1 - x0
+            _camera_params_cache = (None, None)
+    return _camera_params_cache
 
-            filled_crop = np.zeros((crop_h, crop_w), dtype=np.uint8)
-            shifted = best.astype(np.int32) - np.array([[[x0, y0]]])
-            cv2.drawContours(filled_crop, [shifted], -1, 255, thickness=-1)
-
-            equiv_radius = math.sqrt(area / math.pi)
-            ring_thickness = max(2, min(int(round(equiv_radius * 0.90)), min(crop_h, crop_w) // 2 - 1))
-            k = max(3, ring_thickness * 2 + 1)
-            ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-            interior_crop = cv2.erode(filled_crop, ek, iterations=1)
-            ring_crop = cv2.subtract(filled_crop, interior_crop)
-
-            # Draw ring as contour outline (cheap, no addWeighted)
-            ring_cnts_info = cv2.findContours(ring_crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            ring_cnts = ring_cnts_info[0] if len(ring_cnts_info) == 2 else ring_cnts_info[1]
-            for rc in ring_cnts:
-                cv2.drawContours(vis, [rc.astype(np.int32) + np.array([[[x0, y0]]])], -1, (255, 200, 0), 2)
-
-            cv2.drawContours(vis, [best.astype(np.int32)], -1, (0, 255, 0), 2)
-
-            # HSV swatch from crop only
-            hsv_crop = cv2.cvtColor(bundle.warp_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
-            rh = hsv_crop[:, :, 0][ring_crop > 0].astype(np.float32)
-            rs = hsv_crop[:, :, 1][ring_crop > 0].astype(np.float32)
-            rv = hsv_crop[:, :, 2][ring_crop > 0].astype(np.float32)
-            if rh.size > 0:
-                mh, ms, mv = float(np.median(rh)), float(np.median(rs)), float(np.median(rv))
-                swatch = cv2.cvtColor(
-                    np.array([[[int(mh), int(ms), int(mv)]]], dtype=np.uint8), cv2.COLOR_HSV2BGR
-                )[0][0].tolist()
-                sw = 48
-                vis[8:8 + sw, 8:8 + sw] = swatch
-                cv2.rectangle(vis, (8, 8), (8 + sw, 8 + sw), (255, 255, 255), 1)
-                cv2.putText(vis, f"ring_px={rh.size}  H={mh:.0f}  S={ms:.0f}  V={mv:.0f}",
-                            (8 + sw + 8, 8 + sw // 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
-
-    cv2.putText(vis, "CALIBRATION PREVIEW — move band then press Calibrate band", (12, vis.shape[0] - 12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 1, cv2.LINE_AA)
-
-
-
-    return vis
-
-MIN_SCORE = 0.55
-CONSENSUS_N = 6
-CONSENSUS_K = 4
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Engine session runner
+# Warped helpers (copied)
 # ──────────────────────────────────────────────────────────────────────────────
+def warp_gray_blur(frame_bgr: np.ndarray, H_use: np.ndarray, warp_w: int, warp_h: int) -> np.ndarray:
+    warped = cv2.warpPerspective(frame_bgr, H_use, (int(warp_w), int(warp_h)))
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (21, 21), 0)
+    return blur
 
-def _cell_label_rc(row: int, col: int) -> str:
-    return f"r{int(row)}c{int(col)}"
+
+def update_bg_ema(bg_f32: Optional[np.ndarray], cur_u8: np.ndarray, update_mask_u8: np.ndarray, alpha: float) -> np.ndarray:
+    if bg_f32 is None:
+        return cur_u8.astype(np.float32)
+    m = (update_mask_u8 > 0)
+    bg_f32[m] = (1.0 - alpha) * bg_f32[m] + alpha * cur_u8[m].astype(np.float32)
+    return bg_f32
 
 
-def begin_session(
-    on_mini_moved,
-    camera_index=None,
-    show_windows=True,
+# ──────────────────────────────────────────────────────────────────────────────
+# ArUco + homography helpers (copied)
+# ──────────────────────────────────────────────────────────────────────────────
+def detect_markers(cam_bgr: np.ndarray):
+    if ARUCO_DET is None:
+        return None, None, None
+    gray = cv2.cvtColor(cam_bgr, cv2.COLOR_BGR2GRAY)
+    return ARUCO_DET.detectMarkers(gray)
+
+
+def _corner_pt(id_to_c: Dict[int, np.ndarray], marker_id: int, corner_idx: int) -> np.ndarray:
+    return id_to_c[marker_id][0][corner_idx].astype(np.float32)
+
+
+def solve_H_from_markers(
+    cam_bgr: np.ndarray,
+    warp_w: int,
+    warp_h: int,
+    corner_ids: Dict[str, int],
 ):
-    """
-    Band-tracking session runner. Uses cv_core for lock/warp/masks.
-    Emits mini_id=color_name.
-    """
-    sel = s.load_last_selection() or {}
-    mode = (sel.get("mode") or "self_hosted").strip().lower()
+    corners, ids, _ = detect_markers(cam_bgr)
+    if ids is None:
+        return None, 0, [], None, None
 
-    # Control panel is still used for toggles/status and consistent UX.
-    panel = ControlPanel(mode=mode)
-    panel.show()
+    seen_ids = sorted([int(x[0]) for x in ids])
+    detected_count = len(seen_ids)
 
-    # Load color profiles from band_profiles.json
-    # Load color profiles (optional at startup; user can calibrate new bands)
+    if detected_count < 4:
+        return None, detected_count, seen_ids, corners, ids
+
+    id_to_c = {int(ids[i][0]): corners[i] for i in range(len(ids))}
     try:
-        profiles = _load_profiles(_PROFILES_PATH)
-    except Exception:
-        profiles = {}
+        tl = _corner_pt(id_to_c, corner_ids["TL"], 0)
+        tr = _corner_pt(id_to_c, corner_ids["TR"], 1)
+        br = _corner_pt(id_to_c, corner_ids["BR"], 2)
+        bl = _corner_pt(id_to_c, corner_ids["BL"], 3)
+    except KeyError:
+        return None, detected_count, seen_ids, corners, ids
+
+    pts_src = np.array([tl, tr, br, bl], dtype=np.float32)
+    pts_dst = np.array([[0, 0], [warp_w - 1, 0], [warp_w - 1, warp_h - 1], [0, warp_h - 1]], dtype=np.float32)
+    H_view, _ = cv2.findHomography(pts_src, pts_dst, cv2.RANSAC, 3.0)
+    return (H_view.astype(np.float32) if H_view is not None else None), detected_count, seen_ids, corners, ids
 
 
-    # Start core session
-    sess = core.CVCoreSession(camera_index=camera_index)
+def roi_masks(
+    cam_bgr: np.ndarray,
+    H_view: Optional[np.ndarray],
+    warp_w: int,
+    warp_h: int,
+    corner_ids: Dict[str, int],
+):
+    corners, ids, _ = detect_markers(cam_bgr)
+    if ids is None or H_view is None:
+        return None, None
 
-    # Inform foundry output of grid params
+    id_to_c = {int(ids[i][0]): corners[i] for i in range(len(ids))}
     try:
-        fo.set_grid_params(sess.warp_w, sess.warp_h, sess.grid_w, sess.grid_h)
+        tl = _corner_pt(id_to_c, corner_ids["TL"], 0)
+        tr = _corner_pt(id_to_c, corner_ids["TR"], 1)
+        br = _corner_pt(id_to_c, corner_ids["BR"], 2)
+        bl = _corner_pt(id_to_c, corner_ids["BL"], 3)
+    except KeyError:
+        return None, None
+
+    poly_cam = np.array([tl, tr, br, bl], dtype=np.float32)
+    h, w = cam_bgr.shape[:2]
+    mask_cam = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillConvexPoly(mask_cam, poly_cam.astype(np.int32), 255)
+    mask_warp = cv2.warpPerspective(mask_cam, H_view, (warp_w, warp_h), flags=cv2.INTER_NEAREST)
+    return mask_cam, mask_warp
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Session / bundle
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass
+class CoreStatus:
+    marker_count: int
+    seen_ids: List[int]
+    missing_ids: List[int]
+    locked: bool
+    lock_miss_streak: int
+    lock_lost_reason: str
+
+
+@dataclass
+class FrameBundle:
+    # Always present
+    frame_idx: int
+    cam_bgr: np.ndarray  # undistorted (if calibration present), camera space
+    warp_w: int
+    warp_h: int
+    grid_w: int
+    grid_h: int
+
+    # Lock/homography
+    locked: bool
+    H_use: np.ndarray
+    mask_cam: Optional[np.ndarray]
+    mask_warp: Optional[np.ndarray]
+
+    # Debug/ArUco
+    last_marker_count: int
+    last_seen_ids: List[int]
+    last_missing_ids: List[int]
+    last_aruco_ids: Optional[np.ndarray]
+    last_aruco_corners: Optional[Any]  # OpenCV corners structure
+
+    # Pipeline outputs (only valid when locked=True)
+    warp_blur: Optional[np.ndarray]
+    warp_bgr: Optional[np.ndarray]
+    bg_warp_u8: Optional[np.ndarray]
+    motion_warp: Optional[np.ndarray]
+    motion_cam: Optional[np.ndarray]
+    shadowfree_cam: Optional[np.ndarray]
+    final_mask_cam: Optional[np.ndarray]
+
+
+def _resolve_grid_and_warp_from_setup() -> Tuple[int, int, int, int]:
+    warp_w = DEFAULT_WARP_W
+    warp_h = DEFAULT_WARP_H
+    grid_w = DEFAULT_GRID_W
+    grid_h = DEFAULT_GRID_H
+    try:
+        if hasattr(s, "warp_w") and s.warp_w is not None:
+            warp_w = int(s.warp_w)
+        if hasattr(s, "warp_h") and s.warp_h is not None:
+            warp_h = int(s.warp_h)
+        if hasattr(s, "grid_cols") and s.grid_cols is not None:
+            grid_w = int(s.grid_cols)
+        if hasattr(s, "grid_rows") and s.grid_rows is not None:
+            grid_h = int(s.grid_rows)
     except Exception:
         pass
+    return warp_w, warp_h, grid_w, grid_h
 
-    control_panel_shown = False
-    prev_state: Dict[str, Any] = {}
-    switch_to: Optional[str] = None
 
-    # Movement consensus buffers per color
-    from collections import deque, Counter
-    cell_hist: Dict[str, deque] = {}
-    last_emitted: Dict[str, str] = {}
+class CVCoreSession:
+    """
+    Owns camera + lock state + shared mask pipeline.
+    Engines iterate frames() and consume the returned FrameBundle.
+    """
 
-    fps_count = 0
-    last_print = time.perf_counter()
+    def __init__(
+        self,
+        camera_index: Optional[int] = None,
+        warp_w: Optional[int] = None,
+        warp_h: Optional[int] = None,
+        grid_w: Optional[int] = None,
+        grid_h: Optional[int] = None,
+        *,
+        aruco_every_n: int = ARUCO_EVERY_N,
+        aruco_every_n_fast: int = ARUCO_EVERY_N_FAST,
+        lock_drop_after: int = LOCK_DROP_AFTER,
+        warp_motion_thresh: int = WARP_MOTION_THRESH,
+        fog_change_ratio: float = FOG_CHANGE_RATIO,
+        bg_alpha_slow: float = BG_ALPHA_SLOW,
+        bg_alpha_fast: float = BG_ALPHA_FAST,
+    ):
+        sel = s.load_last_selection() or {}
+        if camera_index is None:
+            camera_index = sel.get("webcam_index", 0)
 
-    # Window open flags
-    cam_window_open = False
-    warp_window_open = False
-    homography_window_open = False
-    calib_preview_window_open = False
-    motion_warp_window_open = False
-    motion_cam_window_open = False
-    shadowfree_window_open = False
-    final_mask_window_open = False
+        if warp_w is None or warp_h is None or grid_w is None or grid_h is None:
+            _ww, _wh, _gw, _gh = _resolve_grid_and_warp_from_setup()
+            warp_w = _ww if warp_w is None else int(warp_w)
+            warp_h = _wh if warp_h is None else int(warp_h)
+            grid_w = _gw if grid_w is None else int(grid_w)
+            grid_h = _gh if grid_h is None else int(grid_h)
 
-    DRAW_ARUCO_OVERLAY = False
+        self.camera_index = int(camera_index)
+        self.warp_w = int(warp_w)
+        self.warp_h = int(warp_h)
+        self.grid_w = int(grid_w)
+        self.grid_h = int(grid_h)
 
-    # Display throttle — imshow is expensive on macOS (synchronous GPU upload).
-    # CV detection runs every frame; windows only refresh at DISPLAY_FPS.
-    DISPLAY_FPS = 15.0
-    _display_interval = 1.0 / DISPLAY_FPS
-    _last_display = 0.0
+        self.aruco_every_n = int(aruco_every_n)
+        self.aruco_every_n_fast = int(aruco_every_n_fast)
+        self.lock_drop_after = int(lock_drop_after)
 
-    try:
-        for bundle in sess.frames():
-            # keep UI responsive
-            if not panel.pump():
+        self.warp_motion_thresh = int(warp_motion_thresh)
+        self.fog_change_ratio = float(fog_change_ratio)
+        self.bg_alpha_slow = float(bg_alpha_slow)
+        self.bg_alpha_fast = float(bg_alpha_fast)
+
+        # Foundry grid params (optional)
+        if fo is not None and hasattr(fo, "set_grid_params"):
+            try:
+                fo.set_grid_params(self.warp_w, self.warp_h, self.grid_w, self.grid_h)
+            except Exception:
+                pass
+
+        self.frame_idx = 0
+
+        # Camera calibration
+        self.cam_mtx, self.cam_dist = get_camera_params()
+
+        # Open camera
+        self.cap = cv2.VideoCapture(self.camera_index)
+        if not self.cap.isOpened():
+            raise RuntimeError("Failed to open webcam.")
+
+        # Warm-up reads — macOS cameras need time to stabilise after open
+        for _ in range(8):
+            self.cap.read()
+        time.sleep(0.3)  # let the camera buffer refill before capturing background
+
+        # Background in camera space — retry a few times in case the buffer
+        # isn't ready yet (common on macOS with USB cameras).
+        frame_bg = None
+        for attempt in range(6):
+            ok_bg, frame_bg = self.cap.read()
+            if ok_bg and frame_bg is not None:
                 break
+            time.sleep(0.1)
+        if frame_bg is None:
+            raise RuntimeError("Failed to capture camera-space background after retries.")
+        frame_bg = self._maybe_undistort(frame_bg)
+        gray_bg = cv2.cvtColor(frame_bg, cv2.COLOR_BGR2GRAY)
+        blur_bg = cv2.GaussianBlur(gray_bg, (21, 21), 0)
+        self.BG_cam = {"bgr": frame_bg, "blur": blur_bg}
 
-            # Compute display gate once per loop iteration — used by all imshow calls below
-            _now = time.perf_counter()
-            _do_display = show_windows and (_now - _last_display >= _display_interval)
-            if _do_display:
-                _last_display = _now
-
-            actions = panel.pop_actions()
-            if actions.get("calibrate_band"):
-                req = actions.get("calibrate_band")
-                name = None
-                auto = False
-                if isinstance(req, dict):
-                    name = (req.get("name") or None)
-                    auto = bool(req.get("auto", False))
-                if not bundle.locked:
-                    panel.set_hint("Calibrate: wait for ArUco lock")
-                else:
-                    prof = calibrate_profile_from_bundle(bundle)
-                    if prof is None:
-                        panel.set_hint("Calibrate: move ONE band in view")
-                    else:
-                        if not name:
-                            name = _auto_band_name() if auto else _auto_band_name()
-                        profiles[name] = prof
-                        try:
-                            save_profiles(_PROFILES_PATH, profiles)
-                        except Exception:
-                            pass
-                        panel.set_hint(f"Calibrated band: {name}")
-                # continue frame
-                continue
-            if actions.get("switch_engine") in ("blob", "band"):
-                switch_to = actions.get("switch_engine")
-                break
-            if actions.get("recapture_bg"):
-                try:
-                    # Use the current live frame directly — avoids opening a second
-                    # camera connection which can conflict with CVCoreSession on macOS.
-                    cam = bundle.cam_bgr
-                    gray = cv2.cvtColor(cam, cv2.COLOR_BGR2GRAY)
-                    blur = cv2.GaussianBlur(gray, (21, 21), 0)
-                    sess.BG_cam = {"bgr": cam.copy(), "blur": blur}
-                    bg_warp = core.warp_gray_blur(cam, sess.H_saved, sess.warp_w, sess.warp_h)
-                    sess.BG_warp_f32 = bg_warp.astype(np.float32)
-                    sess._bg_seeded = True
-                    panel.set_hint("Background recaptured ✅")
-                except Exception as e:
-                    panel.set_hint(f"Recapture failed: {e}")
-            if actions.get("exit"):
-                break
-
-            tog = panel.get_toggles()
-            show_cam_view = bool(tog.get("show_live_camera", False))
-            show_h_view = bool(tog.get("show_homography", False))
-            show_calib_preview = bool(tog.get("show_calib_preview", True))
-            show_motion_warp_view = bool(tog.get("show_motion_warp", False))
-            show_motion_cam_view  = bool(tog.get("show_motion_cam", False))
-            show_shadowfree_view  = bool(tog.get("show_shadowfree", False))
-            show_final_mask_view  = bool(tog.get("show_final_mask", False))
-            show_warp_view = bool(tog.get("show_identify", False))  # reuse Identify toggle for Warp view
-
-            # Apply motion threshold from slider — updates cv_core session live
-            sess.warp_motion_thresh = panel.get_motion_thresh()
-
-            # Update status (on every frame; lightweight)
-            panel.set_status(
-                locked=bool(bundle.locked),
-                marker_count=int(bundle.last_marker_count),
-                missing_ids=list(bundle.last_missing_ids),
-            )
-
-            # show panel after first lock
-            if bundle.locked and (not control_panel_shown):
-                panel.show()
-                control_panel_shown = True
-
-            # FPS update (once per second)
-            fps_count += 1
-            now = time.perf_counter()
-            if now - last_print >= 1.0:
-                fps = fps_count / (now - last_print)
-                panel.set_status(fps=fps)
-                fps_count = 0
-                last_print = now
-
-            # ── Camera view (shown even before lock — needed to aim the camera) ──
-            if show_windows and show_cam_view:
-                if _do_display:
-                    vis_cam = bundle.cam_bgr.copy()
-                    if DRAW_ARUCO_OVERLAY and core.ARUCO_DET is not None:
-                        if bundle.last_aruco_ids is not None and bundle.last_aruco_corners is not None:
-                            try:
-                                import cv2.aruco as aruco
-                                aruco.drawDetectedMarkers(vis_cam, bundle.last_aruco_corners, bundle.last_aruco_ids)
-                            except Exception:
-                                pass
-                    if not bundle.locked:
-                        msg = f"Waiting for ArUco lock ({bundle.last_marker_count}/4), missing: {bundle.last_missing_ids}"
-                        cv2.putText(vis_cam, msg, (20, 40),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-                    ensure_window("Camera (band)", 1280, 720)
-                    cv2.imshow("Camera (band)", vis_cam)
-                cam_window_open = True
-                cv2.waitKey(1)
-            else:
-                if cam_window_open:
-                    try:
-                        cv2.waitKey(1)
-                        cv2.destroyWindow("Camera (band)")
-                    except Exception:
-                        pass
-                    cam_window_open = False
-
-            if not bundle.locked:
-                # no lock -> no warp_bgr -> can't run band detection
-                continue
-
-            if bundle.warp_bgr is None:
-                continue
-
-            # Compute grid_px in warp space (min cell dimension)
-            grid_px = min(bundle.warp_w / float(bundle.grid_w), bundle.warp_h / float(bundle.grid_h))
-
-            dets, prev_state = detect_bands(
-                warp_bgr=bundle.warp_bgr,
-                color_profiles=profiles,
-                grid_px=grid_px,
-                prev_state=prev_state,
-                motion_mask=bundle.motion_warp,
-            )
-
-
-            # ── Window rendering (optional) ─────────────────────────────────────
-            # Throttled to DISPLAY_FPS — imshow is a synchronous GPU upload on macOS.
-            # CV detection still runs every frame; only the screen refresh is limited.
-            any_cv_window_open = False
-            if cam_window_open:
-                any_cv_window_open = True  # camera window is managed above the lock check
-
-            if show_windows and show_warp_view and (bundle.warp_bgr is not None):
-                if _do_display:
-                    vis_warp = bundle.warp_bgr.copy()
-                    for cname, det in dets.items():
-                        if det is None:
-                            continue
-                        if det.score < MIN_SCORE:
-                            continue
-                        x, y, w, h = det.bbox
-                        cv2.rectangle(vis_warp, (x, y), (x+w, y+h), (0, 255, 255), 2)
-                        cv2.putText(vis_warp, f"{cname} {det.score:.2f}", (x, max(18, y-6)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
-                        cv2.putText(vis_warp, f"{cname} {det.score:.2f}", (x, max(18, y-6)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv2.LINE_AA)
-                    ensure_window("Warp (band)", 1280, 720)
-                    cv2.imshow("Warp (band)", vis_warp)
-                any_cv_window_open = True
-                warp_window_open = True
-            else:
-                if warp_window_open:
-                    try:
-                        cv2.waitKey(1)
-                        cv2.destroyWindow("Warp (band)")
-                    except Exception:
-                        pass
-                    warp_window_open = False
-
-            if show_windows and show_calib_preview and bundle.locked:
-                if _do_display:
-                    preview = render_calibration_preview(bundle, profiles=profiles)
-                    ensure_window("Calibration Preview", 1280, 720)
-                    cv2.imshow("Calibration Preview", preview)
-                any_cv_window_open = True
-                calib_preview_window_open = True
-            else:
-                if calib_preview_window_open:
-                    try:
-                        cv2.waitKey(1)
-                        cv2.destroyWindow("Calibration Preview")
-                    except Exception:
-                        pass
-                    calib_preview_window_open = False
-
-            if show_windows and show_motion_warp_view and (bundle.motion_warp is not None):
-                if _do_display:
-                    ensure_window("Motion (warp)", 1280, 720)
-                    cv2.imshow("Motion (warp)", bundle.motion_warp)
-                any_cv_window_open = True
-                motion_warp_window_open = True
-            else:
-                if motion_warp_window_open:
-                    try:
-                        cv2.waitKey(1)
-                        cv2.destroyWindow("Motion (warp)")
-                    except Exception:
-                        pass
-                    motion_warp_window_open = False
-
-            if show_windows and show_motion_cam_view and (bundle.motion_cam is not None):
-                if _do_display:
-                    ensure_window("Motion (camera)", 1280, 720)
-                    cv2.imshow("Motion (camera)", bundle.motion_cam)
-                any_cv_window_open = True
-                motion_cam_window_open = True
-            else:
-                if motion_cam_window_open:
-                    try:
-                        cv2.waitKey(1)
-                        cv2.destroyWindow("Motion (camera)")
-                    except Exception:
-                        pass
-                    motion_cam_window_open = False
-
-            if show_windows and show_shadowfree_view and (bundle.shadowfree_cam is not None):
-                if _do_display:
-                    ensure_window("Shadow-free mask", 1280, 720)
-                    cv2.imshow("Shadow-free mask", bundle.shadowfree_cam)
-                any_cv_window_open = True
-                shadowfree_window_open = True
-            else:
-                if shadowfree_window_open:
-                    try:
-                        cv2.waitKey(1)
-                        cv2.destroyWindow("Shadow-free mask")
-                    except Exception:
-                        pass
-                    shadowfree_window_open = False
-
-            if show_windows and show_final_mask_view and (bundle.final_mask_cam is not None):
-                if _do_display:
-                    ensure_window("Final mask", 1280, 720)
-                    cv2.imshow("Final mask", bundle.final_mask_cam)
-                any_cv_window_open = True
-                final_mask_window_open = True
-            else:
-                if final_mask_window_open:
-                    try:
-                        cv2.waitKey(1)
-                        cv2.destroyWindow("Final mask")
-                    except Exception:
-                        pass
-                    final_mask_window_open = False
-
-            # Emit movements (with score gate + consensus)
-            for color_name, det in dets.items():
-                if det is None:
-                    continue
-                if det.score < MIN_SCORE:
-                    continue
-
-                col, row = warp_centroid_to_cell(det.cx, det.cy, bundle.grid_w, bundle.grid_h, bundle.warp_w, bundle.warp_h)
-                cell = _cell_label_rc(row, col)
-
-                buf = cell_hist.setdefault(color_name, deque(maxlen=CONSENSUS_N))
-                buf.append(cell)
-
-                most, count = Counter(buf).most_common(1)[0]
-                prev = last_emitted.get(color_name)
-
-                if count >= CONSENSUS_K and most != prev:
-                    last_emitted[color_name] = most
-                    if on_mini_moved is not None:
-                        on_mini_moved(color_name, most)
-
-            # Update positions panel every frame with last known positions
-            positions = {}
-            for color_name in dets:
-                raw = last_emitted.get(color_name)
-                if raw is not None:
-                    parts = raw[1:].split('c')
-                    try:
-                        r_int, c_int = int(parts[0]), int(parts[1])
-                        positions[color_name] = rc_to_a1(r_int, c_int)
-                    except Exception:
-                        positions[color_name] = raw
-                else:
-                    positions[color_name] = None
-            panel.update_positions(positions)
-
-            # Homography debug view
-            if show_windows and show_h_view:
-                core.show_homography_view(bundle.cam_bgr, bundle.H_use, bundle.warp_w, bundle.warp_h, bundle.grid_w, bundle.grid_h)
-                homography_window_open = True
-                any_cv_window_open = True
-            else:
-                if homography_window_open:
-                    try:
-                        cv2.destroyWindow("Homography view (debug)")
-                    except Exception:
-                        pass
-                    homography_window_open = False
-
-            # Allow quit via OpenCV key (non-blocking)
-            if show_windows and any_cv_window_open:
-                k = cv2.waitKey(1) & 0xFF
-                if k == ord('q'):
-                    break
-                elif k == ord('a'):
-                    DRAW_ARUCO_OVERLAY = not DRAW_ARUCO_OVERLAY
-                elif k == ord('h'):
-                    show_h_view = not show_h_view
-                elif k == ord('r'):
-                    panel._act_recapture_bg()
-
-    finally:
+        # Lock state
+        self.H_saved = DEFAULT_H.copy()
         try:
-            sess.close()
+            self._H_inv: np.ndarray = np.linalg.inv(DEFAULT_H).astype(np.float32)
         except Exception:
-            pass
+            self._H_inv = np.eye(3, dtype=np.float32)
+        self.last_mask_cam: Optional[np.ndarray] = None
+        self.last_mask_warp: Optional[np.ndarray] = None
+
+        # Shadow pipeline throttle — run every N frames to keep FPS stable.
+        # Cached results are reused on skipped frames.
+        self._SHADOW_EVERY_N: int = 6
+        self._shadow_frame_count: int = 0
+        self._last_shadowfree_cam: Optional[np.ndarray] = None
+        self._last_final_mask_cam: Optional[np.ndarray] = None
+
+        self.last_marker_count = 0
+        self.last_seen_ids: List[int] = []
+        self.last_missing_ids: List[int] = sorted(list(REQUIRED_IDS))
+        self.lock_lost_reason = ""
+        self.lock_miss_streak = 0
+
+        self.last_aruco_corners = None
+        self.last_aruco_ids = None
+
+        # Warp BG — seeded on first locked frame (after ArUco lock gives us the
+        # real homography). Initialising with identity-warped content causes a
+        # massive false-motion burst on frame 1 because H_saved is still eye(3).
+        self.BG_warp_f32: Optional[np.ndarray] = None  # None = not yet seeded
+        self._bg_seeded: bool = False
+
+        # Post-motion healing: after a pixel that was genuinely moving goes
+        # still, keep updating its background at bg_alpha_fast for _heal_ms so
+        # fog-of-war reveals get absorbed quickly. Only fires on pixels that
+        # were actually in motion — never on cold/noisy pixels.
+        self._heal_ms: int = 1500
+        self._heal_acc = np.zeros((int(self.warp_h), int(self.warp_w)), dtype=np.uint16)
+
+        # FPS tracking (used for timing report only)
+        self._last_frame_time: float = time.perf_counter()
+        self._fps_estimate: float = 30.0
+
+    def _maybe_undistort(self, cam_bgr: np.ndarray) -> np.ndarray:
+        if self.cam_mtx is not None and self.cam_dist is not None:
+            try:
+                return cv2.undistort(cam_bgr, self.cam_mtx, self.cam_dist)
+            except Exception:
+                return cam_bgr
+        return cam_bgr
+
+    def close(self) -> None:
         try:
-            cv2.destroyAllWindows()
+            self.cap.release()
         except Exception:
             pass
 
-    if switch_to:
-        return {"switch_to": switch_to}
-    return None
+    def _update_lock_if_due(self, cam_bgr: np.ndarray) -> None:
+        have_lock = (self.last_mask_cam is not None) and (self.last_mask_warp is not None)
+        need_fast = (not have_lock) or (self.last_marker_count < 4)
+        aruco_interval = self.aruco_every_n_fast if need_fast else self.aruco_every_n
+
+        if (self.frame_idx % aruco_interval) != 0:
+            return
+
+        H_view, detected_count, seen_ids, det_corners, det_ids = solve_H_from_markers(
+            cam_bgr, self.warp_w, self.warp_h, CORNER_IDS
+        )
+
+        if det_ids is not None and det_corners is not None and len(det_ids) > 0:
+            self.last_aruco_ids = det_ids
+            self.last_aruco_corners = det_corners
+        else:
+            self.last_aruco_ids = None
+            self.last_aruco_corners = None
+
+        self.last_marker_count = int(detected_count)
+        self.last_seen_ids = list(seen_ids)
+        self.last_missing_ids = sorted(list(REQUIRED_IDS - set(self.last_seen_ids)))
+
+        # Lock acquisition / loss with hysteresis
+        if H_view is not None and len(self.last_missing_ids) == 0:
+            self.H_saved = H_view
+            try:
+                self._H_inv = np.linalg.inv(H_view).astype(np.float32)
+            except Exception:
+                self._H_inv = np.eye(3, dtype=np.float32)
+            self.last_mask_cam, self.last_mask_warp = roi_masks(cam_bgr, H_view, self.warp_w, self.warp_h, CORNER_IDS)
+            self.lock_lost_reason = ""
+            self.lock_miss_streak = 0
+        else:
+            if have_lock:
+                self.lock_miss_streak += 1
+                self.lock_lost_reason = f"Lost markers ({self.last_marker_count}/4 visible), missing: {self.last_missing_ids}"
+                if self.lock_miss_streak >= self.lock_drop_after:
+                    self.last_mask_cam = None
+                    self.last_mask_warp = None
+            else:
+                self.lock_miss_streak = 0
+
+    def _compute_shared_masks(self, cam_bgr: np.ndarray) -> Dict[str, Optional[np.ndarray]]:
+        """
+        Compute the shared mask pipeline (only when locked).
+        Returns dict of warp_blur, warp_bgr, bg_warp_u8, motion_warp, motion_cam, shadowfree_cam, final_mask_cam.
+        """
+        _t0 = time.perf_counter()
+
+        H_use = self.H_saved
+        mask_cam = self.last_mask_cam
+        mask_warp = self.last_mask_warp
+        if mask_cam is None or mask_warp is None:
+            return {
+                "warp_blur": None,
+                "warp_bgr": None,
+                "bg_warp_u8": None,
+                "motion_warp": None,
+                "motion_cam": None,
+                "shadowfree_cam": None,
+                "final_mask_cam": None,
+            }
+
+        # Warp once, then extract gray — avoids warping the same frame twice
+        warp_bgr = cv2.warpPerspective(cam_bgr, H_use, (int(self.warp_w), int(self.warp_h)))
+        gray = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2GRAY)
+        warp_blur = cv2.GaussianBlur(gray, (21, 21), 0)
+
+        # Seed background on first locked frame so we always use the real H
+        if not self._bg_seeded:
+            self.BG_warp_f32 = warp_blur.astype(np.float32)
+            self._bg_seeded = True
+            print("CV_CORE | Warp background seeded on first locked frame.")
+        _t1 = time.perf_counter()
+
+        bg_u8 = np.clip(self.BG_warp_f32, 0, 255).astype(np.uint8) if self.BG_warp_f32 is not None else warp_blur
+        diff_warp = cv2.absdiff(bg_u8, warp_blur)
+        _, motion_warp = cv2.threshold(diff_warp, self.warp_motion_thresh, 255, cv2.THRESH_BINARY)
+        motion_warp = cv2.erode(motion_warp, None, iterations=1)
+        motion_warp = cv2.dilate(motion_warp, None, iterations=1)
+        motion_warp = cv2.bitwise_and(motion_warp, mask_warp)
+
+        roi_area = float(cv2.countNonZero(mask_warp))
+        changed = float(cv2.countNonZero(motion_warp))
+        change_ratio = (changed / max(1.0, roi_area))
+        _t2 = time.perf_counter()
+
+        _t3 = time.perf_counter()
+
+        # Background EMA update with post-motion healing.
+        # Key invariant: _heal_acc only charges up on pixels that are currently
+        # in motion_warp (i.e. genuinely above threshold). Cold/noisy pixels
+        # never accumulate charge so they never trigger fast healing.
+        alpha_bg = self.bg_alpha_fast if change_ratio >= self.fog_change_ratio else self.bg_alpha_slow
+
+        now = time.perf_counter()
+        dt = now - self._last_frame_time
+        self._last_frame_time = now
+        if dt > 0:
+            self._fps_estimate = 0.9 * self._fps_estimate + 0.1 * (1.0 / dt)
+        heal_frames = max(1, int(round(self._fps_estimate * self._heal_ms / 1000.0)))
+
+        # Charge heal_acc only where motion is active; drain by 1 elsewhere
+        active = (motion_warp > 0)
+        self._heal_acc = np.where(
+            active,
+            np.uint16(heal_frames),
+            np.clip(self._heal_acc.astype(np.int32) - 1, 0, heal_frames).astype(np.uint16),
+        )
+        healing = (~active) & (self._heal_acc > 0)
+
+        # Pixels currently in motion: excluded from BG update entirely
+        # Pixels healing (were motion, now still): fast BG update
+        # All other pixels: normal alpha BG update
+        not_motion_u8  = cv2.bitwise_not(motion_warp)
+        in_roi         = cv2.bitwise_and(not_motion_u8, mask_warp)
+        healing_u8     = (healing.astype(np.uint8) * 255)
+        healing_mask   = cv2.bitwise_and(in_roi, healing_u8)
+        normal_mask    = cv2.bitwise_and(in_roi, cv2.bitwise_not(healing_u8))
+
+        self.BG_warp_f32 = update_bg_ema(self.BG_warp_f32, warp_blur, normal_mask,  alpha_bg)
+        self.BG_warp_f32 = update_bg_ema(self.BG_warp_f32, warp_blur, healing_mask, self.bg_alpha_fast)
+        _t4 = time.perf_counter()
+
+        # Use cached H_inv — recomputed only when H_saved changes (in _update_lock_if_due)
+        motion_cam = cv2.warpPerspective(motion_warp, self._H_inv, (cam_bgr.shape[1], cam_bgr.shape[0]), flags=cv2.INTER_NEAREST)
+        _t5 = time.perf_counter()
+
+        # Throttle the expensive shadow pipeline to every _SHADOW_EVERY_N frames.
+        self._shadow_frame_count += 1
+        if self._shadow_frame_count % self._SHADOW_EVERY_N == 0:
+            shadowfree_cam = mt.shadow_free_mask(self.BG_cam["bgr"], cam_bgr)
+            final_mask_cam = mt.combine_masks_componentwise(
+                motion_cam, shadowfree_cam,
+                keep_ratio=0.25,
+                min_comp_area=150
+            )
+            final_mask_cam = cv2.bitwise_and(final_mask_cam, mask_cam)
+            self._last_shadowfree_cam = shadowfree_cam
+            self._last_final_mask_cam = final_mask_cam
+        else:
+            shadowfree_cam = self._last_shadowfree_cam
+            final_mask_cam = self._last_final_mask_cam
+        _t6 = time.perf_counter()
+
+        # ── Timing report (once per second) ───────────────────────────────
+        self._timing_count = getattr(self, '_timing_count', 0) + 1
+        self._timing_acc   = getattr(self, '_timing_acc',   [0.0]*6)
+        self._timing_acc[0] += _t1 - _t0
+        self._timing_acc[1] += _t2 - _t1
+        self._timing_acc[2] += _t3 - _t2
+        self._timing_acc[3] += _t4 - _t3
+        self._timing_acc[4] += _t5 - _t4
+        self._timing_acc[5] += _t6 - _t5
+        self._timing_last  = getattr(self, '_timing_last', _t0)
+        if _t6 - self._timing_last >= 1.0:
+            n = max(1, self._timing_count)
+            labels = ["warp+blur", "diff+motion", "bg_ema", "inv_warp", "shadow(throttled)", "unused"]
+            parts = "  ".join(f"{l}:{self._timing_acc[i]/n*1000:.1f}ms" for i, l in enumerate(labels))
+            total = sum(self._timing_acc) / n * 1000
+            print(f"CV_CORE timing/frame ({n}f):  {parts}  TOTAL:{total:.1f}ms", flush=True)
+            self._timing_count = 0
+            self._timing_acc   = [0.0]*6
+            self._timing_last  = _t6
+        # ──────────────────────────────────────────────────────────────────
+
+        return {
+            "warp_blur": warp_blur,
+            "warp_bgr": warp_bgr,
+            "bg_warp_u8": bg_u8,
+            "motion_warp": motion_warp,
+            "motion_cam": motion_cam,
+            "shadowfree_cam": shadowfree_cam,
+            "final_mask_cam": final_mask_cam,
+        }
+
+    def frames(self) -> Iterator[FrameBundle]:
+        """
+        Generator yielding FrameBundle for each camera frame.
+        Engines can consume these bundles.
+        """
+        while True:
+            self.frame_idx += 1
+
+            try:
+                ok, cam = self.cap.read()
+                if not ok or cam is None:
+                    # macOS cameras occasionally drop a frame — retry before giving up
+                    for _ in range(5):
+                        time.sleep(0.05)
+                        ok, cam = self.cap.read()
+                        if ok and cam is not None:
+                            break
+                    if not ok or cam is None:
+                        print("CV_CORE | Camera read failed after retries — stopping.", flush=True)
+                        break
+
+                cam = self._maybe_undistort(cam)
+
+                # Update lock state when due
+                self._update_lock_if_due(cam)
+
+                locked = (self.last_mask_cam is not None) and (self.last_mask_warp is not None)
+                H_use = self.H_saved
+
+                if locked:
+                    try:
+                        shared = self._compute_shared_masks(cam)
+                    except Exception:
+                        print("CV_CORE | _compute_shared_masks error (frame "
+                              f"{self.frame_idx}):", flush=True)
+                        traceback.print_exc()
+                        shared = {
+                            "warp_blur": None, "warp_bgr": None, "bg_warp_u8": None,
+                            "motion_warp": None, "motion_cam": None,
+                            "shadowfree_cam": None, "final_mask_cam": None,
+                        }
+                else:
+                    shared = {
+                        "warp_blur": None, "warp_bgr": None, "bg_warp_u8": None,
+                        "motion_warp": None, "motion_cam": None,
+                        "shadowfree_cam": None, "final_mask_cam": None,
+                    }
+
+                yield FrameBundle(
+                    frame_idx=self.frame_idx,
+                    cam_bgr=cam,
+                    warp_w=self.warp_w,
+                    warp_h=self.warp_h,
+                    grid_w=self.grid_w,
+                    grid_h=self.grid_h,
+                    locked=locked,
+                    H_use=H_use,
+                    mask_cam=self.last_mask_cam,
+                    mask_warp=self.last_mask_warp,
+                    last_marker_count=int(self.last_marker_count),
+                    last_seen_ids=list(self.last_seen_ids),
+                    last_missing_ids=list(self.last_missing_ids),
+                    last_aruco_ids=self.last_aruco_ids,
+                    last_aruco_corners=self.last_aruco_corners,
+                    warp_blur=shared["warp_blur"],
+                    warp_bgr=shared["warp_bgr"],
+                    bg_warp_u8=shared["bg_warp_u8"],
+                    motion_warp=shared["motion_warp"],
+                    motion_cam=shared["motion_cam"],
+                    shadowfree_cam=shared["shadowfree_cam"],
+                    final_mask_cam=shared["final_mask_cam"],
+                )
+
+            except GeneratorExit:
+                break
+            except Exception:
+                print(f"CV_CORE | Unhandled error in frames() at frame {self.frame_idx}:", flush=True)
+                traceback.print_exc()
+                break
