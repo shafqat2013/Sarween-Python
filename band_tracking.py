@@ -673,16 +673,7 @@ def render_calibration_preview(
     cv2.putText(vis, "CALIBRATION PREVIEW — move band then press Calibrate band", (12, vis.shape[0] - 12),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 1, cv2.LINE_AA)
 
-    if bundle.grid_w and bundle.grid_h and bundle.warp_w and bundle.warp_h:
-        cell_w = bundle.warp_w / float(bundle.grid_w)
-        cell_h = bundle.warp_h / float(bundle.grid_h)
-        a1_cx = int(cell_w * 0.5)
-        a1_cy = int(cell_h * 0.5)
-        radius = max(8, int(min(cell_w, cell_h) * 0.25))
-        cv2.circle(vis, (a1_cx, a1_cy), radius, (255, 100, 0), -1)
-        cv2.circle(vis, (a1_cx, a1_cy), radius, (255, 255, 255), 1)
-        cv2.putText(vis, "A1", (a1_cx + radius + 4, a1_cy + 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 180, 80), 1, cv2.LINE_AA)
+
 
     return vis
 
@@ -811,6 +802,7 @@ def begin_session(
                     sess.BG_cam = {"bgr": cam.copy(), "blur": blur}
                     bg_warp = core.warp_gray_blur(cam, sess.H_saved, sess.warp_w, sess.warp_h)
                     sess.BG_warp_f32 = bg_warp.astype(np.float32)
+                    sess._bg_seeded = True
                     panel.set_hint("Background recaptured ✅")
                 except Exception as e:
                     panel.set_hint(f"Recapture failed: {e}")

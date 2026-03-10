@@ -1,19 +1,140 @@
 {
+  "red": {
+    "ranges": [
+      {
+        "lower": [
+          0,
+          91,
+          135
+        ],
+        "upper": [
+          20,
+          192,
+          201
+        ]
+      },
+      {
+        "lower": [
+          178,
+          91,
+          135
+        ],
+        "upper": [
+          179,
+          192,
+          201
+        ]
+      }
+    ],
+    "expected_diameter_squares": 1.2864201710107181
+  },
   "yellow": {
     "ranges": [
       {
         "lower": [
-          24,
-          138,
-          156
+          13,
+          106,
+          101
         ],
         "upper": [
-          29,
-          254,
-          220
+          23,
+          214,
+          159
         ]
       }
     ],
-    "expected_diameter_squares": 0.7593551211562412
+    "expected_diameter_squares": 0.6144867263008237
+  },
+  "green": {
+    "ranges": [
+      {
+        "lower": [
+          17,
+          60,
+          74
+        ],
+        "upper": [
+          50,
+          113,
+          157
+        ]
+      }
+    ],
+    "expected_diameter_squares": 1.0446343215680163
+  },
+  "blue": {
+    "ranges": [
+      {
+        "lower": [
+          5,
+          60,
+          67
+        ],
+        "upper": [
+          21,
+          99,
+          165
+        ]
+      },
+      {
+        "lower": [
+          140,
+          60,
+          67
+        ],
+        "upper": [
+          177,
+          99,
+          165
+        ]
+      }
+    ],
+    "expected_diameter_squares": 1.2286389014990549
+  },
+  "pink": {
+    "ranges": [
+      {
+        "lower": [
+          0,
+          85,
+          112
+        ],
+        "upper": [
+          19,
+          163,
+          229
+        ]
+      }
+    ],
+    "expected_diameter_squares": 0.8905104895783136
+  },
+  "orange": {
+    "ranges": [
+      {
+        "lower": [
+          0,
+          86,
+          114
+        ],
+        "upper": [
+          14,
+          191,
+          199
+        ]
+      },
+      {
+        "lower": [
+          178,
+          86,
+          114
+        ],
+        "upper": [
+          179,
+          191,
+          199
+        ]
+      }
+    ],
+    "expected_diameter_squares": 1.1723063407125165
   }
 }
