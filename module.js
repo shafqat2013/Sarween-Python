@@ -281,6 +281,12 @@ function buildSceneInfoPayload(scene) {
     scene.data?.gridType ??
     null;
 
+  const background =
+    scene.background?.src ??
+    scene.img ??
+    scene.data?.img ??
+    null;
+
   return {
     type: "sceneInfo",
     sceneId: scene.id,
@@ -289,7 +295,8 @@ function buildSceneInfoPayload(scene) {
     gridSize,
     shiftX,
     shiftY,
-    gridType
+    gridType,
+    background,
   };
 }
 

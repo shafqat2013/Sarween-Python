@@ -144,24 +144,41 @@ def detect_webcams_backup():
 # ===========================
 
 def preview_webcam_device(device_index: int):
+    """
+    Open a webcam preview on the primary (built-in) display.
+    Stays open until the user presses any key or closes the window.
+    Primary display is always at position (0, 0).
+    """
     cap = cv2.VideoCapture(int(device_index))
     if not cap.isOpened():
         print(f"⚠️ Could not open webcam {device_index}")
         return
 
-    start_time = time.time()
-    cv2.namedWindow("Webcam Preview")
+    win_name = "Webcam Preview — press any key to close"
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win_name, 1280, 720)
 
-    while time.time() - start_time < 3:
+    # Move to top-left of primary display (coordinates 0, 0)
+    # This ensures it appears on the built-in screen, not the external TV.
+    cv2.moveWindow(win_name, 0, 0)
+
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
-        cv2.imshow("Webcam Preview", frame)
-        if cv2.waitKey(1) & 0xFF == 27:
+        cv2.imshow(win_name, frame)
+        # Wait 1ms — any keypress closes the window
+        if cv2.waitKey(1) & 0xFF != 255:
+            break
+        # Also close if the window was manually closed
+        try:
+            if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
+                break
+        except Exception:
             break
 
     cap.release()
-    cv2.destroyAllWindows()
+    cv2.destroyWindow(win_name)
 
 
 def unified_selection_window(displays, webcams, default_display_index=None,
@@ -238,13 +255,11 @@ def unified_selection_window(displays, webcams, default_display_index=None,
     mode_combo.set(MODE_LABELS.get(default_mode, MODE_LABELS[MODE_SELF_HOSTED]))
     mode_combo.bind("<<ComboboxSelected>>", on_mode_change)
 
-    # NEW: Map selection (self-hosted only)
     map_label = ttk.Label(frame, text="Map (self-hosted)")
     map_label.grid(row=3, column=0, sticky="e", padx=10)
     map_combo = ttk.Combobox(frame, values=map_options, state="readonly", width=40)
     map_combo.grid(row=3, column=1)
 
-    # Default map selection
     default_idx = 0
     if default_map_path and map_files:
         try:

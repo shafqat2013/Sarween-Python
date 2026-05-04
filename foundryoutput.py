@@ -29,6 +29,7 @@ MAP_PATH = Path(__file__).with_name("mini_token_map.json")
 # Foundry scene size (fallback defaults; can be overridden by sceneInfo)
 SCENE_W = 1656   # dnd1.jpg width
 SCENE_H = 1152   # dnd1.jpg height
+SCENE_BACKGROUND = None  # background image path/URL from Foundry
 
 # Foundry grid metadata (NEW; prefer these if present)
 GRID_PX = None   # pixels per grid square
@@ -73,35 +74,47 @@ def _save_mapping() -> None:
 # Scene/grid params (NEW)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def set_scene_params(scene_id=None, scene_w=None, scene_h=None, grid_px=None, shift_x=0, shift_y=0, grid_type=None):
+def set_scene_params(scene_id=None, scene_w=None, scene_h=None, grid_px=None, shift_x=0, shift_y=0, grid_type=None, background=None):
     """
     Update scene metadata based on Foundry 'sceneInfo' message.
+    Only prints when values actually change to avoid log spam.
     """
-    global SCENE_ID, SCENE_W, SCENE_H, GRID_PX, SHIFT_X, SHIFT_Y
+    global SCENE_ID, SCENE_W, SCENE_H, GRID_PX, SHIFT_X, SHIFT_Y, SCENE_BACKGROUND
 
-    if scene_id:
-        SCENE_ID = str(scene_id)
+    new_scene_id = str(scene_id) if scene_id else SCENE_ID
+    new_w        = int(scene_w)  if scene_w  else SCENE_W
+    new_h        = int(scene_h)  if scene_h  else SCENE_H
+    new_grid_px  = int(grid_px)  if grid_px  else GRID_PX
+    new_shift_x  = int(shift_x or 0)
+    new_shift_y  = int(shift_y or 0)
 
-    if scene_w:
-        SCENE_W = int(scene_w)
-    if scene_h:
-        SCENE_H = int(scene_h)
-
-    GRID_PX = int(grid_px) if grid_px else None
-    SHIFT_X = int(shift_x or 0)
-    SHIFT_Y = int(shift_y or 0)
-
-    print(
-        "FoundryOutput | Scene params updated: "
-        f"sceneId={SCENE_ID} size={SCENE_W}x{SCENE_H} "
-        f"gridPx={GRID_PX} shift=({SHIFT_X},{SHIFT_Y})"
-        + (f" gridType={grid_type}" if grid_type is not None else "")
+    changed = (
+        new_scene_id != SCENE_ID or
+        new_w        != SCENE_W  or
+        new_h        != SCENE_H  or
+        new_grid_px  != GRID_PX  or
+        new_shift_x  != SHIFT_X  or
+        new_shift_y  != SHIFT_Y
     )
 
+    SCENE_ID = new_scene_id
+    SCENE_W  = new_w
+    SCENE_H  = new_h
+    GRID_PX  = new_grid_px
+    SHIFT_X  = new_shift_x
+    SHIFT_Y  = new_shift_y
+    if background:
+        SCENE_BACKGROUND = str(background)
+
+    if changed:
+        print(
+            "FoundryOutput | Scene params updated: "
+            f"sceneId={SCENE_ID} size={SCENE_W}x{SCENE_H} "
+            f"gridPx={GRID_PX} shift=({SHIFT_X},{SHIFT_Y})"
+            + (f" gridType={grid_type}" if grid_type is not None else "")
+        )
+
 def get_scene_params() -> dict:
-    """
-    Used by calibration.py (Foundry mode) to compute cols/rows from width/height/gridPx.
-    """
     return {
         "sceneId": SCENE_ID,
         "sceneW": SCENE_W,
@@ -111,6 +124,7 @@ def get_scene_params() -> dict:
         "shiftY": SHIFT_Y,
         "gridCols": _grid_cols,
         "gridRows": _grid_rows,
+        "background": SCENE_BACKGROUND,
     }
 
 def request_scene_info() -> None:
@@ -407,7 +421,8 @@ async def recv_loop(websocket):
             sy = data.get("shiftY", 0)
             gt = data.get("gridType", None)
 
-            set_scene_params(scene_id, w, h, grid_size, sx, sy, gt)
+            set_scene_params(scene_id, w, h, grid_size, sx, sy, gt,
+                             background=data.get("background"))
 
         else:
             # ignore unknown message types

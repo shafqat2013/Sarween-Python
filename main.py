@@ -1,6 +1,19 @@
 import asyncio
 import threading
+import sys
+import os
 from datetime import datetime
+from pathlib import Path
+
+# ── Redirect stdout/stderr to log file when running as a frozen .app ──────────
+if getattr(sys, "frozen", False):
+    _log_dir = os.path.expanduser("~/Library/Logs/Sarween")
+    os.makedirs(_log_dir, exist_ok=True)
+    _log_path = os.path.join(_log_dir, "sarween.log")
+    _log_file = open(_log_path, "w", buffering=1)
+    sys.stdout = _log_file
+    sys.stderr = _log_file
+    print(f"Sarween log started: {datetime.now()}", flush=True)
 
 import setup as s
 import calibration as c
@@ -11,7 +24,6 @@ timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def _rc_str_to_a1(cell: str) -> str:
-    """Convert internal 'r0c0' string to A1 display notation."""
     try:
         parts = cell[1:].split('c')
         return rc_to_a1(int(parts[0]), int(parts[1]))
@@ -20,38 +32,19 @@ def _rc_str_to_a1(cell: str) -> str:
 
 
 def start_foundry_server_in_background():
-    """
-    Start the FoundryOutput WebSocket server (fo.main) in a background thread
-    so tracking + CV can run in the main thread.
-    """
-
     def runner():
-        # This runs the async foundryoutput.main() in its own event loop
         asyncio.run(fo.main())
-
     thread = threading.Thread(target=runner, daemon=True)
     thread.start()
     print("MAIN | Started FoundryOutput server in background thread")
 
 
 def on_mini_moved(mini_id, grid_coord):
-    """
-    Callback passed into tracking.begin_session.
-    Called whenever a known mini's consensus grid cell changes.
-    """
     print(f"[MAIN] Mini {mini_id} moved to {_rc_str_to_a1(grid_coord)}")
-    # Forward the grid coordinate to the Foundry output module
     fo.move_token_to_grid(mini_id, grid_coord)
 
 
-def _get_engine_from_config() -> str:
-    cfg = s.load_last_selection() or {}
-    eng = (cfg.get("engine") or "blob").strip().lower()
-    return eng if eng in ("blob", "band") else "blob"
-
-
 def main():
-    # Start the Foundry WebSocket server in the background
     start_foundry_server_in_background()
 
     try:
@@ -61,24 +54,24 @@ def main():
         print("running c.calibrate. Timestamp: " + timestamp)
         c.calibrate()
 
+        import v3_tracking as t
+        from mini_calibration import run_mini_calibration
+
+        _profiles_path = Path(__file__).with_name("combo_profiles.json")
+        if not _profiles_path.exists():
+            print("MAIN | No mini profiles found — running mini calibration")
+            run_mini_calibration()
+
+        print("running begin_session. Timestamp: " + timestamp)
         while True:
-            engine = _get_engine_from_config()
-            print(f"MAIN | Engine selected: {engine}")
-
-            if engine == "band":
-                import band_tracking as t
-            else:
-                import blob_tracking as t
-
-            print("running begin_session. Timestamp: " + timestamp)
             result = t.begin_session(on_mini_moved)
-            if isinstance(result, dict) and result.get("switch_to") in ("blob", "band"):
-                # main loop will restart and pick up the newly saved engine
-                continue
-            break
+            if result == "recalibrate":
+                print("MAIN | Re-running mini calibration")
+                run_mini_calibration()
+            else:
+                break
 
     except SystemExit as e:
-        # User cancelled setup or cancelled waiting for Foundry scene info
         print(f"MAIN | Exiting: {e}")
         return
 

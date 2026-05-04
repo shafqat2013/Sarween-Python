@@ -1,5 +1,6 @@
 import cv2
 import os
+import sys
 import csv
 import json
 import numpy as np
@@ -7,8 +8,17 @@ import time
 import setup as s
 from datetime import datetime
 
+
+def _resource_path(filename: str) -> str:
+    """Resolve a path relative to this file, whether running live or frozen in a .app."""
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, filename)
+
 # ── Canonical DB path ─────────────────────────────────────────────────────────
-DB_CSV = os.path.abspath(os.path.join("mini_captures", "..", "mini_database.csv"))
+DB_CSV = _resource_path("mini_database.csv")
 
 # ── Lazy camera calibration (avoid I/O at import) ─────────────────────────────
 _camera_params_cache = None
@@ -222,6 +232,8 @@ def set_mini_name(mini_id, name, db_csv_path=DB_CSV):
 
 # ── Background capture helpers ────────────────────────────────────────────────
 def capture_background(camera_index=None):
+    if save_dir is None:
+        save_dir = _resource_path("mini_captures")
     if camera_index is None:
         camera_index = s.load_last_selection()["webcam_index"]
     camera_matrix, dist_coeffs = get_camera_params()
@@ -434,7 +446,7 @@ def derive_orb_path_from_hist(hist_path):
 def save_mini_from_frame_and_contour(
     frame_bgr,
     contour,
-    save_dir="mini_captures",
+    save_dir=None,
     min_area=1500,
     return_info=False,
     mini_id=None,
@@ -447,6 +459,8 @@ def save_mini_from_frame_and_contour(
     If mini_id is provided: appends a NEW view under that mini_id.
     If name is provided and mini_id exists: the DB name for that mini_id is set/updated.
     """
+    if save_dir is None:
+        save_dir = _resource_path("mini_captures")
     if frame_bgr is None or contour is None or len(contour) == 0:
         return None
 
@@ -629,7 +643,7 @@ def capture_mini(
     camera_index=None,
     background_blur=None,
     background_bgr=None,
-    save_dir="mini_captures",
+    save_dir=None,
     min_area=1500,
     return_info=False,
     mini_id=None,

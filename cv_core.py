@@ -33,6 +33,10 @@ import traceback
 from dataclasses import dataclass
 from typing import Dict, Any, Iterator, Optional, Tuple, List
 
+# ── Timing print toggle ───────────────────────────────────────────────────────
+# Set to True via control panel to see per-frame pipeline timing in terminal.
+PRINT_TIMING: bool = False
+
 import cv2
 import numpy as np
 
@@ -397,15 +401,30 @@ class CVCoreSession:
         # Camera calibration
         self.cam_mtx, self.cam_dist = get_camera_params()
 
-        # Open camera
-        self.cap = cv2.VideoCapture(self.camera_index)
-        if not self.cap.isOpened():
-            raise RuntimeError("Failed to open webcam.")
+        # ── TRUESIGHT_SOURCE: optional video file playback (offline debugging) ──
+        _src = os.environ.get("TRUESIGHT_SOURCE", "").strip()
+        self._source_is_file = bool(_src)
 
-        # Warm-up reads — macOS cameras need time to stabilise after open
-        for _ in range(8):
-            self.cap.read()
-        time.sleep(0.3)  # let the camera buffer refill before capturing background
+        if self._source_is_file:
+            print(f"CV_CORE | TRUESIGHT_SOURCE mode — reading from: {_src}", flush=True)
+            self.cap = cv2.VideoCapture(_src)
+            if not self.cap.isOpened():
+                raise RuntimeError(f"TRUESIGHT_SOURCE: failed to open '{_src}'")
+            # No warm-up for file sources
+        else:
+            # Open camera
+            self.cap = cv2.VideoCapture(self.camera_index)
+            if not self.cap.isOpened():
+                raise RuntimeError("Failed to open webcam.")
+
+            # Warm-up reads — macOS cameras need time to stabilise after open
+            for _ in range(8):
+                self.cap.read()
+            time.sleep(0.3)  # let the camera buffer refill before capturing background
+
+        # ── Video recorder (optional) ─────────────────────────────────────────
+        self._recorder: Optional[cv2.VideoWriter] = None
+        self._record_path: Optional[str] = None
 
         # Background in camera space — retry a few times in case the buffer
         # isn't ready yet (common on macOS with USB cameras).
@@ -472,11 +491,75 @@ class CVCoreSession:
                 return cam_bgr
         return cam_bgr
 
-    def close(self) -> None:
+    def close(self, preserve_recording: bool = False) -> None:
+        if not preserve_recording:
+            self.stop_recording()
         try:
             self.cap.release()
         except Exception:
             pass
+
+    def detach_recorder(self) -> Tuple[Optional["cv2.VideoWriter"], Optional[str]]:
+        """Remove the recorder from this session without releasing it.
+        The caller is responsible for attaching it to the next session or releasing it."""
+        rec, path = self._recorder, self._record_path
+        self._recorder = None
+        self._record_path = None
+        return rec, path
+
+    def attach_recorder(self, recorder: "cv2.VideoWriter", path: str) -> None:
+        """Adopt an already-open VideoWriter (e.g. carried over from a prior session)."""
+        if self._recorder is not None:
+            self.stop_recording()
+        self._recorder = recorder
+        self._record_path = path
+        print(f"CV_CORE | Recording resumed → {path}", flush=True)
+
+    def start_recording(self, path: str, fps: Optional[float] = None) -> bool:
+        """Open a VideoWriter and begin saving raw camera frames.  Returns True on success.
+
+        fps — actual processing rate measured by the caller.  When None, the camera's
+              reported FPS is used, which often causes the saved video to play back
+              faster than real-time because the CV pipeline runs slower than the nominal
+              camera rate.
+        """
+        if self._recorder is not None:
+            self.stop_recording()
+        try:
+            # Use the camera's native size if available; fall back to a sensible default.
+            w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
+            h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
+            if fps is None or fps <= 0:
+                fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 30.0)
+            if fps <= 0:
+                fps = 30.0
+            fourcc = cv2.VideoWriter.fourcc(*"mp4v")
+            writer = cv2.VideoWriter(path, fourcc, fps, (w, h))
+            if not writer.isOpened():
+                print(f"CV_CORE | Recording: VideoWriter failed to open '{path}'", flush=True)
+                return False
+            self._recorder = writer
+            self._record_path = path
+            print(f"CV_CORE | Recording started → {path}  ({w}×{h} @ {fps:.0f}fps)", flush=True)
+            return True
+        except Exception as exc:
+            print(f"CV_CORE | Recording start error: {exc}", flush=True)
+            return False
+
+    def stop_recording(self) -> None:
+        """Flush and close the VideoWriter if one is open."""
+        if self._recorder is not None:
+            try:
+                self._recorder.release()
+                print(f"CV_CORE | Recording saved → {self._record_path}", flush=True)
+            except Exception as exc:
+                print(f"CV_CORE | Recording stop error: {exc}", flush=True)
+            self._recorder = None
+            self._record_path = None
+
+    @property
+    def is_recording(self) -> bool:
+        return self._recorder is not None
 
     def _update_lock_if_due(self, cam_bgr: np.ndarray) -> None:
         have_lock = (self.last_mask_cam is not None) and (self.last_mask_warp is not None)
@@ -566,12 +649,29 @@ class CVCoreSession:
         change_ratio = (changed / max(1.0, roi_area))
         _t2 = time.perf_counter()
 
+        # Filter out blobs larger than MAX_BLOB_CELLS x MAX_BLOB_CELLS grid squares.
+        # This removes large obstructions (hands, cats, fog-of-war reveals covering
+        # many cells at once) while keeping genuine mini-sized blobs.
+        # We filter per-contour so small blobs survive even if large ones are present.
+        MAX_BLOB_CELLS = 5
+        cell_area_warp = (self.warp_w / float(self.grid_w)) * (self.warp_h / float(self.grid_h))
+        max_blob_area  = cell_area_warp * (MAX_BLOB_CELLS * MAX_BLOB_CELLS)
+
+        cnts_info = cv2.findContours(motion_warp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts_motion = cnts_info[0] if len(cnts_info) == 2 else cnts_info[1]
+        motion_filtered = np.zeros_like(motion_warp)
+        for mc in cnts_motion:
+            if cv2.contourArea(mc) <= max_blob_area:
+                cv2.drawContours(motion_filtered, [mc], -1, 255, thickness=-1)
+        motion_warp = motion_filtered
+
         _t3 = time.perf_counter()
 
         # Background EMA update with post-motion healing.
-        # Key invariant: _heal_acc only charges up on pixels that are currently
-        # in motion_warp (i.e. genuinely above threshold). Cold/noisy pixels
-        # never accumulate charge so they never trigger fast healing.
+        # IMPORTANT: use raw motion_warp (pre-filter) to charge _heal_acc so
+        # large fog-of-war changes still trigger fast healing after they settle.
+        # Only the engine-visible motion_warp is filtered; the BG update sees all
+        # genuine motion pixels.
         alpha_bg = self.bg_alpha_fast if change_ratio >= self.fog_change_ratio else self.bg_alpha_slow
 
         now = time.perf_counter()
@@ -581,23 +681,28 @@ class CVCoreSession:
             self._fps_estimate = 0.9 * self._fps_estimate + 0.1 * (1.0 / dt)
         heal_frames = max(1, int(round(self._fps_estimate * self._heal_ms / 1000.0)))
 
-        # Charge heal_acc only where motion is active; drain by 1 elsewhere
-        active = (motion_warp > 0)
+        # Charge heal_acc from ALL motion (pre-filter) — fog reveals charge this.
+        # Use original contours (before size filter) to charge heal_acc
+        motion_for_heal = np.zeros_like(motion_warp)
+        for mc in cnts_motion:
+            cv2.drawContours(motion_for_heal, [mc], -1, 255, thickness=-1)
+        heal_active = (motion_for_heal > 0)
+
         self._heal_acc = np.where(
-            active,
+            heal_active,
             np.uint16(heal_frames),
             np.clip(self._heal_acc.astype(np.int32) - 1, 0, heal_frames).astype(np.uint16),
         )
-        healing = (~active) & (self._heal_acc > 0)
+        healing = (~heal_active) & (self._heal_acc > 0)
 
-        # Pixels currently in motion: excluded from BG update entirely
+        # Pixels in motion (any size): excluded from BG update entirely
         # Pixels healing (were motion, now still): fast BG update
-        # All other pixels: normal alpha BG update
-        not_motion_u8  = cv2.bitwise_not(motion_warp)
-        in_roi         = cv2.bitwise_and(not_motion_u8, mask_warp)
-        healing_u8     = (healing.astype(np.uint8) * 255)
-        healing_mask   = cv2.bitwise_and(in_roi, healing_u8)
-        normal_mask    = cv2.bitwise_and(in_roi, cv2.bitwise_not(healing_u8))
+        # All other pixels: normal alpha update
+        not_motion_u8 = cv2.bitwise_not(motion_for_heal)
+        in_roi        = cv2.bitwise_and(not_motion_u8, mask_warp)
+        healing_u8    = (healing.astype(np.uint8) * 255)
+        healing_mask  = cv2.bitwise_and(in_roi, healing_u8)
+        normal_mask   = cv2.bitwise_and(in_roi, cv2.bitwise_not(healing_u8))
 
         self.BG_warp_f32 = update_bg_ema(self.BG_warp_f32, warp_blur, normal_mask,  alpha_bg)
         self.BG_warp_f32 = update_bg_ema(self.BG_warp_f32, warp_blur, healing_mask, self.bg_alpha_fast)
@@ -639,7 +744,8 @@ class CVCoreSession:
             labels = ["warp+blur", "diff+motion", "bg_ema", "inv_warp", "shadow(throttled)", "unused"]
             parts = "  ".join(f"{l}:{self._timing_acc[i]/n*1000:.1f}ms" for i, l in enumerate(labels))
             total = sum(self._timing_acc) / n * 1000
-            print(f"CV_CORE timing/frame ({n}f):  {parts}  TOTAL:{total:.1f}ms", flush=True)
+            if PRINT_TIMING:
+                print(f"CV_CORE timing/frame ({n}f):  {parts}  TOTAL:{total:.1f}ms", flush=True)
             self._timing_count = 0
             self._timing_acc   = [0.0]*6
             self._timing_last  = _t6
@@ -666,17 +772,32 @@ class CVCoreSession:
             try:
                 ok, cam = self.cap.read()
                 if not ok or cam is None:
-                    # macOS cameras occasionally drop a frame — retry before giving up
-                    for _ in range(5):
-                        time.sleep(0.05)
+                    if self._source_is_file:
+                        # Loop video file back to the beginning
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         ok, cam = self.cap.read()
-                        if ok and cam is not None:
+                        if not ok or cam is None:
+                            print("CV_CORE | TRUESIGHT_SOURCE: cannot loop video — stopping.", flush=True)
                             break
-                    if not ok or cam is None:
-                        print("CV_CORE | Camera read failed after retries — stopping.", flush=True)
-                        break
+                    else:
+                        # macOS cameras occasionally drop a frame — retry before giving up
+                        for _ in range(5):
+                            time.sleep(0.05)
+                            ok, cam = self.cap.read()
+                            if ok and cam is not None:
+                                break
+                        if not ok or cam is None:
+                            print("CV_CORE | Camera read failed after retries — stopping.", flush=True)
+                            break
 
                 cam = self._maybe_undistort(cam)
+
+                # Write frame to recorder if active
+                if self._recorder is not None:
+                    try:
+                        self._recorder.write(cam)
+                    except Exception:
+                        pass
 
                 # Update lock state when due
                 self._update_lock_if_due(cam)
