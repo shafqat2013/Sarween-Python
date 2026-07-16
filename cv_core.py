@@ -362,6 +362,7 @@ class CVCoreSession:
         fog_change_ratio: float = FOG_CHANGE_RATIO,
         bg_alpha_slow: float = BG_ALPHA_SLOW,
         bg_alpha_fast: float = BG_ALPHA_FAST,
+        source_path: Optional[str] = None,
     ):
         sel = s.load_last_selection() or {}
         if camera_index is None:
@@ -402,7 +403,7 @@ class CVCoreSession:
         self.cam_mtx, self.cam_dist = get_camera_params()
 
         # ── TRUESIGHT_SOURCE: optional video file playback (offline debugging) ──
-        _src = os.environ.get("TRUESIGHT_SOURCE", "").strip()
+        _src = (source_path or os.environ.get("TRUESIGHT_SOURCE", "")).strip()
         self._source_is_file = bool(_src)
 
         if self._source_is_file:

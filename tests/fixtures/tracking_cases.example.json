@@ -1,0 +1,29 @@
+{
+  "cases": [
+    {
+      "name": "sample_session_01",
+      "video": "../../sarween_rec_20260420_163421.mp4",
+      "profiles": "../../combo_profiles.json",
+      "grid": {
+        "cols": 23,
+        "rows": 16,
+        "warp_width": 1280,
+        "warp_height": 720
+      },
+      "initial_positions": {
+        "red9": "A12"
+      },
+      "tolerance_seconds": 2,
+      "allow_unexpected": false,
+      "expectations": [
+        {
+          "mini": "red9",
+          "from": "A12",
+          "to": "B21",
+          "at": "00:02:23",
+          "tolerance_seconds": 2
+        }
+      ]
+    }
+  ]
+}
