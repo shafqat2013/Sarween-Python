@@ -1,4 +1,6 @@
+import json
 import os
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -34,6 +36,31 @@ class TrackingRegressionTest(unittest.TestCase):
 
         if failures:
             self.fail("\n".join(failures))
+
+    def test_missing_local_video_is_skipped(self):
+        tracking_regression = self._load_runner()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cases_path = Path(temp_dir) / "cases.json"
+            cases_path.write_text(
+                json.dumps(
+                    {
+                        "cases": [
+                            {
+                                "name": "portable-local-footage",
+                                "video": "not-checked-in.mp4",
+                                "expectations": [{"mini": "red", "to": "A1"}],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            results = tracking_regression.check_cases(cases_path)
+
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].ok)
+        self.assertIn("Missing local video", results[0].skipped or "")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,196 @@
 {
-  "cases": []
+  "cases": [
+    {
+      "name": "fog_off_red10_control",
+      "video": "../../sarween_rec_20260905_233022.mp4",
+      "profiles": "../../combo_profiles.json",
+      "grid": {
+        "cols": 23,
+        "rows": 16,
+        "warp_width": 1280,
+        "warp_height": 720
+      },
+      "tolerance_seconds": 1.0,
+      "allow_unexpected": false,
+      "expectations": [
+        {
+          "mini": "red10",
+          "to": "H8",
+          "at": "00:19.979"
+        },
+        {
+          "mini": "red10",
+          "from": "H8",
+          "to": "I8",
+          "at": "00:32.823"
+        },
+        {
+          "mini": "red10",
+          "from": "I8",
+          "to": "I9",
+          "at": "00:44.002"
+        }
+      ]
+    },
+    {
+      "name": "fog_on_red10_numbered_targets_48x27",
+      "video": "../../sarween_rec_20260911_135922.mp4",
+      "profiles": "../../combo_profiles.json",
+      "timeline": "../../sarween_rec_20260911_135922.tracking.json",
+      "ignore_before": 2.0,
+      "tolerance_seconds": 1.0,
+      "allow_unexpected": false,
+      "expectations": [
+        {
+          "mini": "red10",
+          "to": "J7",
+          "at": "00:03.673"
+        },
+        {
+          "mini": "red10",
+          "from": "J7",
+          "to": "AK7",
+          "at": "00:09.623"
+        },
+        {
+          "mini": "red10",
+          "from": "AK7",
+          "to": "Y14",
+          "at": "00:15.133"
+        },
+        {
+          "mini": "red10",
+          "from": "Y14",
+          "to": "K21",
+          "at": "00:20.715"
+        },
+        {
+          "mini": "red10",
+          "from": "K21",
+          "to": "AL20",
+          "at": "00:26.298"
+        }
+      ]
+    },
+    {
+      "name": "fog_on_red10_partial_marker_lock_48x27",
+      "video": "../../sarween_rec_20260911_141952.mp4",
+      "profiles": "../../combo_profiles.json",
+      "timeline": "../../sarween_rec_20260911_141952.tracking.json",
+      "ignore_before": 2.0,
+      "tolerance_seconds": 1.0,
+      "allow_unexpected": false,
+      "expectations": [
+        {
+          "mini": "red10",
+          "to": "J7",
+          "at": "00:04.915"
+        },
+        {
+          "mini": "red10",
+          "from": "J7",
+          "to": "AK7",
+          "at": "00:11.493"
+        },
+        {
+          "mini": "red10",
+          "from": "AK7",
+          "to": "Y14",
+          "at": "00:30.071"
+        },
+        {
+          "mini": "red10",
+          "from": "Y14",
+          "to": "K21",
+          "at": "00:36.866"
+        },
+        {
+          "mini": "red10",
+          "from": "K21",
+          "to": "AL20",
+          "at": "00:45.974"
+        }
+      ]
+    },
+    {
+      "name": "fog_on_red10_rejects_matching_foundry_token",
+      "video": "../../sarween_rec_20260911_162031.mp4",
+      "profiles": "../../combo_profiles.json",
+      "timeline": "../../sarween_rec_20260911_162031.tracking.json",
+      "ignore_before": 2.0,
+      "tolerance_seconds": 1.0,
+      "allow_unexpected": false,
+      "expectations": [
+        {
+          "mini": "red10",
+          "to": "Y14",
+          "at": "00:59.202"
+        },
+        {
+          "mini": "red10",
+          "from": "Y14",
+          "to": "AL20",
+          "at": "01:28.295"
+        },
+        {
+          "mini": "red10",
+          "from": "AL20",
+          "to": "I14",
+          "at": "02:08.890"
+        }
+      ]
+    },
+    {
+      "name": "fog_on_red10_a1_a5_plus_random_48x27",
+      "video": "../../sarween_rec_20260911_165442.mp4",
+      "profiles": "../../combo_profiles.json",
+      "timeline": "../../sarween_rec_20260911_165442.tracking.json",
+      "ignore_before": 10.0,
+      "tolerance_seconds": 1.0,
+      "allow_unexpected": false,
+      "expectations": [
+        {
+          "mini": "red10",
+          "to": "J7",
+          "at": "00:12.256"
+        },
+        {
+          "mini": "red10",
+          "from": "J7",
+          "to": "Y14",
+          "at": "00:15.727"
+        },
+        {
+          "mini": "red10",
+          "from": "Y14",
+          "to": "AL20",
+          "at": "00:18.901"
+        },
+        {
+          "mini": "red10",
+          "from": "AL20",
+          "to": "AK7",
+          "at": "00:21.264"
+        },
+        {
+          "mini": "red10",
+          "from": "AK7",
+          "to": "K21",
+          "at": "00:23.627"
+        },
+        {
+          "mini": "red10",
+          "from": "K21",
+          "to": "K14",
+          "at": "00:27.023"
+        },
+        {
+          "mini": "red10",
+          "from": "K14",
+          "to": "AR14",
+          "at": "00:29.238"
+        }
+      ]
+    }
+  ]
 }

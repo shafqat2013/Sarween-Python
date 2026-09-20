@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import cv2
 
 import cv_core as core
+import foundryoutput as fo
 import v3_tracking as tracking
 from control_panel import rc_to_a1
 from mini_calibration import load_profiles_with_curves
@@ -26,6 +27,64 @@ from mini_calibration import load_profiles_with_curves
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CASES_PATH = ROOT / "tests" / "fixtures" / "tracking_cases.json"
+
+
+class FoundryTimelineReplay:
+    def __init__(self, path: Path):
+        self.path = path.resolve()
+        self.data = json.loads(self.path.read_text(encoding="utf-8"))
+        if int(self.data.get("schemaVersion", 0)) != 1:
+            raise ValueError(f"Unsupported Foundry timeline schema: {self.path}")
+        self.events = sorted(
+            list(self.data.get("events") or []), key=lambda event: int(event["frame"])
+        )
+        if not self.events:
+            raise ValueError(f"Foundry timeline has no events: {self.path}")
+        self._next_event = 0
+        self._last_visual_revision: Optional[int] = None
+
+    def apply_through(self, frame: int) -> None:
+        while self._next_event < len(self.events):
+            event = self.events[self._next_event]
+            if int(event["frame"]) > int(frame):
+                break
+            self._apply_event(event)
+            self._next_event += 1
+
+    def _apply_event(self, event: Dict[str, Any]) -> None:
+        scene = event.get("sceneInfo") or {}
+        if scene:
+            fo.set_scene_params(
+                scene_id=scene.get("sceneId"),
+                scene_w=scene.get("width"),
+                scene_h=scene.get("height"),
+                grid_px=scene.get("gridSize"),
+                shift_x=scene.get("shiftX", 0),
+                shift_y=scene.get("shiftY", 0),
+                grid_type=scene.get("gridType"),
+                background=scene.get("background"),
+            )
+
+        view = event.get("viewTransform")
+        if view is None:
+            fo.clear_view_transform()
+        else:
+            fo.set_view_transform(view)
+
+        visual_revision = int(event.get("sceneVisualRevision", 0))
+        if (
+            self._last_visual_revision is not None
+            and visual_revision != self._last_visual_revision
+        ):
+            fo.mark_scene_visual_changed(
+                str(event.get("sceneVisualReason") or "timelineReplay")
+            )
+        self._last_visual_revision = visual_revision
+
+
+def find_timeline_path(video_path: Path) -> Optional[Path]:
+    candidate = fo.timeline_path_for_video(video_path)
+    return candidate if candidate.exists() else None
 
 
 @dataclass
@@ -39,6 +98,7 @@ class MovementEvent:
     raw_to: str
     lab_dist: float
     score: float
+    source: str = "detection"
 
 
 @dataclass
@@ -49,6 +109,7 @@ class CaseResult:
     failures: List[str]
     matched_expectations: int
     total_expectations: int
+    skipped: Optional[str] = None
 
     @property
     def ok(self) -> bool:
@@ -147,6 +208,7 @@ def _seed_initial_positions(
     grid_h: int,
     warp_w: int,
     warp_h: int,
+    marker_mode: str = "legacy",
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
     prev_state: Dict[str, Dict[str, Any]] = {}
     last_emitted: Dict[str, str] = {}
@@ -157,7 +219,11 @@ def _seed_initial_positions(
         raw = tracking._cell_label(row, col)
         last_emitted[str(mini)] = raw
         prev_state[str(mini)] = {
-            "last_xy": ((col + 0.5) * cell_w, (row + 0.5) * cell_h),
+            "last_xy": (
+                None
+                if marker_mode == "viewport"
+                else ((col + 0.5) * cell_w, (row + 0.5) * cell_h)
+            ),
             "last_dist": None,
         }
     return prev_state, last_emitted
@@ -179,12 +245,34 @@ def run_video(
     consensus_k: int = tracking.CONSENSUS_K,
     lost_timeout: float = 2.0,
     verbose: bool = False,
+    timeline_path: Optional[Path] = None,
+    marker_mode: Optional[str] = None,
+    view_settle_seconds: float = core.VIEW_SETTLE_SECONDS,
 ) -> List[MovementEvent]:
     video_path = video_path.resolve()
     profiles_path = profiles_path.resolve()
     profiles = load_profiles_with_curves(profiles_path)
     if not profiles:
         raise RuntimeError(f"No mini profiles found in {profiles_path}")
+
+    if timeline_path is None:
+        timeline_path = find_timeline_path(video_path)
+    timeline = FoundryTimelineReplay(timeline_path) if timeline_path else None
+    source_frames_undistorted = False
+    if timeline is not None:
+        timeline.apply_through(0)
+        marker_mode = marker_mode or str(timeline.data.get("markerMode") or "viewport")
+        grid_w = grid_w or timeline.data.get("gridCols")
+        grid_h = grid_h or timeline.data.get("gridRows")
+        warp_w = warp_w or timeline.data.get("warpWidth")
+        warp_h = warp_h or timeline.data.get("warpHeight")
+        # Timeline sidecars were introduced for videos recorded by CVCoreSession,
+        # which stores frames after lens correction. Default true for the first
+        # schema revision so sidecars written before this field remain replayable.
+        source_frames_undistorted = bool(
+            timeline.data.get("framesUndistorted", True)
+        )
+        print(f"TrackingRegression | Replaying Foundry timeline: {timeline.path}")
 
     fps, frame_count = _video_metadata(video_path)
     if max_seconds is not None:
@@ -202,6 +290,10 @@ def run_video(
         warp_h=warp_h,
         grid_w=grid_w,
         grid_h=grid_h,
+        marker_mode=marker_mode,
+        before_frame_callback=timeline.apply_through if timeline is not None else None,
+        source_frames_undistorted=source_frames_undistorted,
+        view_settle_seconds=view_settle_seconds,
     )
     sess.warp_motion_thresh = int(motion_thresh)
 
@@ -212,10 +304,13 @@ def run_video(
         sess.grid_h,
         sess.warp_w,
         sess.warp_h,
+        marker_mode=sess.marker_mode,
     )
     cell_hist: Dict[str, deque] = {}
     last_seen: Dict[str, float] = {str(mini): 0.0 for mini in initial_positions}
     events: List[MovementEvent] = []
+    last_physical_xy: Dict[str, Tuple[float, float]] = {}
+    last_view_transform_revision = fo.get_view_transform_revision()
 
     try:
         for bundle in sess.frames():
@@ -226,10 +321,45 @@ def run_video(
 
             video_frame_idx = int(sess.cap.get(cv2.CAP_PROP_POS_FRAMES) or bundle.frame_idx)
             time_seconds = max(0, video_frame_idx - 1) / fps
-            grid_px = min(
-                bundle.warp_w / float(bundle.grid_w),
-                bundle.warp_h / float(bundle.grid_h),
-            )
+            grid_px = tracking._grid_px_for_bundle(bundle)
+            if grid_px is None:
+                continue
+
+            current_view_revision = fo.get_view_transform_revision()
+            if current_view_revision != last_view_transform_revision:
+                last_view_transform_revision = current_view_revision
+                for mini, (physical_x, physical_y) in list(last_physical_xy.items()):
+                    mapped = tracking._bundle_to_cell(
+                        bundle, physical_x, physical_y
+                    )
+                    if mapped is None:
+                        continue
+                    col, row = mapped
+                    raw_cell = tracking._cell_label(row, col)
+                    raw_from = last_emitted.get(mini)
+                    if raw_cell == raw_from:
+                        continue
+                    last_emitted[mini] = raw_cell
+                    cell_hist.pop(mini, None)
+                    event = MovementEvent(
+                        mini=mini,
+                        from_cell=raw_to_a1(raw_from),
+                        to_cell=raw_to_a1(raw_cell) or raw_cell,
+                        frame_idx=video_frame_idx,
+                        time_seconds=time_seconds,
+                        raw_from=raw_from,
+                        raw_to=raw_cell,
+                        lab_dist=0.0,
+                        score=1.0,
+                        source="viewportTransform",
+                    )
+                    events.append(event)
+                    if verbose:
+                        print(
+                            f"{format_time(event.time_seconds)} {mini}: "
+                            f"{event.from_cell or '?'} -> {event.to_cell} "
+                            "(Foundry viewport moved)"
+                        )
 
             for mini, state in list(prev_state.items()):
                 if state.get("last_xy") is None:
@@ -252,46 +382,39 @@ def run_video(
             for mini, det in dets.items():
                 if det is None:
                     continue
-                previous_xy = prev_state.get(mini, {}).get("last_xy")
-                if previous_xy is not None:
-                    distance_cells = math.hypot(
-                        det.cx - previous_xy[0],
-                        det.cy - previous_xy[1],
-                    ) / grid_px
-                    if distance_cells < 0.5:
-                        continue
                 last_seen[mini] = time_seconds
 
             for mini, det in dets.items():
                 if det is None:
                     continue
-                col, row = tracking._warp_to_cell(
-                    det.cx,
-                    det.cy,
-                    bundle.grid_w,
-                    bundle.grid_h,
-                    bundle.warp_w,
-                    bundle.warp_h,
-                )
+                mapped = tracking._bundle_to_cell(bundle, det.cx, det.cy)
+                if mapped is None:
+                    continue
+                col, row = mapped
                 raw_cell = tracking._cell_label(row, col)
                 buf = cell_hist.setdefault(mini, deque(maxlen=consensus_n))
                 buf.append(raw_cell)
                 most, count = Counter(buf).most_common(1)[0]
+                if count >= consensus_k and raw_cell == most:
+                    last_physical_xy[mini] = (det.cx, det.cy)
                 if count < consensus_k or most == last_emitted.get(mini):
                     continue
 
                 raw_from = last_emitted.get(mini)
                 last_emitted[mini] = most
 
-                if prev_state.get(mini, {}).get("last_xy") is None:
+                if bundle.marker_mode == "viewport":
+                    anchor = (det.cx, det.cy)
+                else:
                     cell_w = bundle.warp_w / float(bundle.grid_w)
                     cell_h = bundle.warp_h / float(bundle.grid_h)
                     parts = most[1:].split("c", 1)
                     anchor_row, anchor_col = int(parts[0]), int(parts[1])
-                    prev_state.setdefault(mini, {})["last_xy"] = (
+                    anchor = (
                         (anchor_col + 0.5) * cell_w,
                         (anchor_row + 0.5) * cell_h,
                     )
+                prev_state.setdefault(mini, {})["last_xy"] = anchor
 
                 event = MovementEvent(
                     mini=mini,
@@ -321,7 +444,7 @@ def _expectation_label(expectation: Dict[str, Any]) -> str:
     mini = expectation.get("mini", "*")
     from_cell = normalize_cell(expectation.get("from"))
     to_cell = normalize_cell(expectation.get("to"))
-    at = expectation.get("at", expectation.get("time", "?"))
+    at = expectation.get("at", expectation.get("time", expectation.get("between", "?")))
     if from_cell:
         return f"{mini} {from_cell}->{to_cell} at {at}"
     return f"{mini} ->{to_cell} at {at}"
@@ -340,6 +463,9 @@ def _event_matches_expectation(
     expected_from = normalize_cell(expectation.get("from"))
     if expected_from and event.from_cell != expected_from:
         return False
+    if "between" in expectation:
+        start, end = expectation["between"]
+        return parse_time_seconds(start) <= event.time_seconds <= parse_time_seconds(end)
     expected_time = parse_time_seconds(expectation.get("at", expectation.get("time")))
     tolerance = float(expectation.get("tolerance_seconds", default_tolerance))
     return abs(event.time_seconds - expected_time) <= tolerance
@@ -355,6 +481,28 @@ def check_case(case: Dict[str, Any], *, cases_base_dir: Path) -> CaseResult:
     ignore_before = parse_time_seconds(case.get("ignore_before", 0))
     ignore_after_value = case.get("ignore_after")
     ignore_after = parse_time_seconds(ignore_after_value) if ignore_after_value is not None else None
+    timeline_value = case.get("timeline")
+    timeline_path = (
+        _resolve_path(str(timeline_value), cases_base_dir)
+        if timeline_value
+        else None
+    )
+
+    missing = []
+    if not video.exists():
+        missing.append(f"video {video}")
+    if timeline_path is not None and not timeline_path.exists():
+        missing.append(f"timeline {timeline_path}")
+    if missing:
+        return CaseResult(
+            name=name,
+            video=str(video),
+            events=[],
+            failures=[],
+            matched_expectations=0,
+            total_expectations=len(expectations),
+            skipped="Missing local " + " and ".join(missing),
+        )
 
     events = run_video(
         video,
@@ -371,6 +519,11 @@ def check_case(case: Dict[str, Any], *, cases_base_dir: Path) -> CaseResult:
         consensus_k=int(case.get("consensus_k", tracking.CONSENSUS_K)),
         lost_timeout=float(case.get("lost_timeout", 2.0)),
         verbose=bool(case.get("verbose", False)),
+        timeline_path=timeline_path,
+        marker_mode=case.get("marker_mode"),
+        view_settle_seconds=float(
+            case.get("view_settle_seconds", core.VIEW_SETTLE_SECONDS)
+        ),
     )
 
     scoped_events = [
@@ -390,7 +543,8 @@ def check_case(case: Dict[str, Any], *, cases_base_dir: Path) -> CaseResult:
         if not matches:
             failures.append(f"Missing expected movement: {_expectation_label(expectation)}")
             continue
-        expected_time = parse_time_seconds(expectation.get("at", expectation.get("time")))
+        window = expectation.get("between")
+        expected_time = (sum(parse_time_seconds(value) for value in window) / 2.0) if window else parse_time_seconds(expectation.get("at", expectation.get("time")))
         idx, _ = min(matches, key=lambda item: abs(item[1].time_seconds - expected_time))
         used_event_indexes.add(idx)
 
@@ -437,11 +591,18 @@ def events_to_json(events: Iterable[MovementEvent]) -> List[Dict[str, Any]]:
 
 
 def _print_case_result(result: CaseResult) -> None:
+    if result.skipped:
+        print(f"SKIP {result.name}: {result.skipped}")
+        return
     status = "PASS" if result.ok else "FAIL"
     print(f"{status} {result.name}: {result.matched_expectations}/{result.total_expectations} expected movements matched")
     for event in result.events:
         from_text = event.from_cell or "?"
-        print(f"  actual {format_time(event.time_seconds)} {event.mini}: {from_text}->{event.to_cell}")
+        source = f" [{event.source}]" if event.source != "detection" else ""
+        print(
+            f"  actual {format_time(event.time_seconds)} "
+            f"{event.mini}: {from_text}->{event.to_cell}{source}"
+        )
     for failure in result.failures:
         print(f"  {failure}")
 
@@ -460,6 +621,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_parser.add_argument("--max-seconds", type=float, default=None)
     run_parser.add_argument("--max-frames", type=int, default=None)
     run_parser.add_argument("--motion-thresh", type=int, default=core.WARP_MOTION_THRESH)
+    run_parser.add_argument(
+        "--timeline",
+        default=None,
+        help="Foundry timeline JSON. Defaults to VIDEO.tracking.json when present.",
+    )
+    run_parser.add_argument(
+        "--marker-mode", choices=("legacy", "viewport"), default=None
+    )
+    run_parser.add_argument(
+        "--view-settle-seconds",
+        type=float,
+        default=core.VIEW_SETTLE_SECONDS,
+    )
     run_parser.add_argument("--verbose", action="store_true")
 
     check_parser = sub.add_parser("check", help="Check a JSON regression case file.")
@@ -479,6 +653,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 max_frames=args.max_frames,
                 motion_thresh=args.motion_thresh,
                 verbose=args.verbose,
+                timeline_path=(
+                    Path(args.timeline).expanduser().resolve()
+                    if args.timeline
+                    else None
+                ),
+                marker_mode=args.marker_mode,
+                view_settle_seconds=args.view_settle_seconds,
             )
             print(json.dumps(events_to_json(events), indent=2))
             return 0

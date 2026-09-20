@@ -47,6 +47,7 @@ MIN_AREA_FRAC    = 0.04
 MAX_AREA_FRAC    = 9.0
 SAMPLE_RADIUS_FRAC = 0.35
 DEFAULT_MAX_LAB_DIST = 40.0
+DEFAULT_PRESENCE_LAB_DIST = 20.0
 MORPH_CLOSE_FRAC = 0.30
 
 WIN_TV   = "Sarween Calibration"
@@ -560,6 +561,7 @@ def run_mini_calibration(camera_index: Optional[int] = None) -> bool:
                 "brightness_steps": BRIGHTNESS_STEPS,
                 "expected_diameter_squares": float((equiv_r * 2.0) / grid_px_final),
                 "max_lab_dist": DEFAULT_MAX_LAB_DIST,
+                "presence_lab_dist": DEFAULT_PRESENCE_LAB_DIST,
                 "lab": list(np.median(np.array(valid), axis=0).tolist()),
             }
             print(f"MINI_CAL | Saved '{name}' with {len(valid)} valid samples")

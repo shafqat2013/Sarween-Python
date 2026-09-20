@@ -13,3 +13,10 @@ Deprecated/
 # Large map assets
 maps/Digital/
 maps/Print/
+
+# Local camera recordings and their Foundry replay sidecars. Regression case
+# definitions may reference these files, but the videos stay on the capture Mac.
+/sarween_rec_*.mp4
+/sarween_rec_*.tracking.json
+/sarween_rec_*.profiles.json
+/sarween_rec_*.case.json

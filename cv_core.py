@@ -64,11 +64,14 @@ BG_ALPHA_SLOW = 0.02
 BG_ALPHA_FAST = 0.15
 FOG_CHANGE_RATIO = 0.08
 WARP_MOTION_THRESH = 30
+VIEW_SETTLE_SECONDS = 1.25
 
 ARUCO_EVERY_N = 30
 ARUCO_EVERY_N_FAST = 5
 
 LOCK_DROP_AFTER = 10  # consecutive ArUco misses before dropping lock
+MIN_MARKERS_TO_HOLD_LOCK = 3
+PARTIAL_LOCK_MAX_ERROR_PX = 8.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -94,14 +97,19 @@ def show_homography_view(
     warp_h: int,
     grid_w: int,
     grid_h: int,
+    marker_mode: str = "legacy",
+    corner_ids: Optional[Dict[str, int]] = None,
 ) -> None:
-    """Render a warped+gridded debug view of the current homography."""
+    """Render a warped debug view with the grid in its true visible position."""
     count = 0
+    seen_ids: List[int] = []
     if ARUCO_DET is not None:
         gray = cv2.cvtColor(cam_frame, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = ARUCO_DET.detectMarkers(gray)
         if ids is not None and len(ids) > 0:
-            count = len(ids)
+            seen_ids = sorted(int(value) for value in ids.flatten())
+            required = set((corner_ids or CORNER_IDS).values())
+            count = len(required.intersection(seen_ids))
 
     if H_view is not None:
         pad = int(DEST_PAD_PX)
@@ -113,24 +121,30 @@ def show_homography_view(
 
         warped_dbg = cv2.warpPerspective(cam_frame, H_pad, (canvas_w, canvas_h))
 
-        xs = np.linspace(0, warp_w, grid_w + 1)
-        ys = np.linspace(0, warp_h, grid_h + 1)
-        xs_i = np.unique(np.round(xs + pad).astype(int))
-        ys_i = np.unique(np.round(ys + pad).astype(int))
-
         thick = 2
         lt = cv2.LINE_AA
-        for xg in xs_i[1:-1]:
-            cv2.line(warped_dbg, (int(xg), pad), (int(xg), pad + warp_h - 1), (0, 255, 0), thick, lt)
-        for yg in ys_i[1:-1]:
-            cv2.line(warped_dbg, (pad, int(yg)), (pad + warp_w - 1, int(yg)), (0, 255, 0), thick, lt)
-        cv2.rectangle(warped_dbg, (pad, pad), (pad + warp_w - 1, pad + warp_h - 1), (0, 255, 0), thick, lt)
+        if marker_mode == "viewport" and fo is not None:
+            for start, end in fo.warp_grid_segments(warp_w, warp_h):
+                p1 = (int(round(start[0] + pad)), int(round(start[1] + pad)))
+                p2 = (int(round(end[0] + pad)), int(round(end[1] + pad)))
+                cv2.line(warped_dbg, p1, p2, (0, 255, 0), thick, lt)
+        else:
+            xs = np.linspace(0, warp_w, grid_w + 1)
+            ys = np.linspace(0, warp_h, grid_h + 1)
+            xs_i = np.unique(np.round(xs + pad).astype(int))
+            ys_i = np.unique(np.round(ys + pad).astype(int))
+            for xg in xs_i[1:-1]:
+                cv2.line(warped_dbg, (int(xg), pad), (int(xg), pad + warp_h - 1), (0, 255, 0), thick, lt)
+            for yg in ys_i[1:-1]:
+                cv2.line(warped_dbg, (pad, int(yg)), (pad + warp_w - 1, int(yg)), (0, 255, 0), thick, lt)
+            cv2.rectangle(warped_dbg, (pad, pad), (pad + warp_w - 1, pad + warp_h - 1), (0, 255, 0), thick, lt)
     else:
         warped_dbg = np.zeros((warp_h, warp_w, 3), dtype=np.uint8)
 
-    cv2.putText(warped_dbg, f"ArUco markers: {count}", (12, 28),
+    marker_text = f"Required markers: {count}/4  seen={seen_ids}"
+    cv2.putText(warped_dbg, marker_text, (12, 28),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
-    cv2.putText(warped_dbg, f"ArUco markers: {count}", (12, 28),
+    cv2.putText(warped_dbg, marker_text, (12, 28),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
 
     ensure_window("Homography view (debug)", 1280, 720)
@@ -148,7 +162,9 @@ try:
 except Exception:
     ARUCO_DET = None
 
-CORNER_IDS = {"TL": 0, "TR": 1, "BR": 2, "BL": 3}
+LEGACY_CORNER_IDS = {"TL": 0, "TR": 1, "BR": 2, "BL": 3}
+VIEWPORT_CORNER_IDS = {"TL": 10, "TR": 11, "BR": 12, "BL": 13}
+CORNER_IDS = LEGACY_CORNER_IDS
 REQUIRED_IDS = set(CORNER_IDS.values())
 
 
@@ -214,7 +230,8 @@ def solve_H_from_markers(
         return None, 0, [], None, None
 
     seen_ids = sorted([int(x[0]) for x in ids])
-    detected_count = len(seen_ids)
+    required_ids = set(corner_ids.values())
+    detected_count = len(required_ids.intersection(seen_ids))
 
     if detected_count < 4:
         return None, detected_count, seen_ids, corners, ids
@@ -232,6 +249,48 @@ def solve_H_from_markers(
     pts_dst = np.array([[0, 0], [warp_w - 1, 0], [warp_w - 1, warp_h - 1], [0, warp_h - 1]], dtype=np.float32)
     H_view, _ = cv2.findHomography(pts_src, pts_dst, cv2.RANSAC, 3.0)
     return (H_view.astype(np.float32) if H_view is not None else None), detected_count, seen_ids, corners, ids
+
+
+def markers_agree_with_homography(
+    corners: Any,
+    ids: Optional[np.ndarray],
+    H_view: Optional[np.ndarray],
+    warp_w: int,
+    warp_h: int,
+    corner_ids: Dict[str, int],
+    *,
+    min_markers: int = MIN_MARKERS_TO_HOLD_LOCK,
+    max_error_px: float = PARTIAL_LOCK_MAX_ERROR_PX,
+) -> bool:
+    """Return whether visible registration corners still match a saved lock."""
+    if ids is None or corners is None or H_view is None:
+        return False
+
+    id_to_c = {int(ids[i][0]): corners[i] for i in range(len(ids))}
+    marker_specs = (
+        (corner_ids["TL"], 0, (0.0, 0.0)),
+        (corner_ids["TR"], 1, (float(warp_w - 1), 0.0)),
+        (corner_ids["BR"], 2, (float(warp_w - 1), float(warp_h - 1))),
+        (corner_ids["BL"], 3, (0.0, float(warp_h - 1))),
+    )
+    source_points = []
+    destination_points = []
+    for marker_id, corner_index, destination in marker_specs:
+        if marker_id not in id_to_c:
+            continue
+        source_points.append(_corner_pt(id_to_c, marker_id, corner_index))
+        destination_points.append(destination)
+
+    if len(source_points) < int(min_markers):
+        return False
+
+    projected = cv2.perspectiveTransform(
+        np.asarray(source_points, dtype=np.float32).reshape(1, -1, 2),
+        H_view,
+    ).reshape(-1, 2)
+    expected = np.asarray(destination_points, dtype=np.float32)
+    errors = np.linalg.norm(projected - expected, axis=1)
+    return bool(np.max(errors) <= float(max_error_px))
 
 
 def roi_masks(
@@ -320,6 +379,9 @@ class FrameBundle:
     motion_cam: Optional[np.ndarray]
     shadowfree_cam: Optional[np.ndarray]
     final_mask_cam: Optional[np.ndarray]
+    raw_motion_ratio: float = 0.0
+    largest_motion_area: float = 0.0
+    marker_mode: str = "legacy"
 
 
 def _resolve_grid_and_warp_from_setup() -> Tuple[int, int, int, int]:
@@ -363,6 +425,11 @@ class CVCoreSession:
         bg_alpha_slow: float = BG_ALPHA_SLOW,
         bg_alpha_fast: float = BG_ALPHA_FAST,
         source_path: Optional[str] = None,
+        marker_mode: Optional[str] = None,
+        before_frame_callback: Optional[Any] = None,
+        source_frames_undistorted: bool = False,
+        view_settle_seconds: float = VIEW_SETTLE_SECONDS,
+        loop_video: bool = False,
     ):
         sel = s.load_last_selection() or {}
         if camera_index is None:
@@ -380,6 +447,37 @@ class CVCoreSession:
         self.warp_h = int(warp_h)
         self.grid_w = int(grid_w)
         self.grid_h = int(grid_h)
+        self.before_frame_callback = before_frame_callback
+        self.source_frames_undistorted = bool(source_frames_undistorted)
+        self.view_settle_seconds = max(0.0, float(view_settle_seconds))
+        self.loop_video = bool(loop_video)
+
+        _src = (source_path or os.environ.get("TRUESIGHT_SOURCE", "")).strip()
+        if marker_mode is None:
+            is_live_foundry = not _src and str(sel.get("mode", "")).lower() == "foundry"
+            marker_mode = "viewport" if is_live_foundry else "legacy"
+        marker_mode = str(marker_mode).strip().lower()
+        if marker_mode not in {"legacy", "viewport"}:
+            raise ValueError(f"Unsupported marker mode: {marker_mode}")
+        self.marker_mode = marker_mode
+        self.corner_ids = (
+            VIEWPORT_CORNER_IDS if marker_mode == "viewport" else LEGACY_CORNER_IDS
+        )
+        self.required_ids = set(self.corner_ids.values())
+        self._view_transform_revision = 0
+        self._scene_visual_revision = 0
+        self._view_settle_frames = 0
+        if self.marker_mode == "viewport" and fo is not None:
+            try:
+                self._view_transform_revision = fo.get_view_transform_revision()
+                self._scene_visual_revision = fo.get_scene_visual_revision()
+            except Exception:
+                pass
+        print(
+            f"CV_CORE | Marker mode: {self.marker_mode} "
+            f"IDs={sorted(self.required_ids)}",
+            flush=True,
+        )
 
         self.aruco_every_n = int(aruco_every_n)
         self.aruco_every_n_fast = int(aruco_every_n_fast)
@@ -403,7 +501,6 @@ class CVCoreSession:
         self.cam_mtx, self.cam_dist = get_camera_params()
 
         # ── TRUESIGHT_SOURCE: optional video file playback (offline debugging) ──
-        _src = (source_path or os.environ.get("TRUESIGHT_SOURCE", "")).strip()
         self._source_is_file = bool(_src)
 
         if self._source_is_file:
@@ -460,7 +557,7 @@ class CVCoreSession:
 
         self.last_marker_count = 0
         self.last_seen_ids: List[int] = []
-        self.last_missing_ids: List[int] = sorted(list(REQUIRED_IDS))
+        self.last_missing_ids: List[int] = sorted(self.required_ids)
         self.lock_lost_reason = ""
         self.lock_miss_streak = 0
 
@@ -480,11 +577,21 @@ class CVCoreSession:
         self._heal_ms: int = 1500
         self._heal_acc = np.zeros((int(self.warp_h), int(self.warp_w)), dtype=np.uint16)
 
-        # FPS tracking (used for timing report only)
+        # File replay must use the recording's timeline rate for every
+        # frame-count-based timeout. Otherwise results vary with CPU speed.
+        source_fps = (
+            float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            if self._source_is_file
+            else 0.0
+        )
         self._last_frame_time: float = time.perf_counter()
-        self._fps_estimate: float = 30.0
+        self._fps_estimate: float = source_fps if source_fps > 0 else 30.0
 
     def _maybe_undistort(self, cam_bgr: np.ndarray) -> np.ndarray:
+        # Sarween writes recordings after this correction has already run.
+        # Timeline-backed replay marks those frames so they are not corrected twice.
+        if self.source_frames_undistorted:
+            return cam_bgr
         if self.cam_mtx is not None and self.cam_dist is not None:
             try:
                 return cv2.undistort(cam_bgr, self.cam_mtx, self.cam_dist)
@@ -541,6 +648,22 @@ class CVCoreSession:
                 return False
             self._recorder = writer
             self._record_path = path
+            if fo is not None and hasattr(fo, "start_timeline_recording"):
+                try:
+                    fo.start_timeline_recording(
+                        path,
+                        fps=float(fps),
+                        frame_width=w,
+                        frame_height=h,
+                        marker_mode=self.marker_mode,
+                        warp_width=self.warp_w,
+                        warp_height=self.warp_h,
+                        grid_cols=self.grid_w,
+                        grid_rows=self.grid_h,
+                        frames_undistorted=True,
+                    )
+                except Exception as exc:
+                    print(f"CV_CORE | Foundry timeline start error: {exc}", flush=True)
             print(f"CV_CORE | Recording started → {path}  ({w}×{h} @ {fps:.0f}fps)", flush=True)
             return True
         except Exception as exc:
@@ -555,6 +678,11 @@ class CVCoreSession:
                 print(f"CV_CORE | Recording saved → {self._record_path}", flush=True)
             except Exception as exc:
                 print(f"CV_CORE | Recording stop error: {exc}", flush=True)
+            if fo is not None and hasattr(fo, "stop_timeline_recording"):
+                try:
+                    fo.stop_timeline_recording()
+                except Exception as exc:
+                    print(f"CV_CORE | Foundry timeline stop error: {exc}", flush=True)
             self._recorder = None
             self._record_path = None
 
@@ -571,7 +699,7 @@ class CVCoreSession:
             return
 
         H_view, detected_count, seen_ids, det_corners, det_ids = solve_H_from_markers(
-            cam_bgr, self.warp_w, self.warp_h, CORNER_IDS
+            cam_bgr, self.warp_w, self.warp_h, self.corner_ids
         )
 
         if det_ids is not None and det_corners is not None and len(det_ids) > 0:
@@ -583,17 +711,35 @@ class CVCoreSession:
 
         self.last_marker_count = int(detected_count)
         self.last_seen_ids = list(seen_ids)
-        self.last_missing_ids = sorted(list(REQUIRED_IDS - set(self.last_seen_ids)))
+        self.last_missing_ids = sorted(self.required_ids - set(self.last_seen_ids))
 
-        # Lock acquisition / loss with hysteresis
+        # Full visibility is required to acquire or refresh the homography. Once
+        # acquired, three matching corners are enough to prove the camera and TV
+        # have not moved, so a single dim/glared marker does not stop tracking.
         if H_view is not None and len(self.last_missing_ids) == 0:
             self.H_saved = H_view
             try:
                 self._H_inv = np.linalg.inv(H_view).astype(np.float32)
             except Exception:
                 self._H_inv = np.eye(3, dtype=np.float32)
-            self.last_mask_cam, self.last_mask_warp = roi_masks(cam_bgr, H_view, self.warp_w, self.warp_h, CORNER_IDS, grid_w=self.grid_w, grid_h=self.grid_h)
+            self.last_mask_cam, self.last_mask_warp = roi_masks(
+                cam_bgr, H_view, self.warp_w, self.warp_h, self.corner_ids,
+                grid_w=self.grid_w, grid_h=self.grid_h,
+            )
             self.lock_lost_reason = ""
+            self.lock_miss_streak = 0
+        elif have_lock and markers_agree_with_homography(
+            det_corners,
+            det_ids,
+            self.H_saved,
+            self.warp_w,
+            self.warp_h,
+            self.corner_ids,
+        ):
+            self.lock_lost_reason = (
+                f"Holding verified lock ({self.last_marker_count}/4 visible), "
+                f"missing: {self.last_missing_ids}"
+            )
             self.lock_miss_streak = 0
         else:
             if have_lock:
@@ -624,12 +770,66 @@ class CVCoreSession:
                 "motion_cam": None,
                 "shadowfree_cam": None,
                 "final_mask_cam": None,
+                "raw_motion_ratio": 0.0,
+                "largest_motion_area": 0.0,
             }
 
         # Warp once, then extract gray — avoids warping the same frame twice
         warp_bgr = cv2.warpPerspective(cam_bgr, H_use, (int(self.warp_w), int(self.warp_h)))
         gray = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2GRAY)
         warp_blur = cv2.GaussianBlur(gray, (21, 21), 0)
+
+        # A Foundry pan changes the entire displayed map while the physical
+        # minis remain still. Once the browser publishes the completed canvas
+        # transform, reseed both backgrounds so the new map is not treated as
+        # permanent motion.
+        if self.marker_mode == "viewport" and fo is not None:
+            try:
+                revision = fo.get_view_transform_revision()
+            except Exception:
+                revision = self._view_transform_revision
+            if revision != self._view_transform_revision:
+                had_background = self._bg_seeded
+                self._view_transform_revision = revision
+                if had_background and revision > 0:
+                    self._view_settle_frames = max(
+                        4, int(round(self._fps_estimate * self.view_settle_seconds))
+                    )
+                    print(
+                        f"CV_CORE | Foundry view changed (revision {revision}); "
+                        "settling and reseeding background.",
+                        flush=True,
+                    )
+
+            try:
+                visual_revision = fo.get_scene_visual_revision()
+            except Exception:
+                visual_revision = self._scene_visual_revision
+            if visual_revision != self._scene_visual_revision:
+                self._scene_visual_revision = visual_revision
+                if self._bg_seeded and visual_revision > 0:
+                    self._view_settle_frames = max(
+                        self._view_settle_frames,
+                        max(4, int(round(self._fps_estimate * self.view_settle_seconds))),
+                    )
+                    print(
+                        f"CV_CORE | Foundry visual changed (revision {visual_revision}); "
+                        "settling and reseeding background.",
+                        flush=True,
+                    )
+
+        if self._view_settle_frames > 0:
+            self.BG_warp_f32 = warp_blur.astype(np.float32)
+            self.BG_cam = {
+                "bgr": cam_bgr.copy(),
+                "blur": cv2.GaussianBlur(
+                    cv2.cvtColor(cam_bgr, cv2.COLOR_BGR2GRAY), (21, 21), 0
+                ),
+            }
+            self._heal_acc.fill(0)
+            self._last_shadowfree_cam = None
+            self._last_final_mask_cam = None
+            self._view_settle_frames -= 1
 
         # Seed background on first locked frame so we always use the real H
         if not self._bg_seeded:
@@ -655,11 +855,23 @@ class CVCoreSession:
         # many cells at once) while keeping genuine mini-sized blobs.
         # We filter per-contour so small blobs survive even if large ones are present.
         MAX_BLOB_CELLS = 5
-        cell_area_warp = (self.warp_w / float(self.grid_w)) * (self.warp_h / float(self.grid_h))
+        grid_dimensions = None
+        if self.marker_mode == "viewport" and fo is not None:
+            try:
+                grid_dimensions = fo.warp_grid_dimensions(self.warp_w, self.warp_h)
+            except Exception:
+                grid_dimensions = None
+        if grid_dimensions is None:
+            grid_dimensions = (
+                self.warp_w / float(self.grid_w),
+                self.warp_h / float(self.grid_h),
+            )
+        cell_area_warp = grid_dimensions[0] * grid_dimensions[1]
         max_blob_area  = cell_area_warp * (MAX_BLOB_CELLS * MAX_BLOB_CELLS)
 
         cnts_info = cv2.findContours(motion_warp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cnts_motion = cnts_info[0] if len(cnts_info) == 2 else cnts_info[1]
+        largest_motion_area = max((cv2.contourArea(mc) for mc in cnts_motion), default=0.0)
         motion_filtered = np.zeros_like(motion_warp)
         for mc in cnts_motion:
             if cv2.contourArea(mc) <= max_blob_area:
@@ -678,7 +890,7 @@ class CVCoreSession:
         now = time.perf_counter()
         dt = now - self._last_frame_time
         self._last_frame_time = now
-        if dt > 0:
+        if dt > 0 and not self._source_is_file:
             self._fps_estimate = 0.9 * self._fps_estimate + 0.1 * (1.0 / dt)
         heal_frames = max(1, int(round(self._fps_estimate * self._heal_ms / 1000.0)))
 
@@ -760,6 +972,8 @@ class CVCoreSession:
             "motion_cam": motion_cam,
             "shadowfree_cam": shadowfree_cam,
             "final_mask_cam": final_mask_cam,
+            "raw_motion_ratio": change_ratio,
+            "largest_motion_area": float(largest_motion_area),
         }
 
     def frames(self) -> Iterator[FrameBundle]:
@@ -771,10 +985,18 @@ class CVCoreSession:
             self.frame_idx += 1
 
             try:
+                if self.marker_mode == "viewport" and fo is not None:
+                    scene = fo.get_scene_params()
+                    self.grid_w = int(scene["gridCols"])
+                    self.grid_h = int(scene["gridRows"])
+                if self.before_frame_callback is not None:
+                    self.before_frame_callback(self.frame_idx)
                 ok, cam = self.cap.read()
                 if not ok or cam is None:
                     if self._source_is_file:
-                        # Loop video file back to the beginning
+                        if not self.loop_video:
+                            print("CV_CORE | TRUESIGHT_SOURCE: end of video — stopping.", flush=True)
+                            break
                         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         ok, cam = self.cap.read()
                         if not ok or cam is None:
@@ -797,6 +1019,8 @@ class CVCoreSession:
                 if self._recorder is not None:
                     try:
                         self._recorder.write(cam)
+                        if fo is not None and hasattr(fo, "record_timeline_frame"):
+                            fo.record_timeline_frame()
                     except Exception:
                         pass
 
@@ -817,12 +1041,14 @@ class CVCoreSession:
                             "warp_blur": None, "warp_bgr": None, "bg_warp_u8": None,
                             "motion_warp": None, "motion_cam": None,
                             "shadowfree_cam": None, "final_mask_cam": None,
+                            "raw_motion_ratio": 0.0, "largest_motion_area": 0.0,
                         }
                 else:
                     shared = {
                         "warp_blur": None, "warp_bgr": None, "bg_warp_u8": None,
                         "motion_warp": None, "motion_cam": None,
                         "shadowfree_cam": None, "final_mask_cam": None,
+                        "raw_motion_ratio": 0.0, "largest_motion_area": 0.0,
                     }
 
                 yield FrameBundle(
@@ -848,6 +1074,9 @@ class CVCoreSession:
                     motion_cam=shared["motion_cam"],
                     shadowfree_cam=shared["shadowfree_cam"],
                     final_mask_cam=shared["final_mask_cam"],
+                    raw_motion_ratio=shared["raw_motion_ratio"],
+                    largest_motion_area=shared["largest_motion_area"],
+                    marker_mode=self.marker_mode,
                 )
 
             except GeneratorExit:

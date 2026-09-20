@@ -65,7 +65,7 @@ class ControlPanel:
             "show_shadowfree": False,
             "show_final_mask": False,
             "show_hsv_overlap": False,
-            "show_calib_preview": True,
+            "show_calib_preview": False,
             "show_timing": False,
             "verbose_tracking": False,
         }
