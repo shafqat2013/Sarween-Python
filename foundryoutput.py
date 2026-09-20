@@ -77,6 +77,7 @@ _capture_ready = False
 _tracking_output_paused = False
 _camera_lock_state = {"locked": False, "missingIds": []}
 _capture_status = {"type": "captureStatus", "state": "idle"}
+_selected_mini_id = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -220,6 +221,10 @@ def reconcile_scene_bindings(payload: dict) -> None:
 def get_mini_assignments() -> tuple[dict, dict]:
     """Return copies of live mini mappings and scene token labels for UI use."""
     return dict(MINI_TO_TOKEN), dict(SCENE_TOKEN_NAMES)
+
+
+def get_selected_mini() -> str | None:
+    return _selected_mini_id
 
 
 def clear_view_transform() -> None:
@@ -1013,7 +1018,10 @@ async def send_loop(websocket):
             continue
 
         payload = {
+            "type": "moveToken",
             "sceneId": SCENE_ID,
+            "miniId": mini_id,
+            "cell": cell_label,
             "tokenId": token_id,
             "x": x,
             "y": y,
@@ -1067,7 +1075,7 @@ async def recv_loop(websocket):
     """
     Receives messages from Foundry (assignment results, scene info).
     """
-    global MINI_TO_TOKEN
+    global MINI_TO_TOKEN, _selected_mini_id
     while True:
         try:
             raw = await websocket.recv()
@@ -1123,6 +1131,15 @@ async def recv_loop(websocket):
 
         elif msg_type == "sceneVisualChanged":
             mark_scene_visual_changed(str(data.get("reason") or "foundry"))
+
+        elif msg_type == "movementSelection":
+            mini_id = str(data.get("miniId") or "").strip()
+            _selected_mini_id = mini_id if data.get("selected") and mini_id else None
+            print(
+                f"FoundryOutput | Movement selection: "
+                f"{_selected_mini_id or 'none'}",
+                flush=True,
+            )
 
         elif msg_type == "tokenMissing":
             token_id = str(data.get("tokenId") or "").strip()

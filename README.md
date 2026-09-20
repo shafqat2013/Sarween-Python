@@ -101,6 +101,29 @@ profile remains in `combo_profiles.json`. Keeping these separate lets offline
 experiments evaluate larger portfolios before they are allowed to change live
 matching behavior.
 
+## Tap Selection And Movement Budget
+
+Selecting a known Red, Blue, Yellow, Green, or White token in Foundry starts a
+movement session. Sarween uses the actor's walking speed when available and the
+module's `Fallback movement speed` setting otherwise. Each confirmed grid move
+adds Foundry's measured path distance, so diagonal behavior follows the active
+scene rather than a separate Sarween rule.
+
+The selected mini receives a white reachable-range ring, path, and remaining
+movement label. The white range shrinks around its current position. Once the
+cumulative path exceeds the budget, the token ring, path, and counter turn red.
+The Sarween bar provides icon buttons to undo the last confirmed segment or
+reset the budget from the mini's current square.
+
+`Physical tap selects a mini` is enabled by default. Python watches the existing
+foreground/obstruction mask only near already-known mini positions. A brief
+touch followed by the same mini reappearing in place toggles selection; picking
+the mini up and placing it elsewhere is treated as movement instead of a tap.
+The selected mini enters search mode sooner after pickup, helping it reacquire
+after a long move. Tap the stationary mini again, or deselect its Foundry token,
+to end the movement session. Double-tap actions, attack ranges, and aura ranges
+are deliberately reserved for later versions.
+
 Scene activation and grid/background edits now resend scene geometry before the
 viewport transform. Python derives row/column counts from the Foundry grid,
 clears old anchors, and discards moves queued for a different scene. Player

@@ -1,5 +1,15 @@
 // module.js for "sarween" — Computer Vision for TTRPG
 import {CAPTURE_MINIS, generateCaptureTargets} from "./capture_logic.mjs";
+import {
+  addMovementPoint,
+  createMovementState,
+  fallbackGridDistance,
+  movementColor,
+  movementOverage,
+  remainingMovement,
+  resetMovementAt,
+  undoMovementPoint,
+} from "./movement_logic.mjs";
 
 const MODULE_ID = "sarween";
 const MIN_CANVAS_ZOOM = 0.1;
@@ -21,6 +31,10 @@ let testTargetRenderTimer = null;
 let guidedCapture = null;
 let capturePanelEl = null;
 let captureLastStatus = {state: "idle"};
+let movementState = null;
+let movementOverlayEl = null;
+let miniTokenBindings = new Map();
+const ignoredMovementUpdates = new Set();
 
 // UI
 let statusEl = null;
@@ -866,6 +880,254 @@ function scheduleViewTransformSend() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Movement selection and budget overlay
+// ──────────────────────────────────────────────────────────────────────────────
+
+function tokenDocument(token) {
+  return token?.document ?? token ?? null;
+}
+
+function miniForToken(token) {
+  const document = tokenDocument(token);
+  if (!document) return null;
+  for (const [miniId, tokenId] of miniTokenBindings.entries()) {
+    if (String(tokenId) === String(document.id)) {
+      return CAPTURE_MINIS.find(mini => mini.miniId === miniId) ?? {
+        miniId,
+        tokenName: document.name || miniId,
+      };
+    }
+  }
+  const name = String(document.name || "").trim().toLowerCase();
+  return CAPTURE_MINIS.find(mini => mini.tokenName.toLowerCase() === name) ?? null;
+}
+
+function tokenForMini(miniId) {
+  const boundId = miniTokenBindings.get(String(miniId));
+  if (boundId) {
+    const placeable = canvas.tokens?.get?.(boundId);
+    if (placeable) return placeable;
+  }
+  const spec = CAPTURE_MINIS.find(mini => mini.miniId === String(miniId));
+  if (!spec) return null;
+  const document = (canvas.scene?.tokens ?? []).find(
+    token => String(token.name || "").toLowerCase() === spec.tokenName.toLowerCase()
+  );
+  return document ? canvas.tokens?.get?.(document.id) ?? document : null;
+}
+
+function movementPointForToken(token, changes = {}) {
+  const document = tokenDocument(token);
+  const gridSize = Number(canvas.scene?.grid?.size ?? 0);
+  const originX = Number(canvas.dimensions?.sceneX ?? 0) + Number(canvas.scene?.grid?.shiftX ?? 0);
+  const originY = Number(canvas.dimensions?.sceneY ?? 0) + Number(canvas.scene?.grid?.shiftY ?? 0);
+  const x = Number(changes.x ?? document?.x ?? 0);
+  const y = Number(changes.y ?? document?.y ?? 0);
+  return {
+    x,
+    y,
+    column: gridSize > 0 ? Math.round((x - originX) / gridSize) : 0,
+    row: gridSize > 0 ? Math.round((y - originY) / gridSize) : 0,
+  };
+}
+
+function tokenMovementBudget(token) {
+  const document = tokenDocument(token);
+  const movement = document?.actor?.system?.attributes?.movement;
+  const walk = Number(movement?.walk?.value ?? movement?.walk);
+  if (Number.isFinite(walk) && walk > 0) return walk;
+  return Math.max(0, Number(getSetting("defaultMovementSpeed")) || 30);
+}
+
+function measureMovementFeet(from, to) {
+  const gridSize = Number(canvas.scene?.grid?.size ?? 0);
+  const gridDistance = Number(canvas.scene?.grid?.distance ?? 5) || 5;
+  if (gridSize > 0 && canvas.grid?.measurePath) {
+    const half = gridSize / 2;
+    try {
+      const measured = canvas.grid.measurePath([
+        {x: from.x + half, y: from.y + half},
+        {x: to.x + half, y: to.y + half},
+      ]);
+      const distance = Number(measured?.distance);
+      if (Number.isFinite(distance)) return distance;
+    } catch (error) {
+      warn("Could not use Foundry path measurement; using square-grid fallback", error);
+    }
+  }
+  return fallbackGridDistance(from, to, gridDistance);
+}
+
+function sceneToClient(point) {
+  const transform = canvas.stage?.worldTransform;
+  if (!transform) return {x: point.x, y: point.y};
+  return {
+    x: transform.a * point.x + transform.c * point.y + transform.tx,
+    y: transform.b * point.x + transform.d * point.y + transform.ty,
+  };
+}
+
+function ensureMovementOverlay() {
+  if (movementOverlayEl) return movementOverlayEl;
+  movementOverlayEl = document.createElement("div");
+  movementOverlayEl.id = "sarween-movement-overlay";
+  movementOverlayEl.style.cssText = `position:fixed;inset:0;z-index:9998;pointer-events:none;overflow:hidden;`;
+  document.body.appendChild(movementOverlayEl);
+  return movementOverlayEl;
+}
+
+function updateMovementStatusUI() {
+  const status = statusEl?.querySelector("#sarween-movement-status");
+  const undo = statusEl?.querySelector("#sarween-movement-undo");
+  const reset = statusEl?.querySelector("#sarween-movement-reset");
+  if (!status || !undo || !reset) return;
+  if (!movementState) {
+    status.hidden = true;
+    undo.hidden = true;
+    reset.hidden = true;
+    return;
+  }
+  const overage = movementOverage(movementState);
+  status.hidden = false;
+  undo.hidden = false;
+  reset.hidden = false;
+  status.textContent = overage > 0
+    ? `${movementState.label}: ${overage} ft over`
+    : `${movementState.label}: ${movementState.usedFeet}/${movementState.budgetFeet} ft`;
+  status.style.color = movementColor(movementState);
+  undo.disabled = movementState.segments.length === 0;
+}
+
+function renderMovementOverlay() {
+  updateMovementStatusUI();
+  if (!movementState || !canvas?.ready) {
+    movementOverlayEl?.remove();
+    movementOverlayEl = null;
+    return;
+  }
+  const overlay = ensureMovementOverlay();
+  const gridSize = Number(canvas.scene?.grid?.size ?? 0);
+  const gridDistance = Number(canvas.scene?.grid?.distance ?? 5) || 5;
+  const half = gridSize / 2;
+  const color = movementColor(movementState);
+  const current = movementState.points.at(-1);
+  const currentClient = sceneToClient({x: current.x + half, y: current.y + half});
+  const transform = canvas.stage?.worldTransform;
+  const screenScale = transform
+    ? (Math.hypot(transform.a, transform.b) + Math.hypot(transform.c, transform.d)) / 2
+    : 1;
+  const remaining = remainingMovement(movementState);
+  const rangeRadius = gridDistance > 0 ? remaining / gridDistance * gridSize * screenScale : 0;
+  const tokenRadius = Math.max(10, gridSize * screenScale * 0.58);
+  const path = movementState.points.map(point => {
+    const client = sceneToClient({x: point.x + half, y: point.y + half});
+    return `${client.x},${client.y}`;
+  }).join(" ");
+  const overage = movementOverage(movementState);
+  overlay.innerHTML = `<svg width="100%" height="100%" viewBox="0 0 ${window.innerWidth} ${window.innerHeight}" aria-hidden="true">
+    ${remaining > 0 ? `<circle cx="${currentClient.x}" cy="${currentClient.y}" r="${rangeRadius}" fill="${color}" fill-opacity="0.055" stroke="${color}" stroke-width="3" stroke-dasharray="10 7"/>` : ""}
+    ${path ? `<polyline points="${path}" fill="none" stroke="${color}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>` : ""}
+    <circle cx="${currentClient.x}" cy="${currentClient.y}" r="${tokenRadius}" fill="none" stroke="${color}" stroke-width="4"/>
+    <text x="${currentClient.x}" y="${currentClient.y - tokenRadius - 8}" text-anchor="middle" fill="${color}" stroke="#000" stroke-width="3" paint-order="stroke" font-size="16" font-weight="700">${overage > 0 ? `${overage} ft over` : `${remaining} ft left`}</text>
+  </svg>`;
+}
+
+function clearMovementSelection({notifyPython = true} = {}) {
+  if (movementState && notifyPython) {
+    sendToPython({
+      type: "movementSelection",
+      miniId: movementState.miniId,
+      tokenId: movementState.tokenId,
+      selected: false,
+    });
+  }
+  movementState = null;
+  renderMovementOverlay();
+}
+
+function selectMovementToken(token, {notifyPython = true} = {}) {
+  const document = tokenDocument(token);
+  const mini = miniForToken(document);
+  if (!document || !mini) return false;
+  miniTokenBindings.set(mini.miniId, document.id);
+  movementState = createMovementState({
+    miniId: mini.miniId,
+    tokenId: document.id,
+    label: document.name || mini.tokenName,
+    budgetFeet: tokenMovementBudget(document),
+    point: movementPointForToken(document),
+  });
+  if (notifyPython) {
+    sendToPython({
+      type: "movementSelection",
+      miniId: mini.miniId,
+      tokenId: document.id,
+      selected: true,
+    });
+  }
+  renderMovementOverlay();
+  return true;
+}
+
+function togglePhysicalMiniSelection(miniId) {
+  if (!getSetting("physicalTapSelection")) return;
+  const token = tokenForMini(miniId);
+  if (!token) {
+    ui.notifications?.warn(`Sarween: No Foundry token is assigned to ${miniId}.`);
+    return;
+  }
+  const document = tokenDocument(token);
+  if (movementState?.miniId === String(miniId)) {
+    token.release?.();
+    if (movementState) clearMovementSelection();
+    return;
+  }
+  token.control?.({releaseOthers: true});
+  if (movementState?.tokenId !== document.id) selectMovementToken(document);
+}
+
+function recordSelectedMovement(token, changes = {}) {
+  const document = tokenDocument(token);
+  if (!movementState || document?.id !== movementState.tokenId) return;
+  if (ignoredMovementUpdates.delete(document.id)) return;
+  if (changes.x === undefined && changes.y === undefined) return;
+  const next = movementPointForToken(document, changes);
+  const previous = movementState.points.at(-1);
+  movementState = addMovementPoint(
+    movementState,
+    next,
+    measureMovementFeet(previous, next),
+  );
+  renderMovementOverlay();
+}
+
+async function undoSelectedMovement() {
+  if (!movementState) return;
+  const undone = undoMovementPoint(movementState);
+  if (!undone.point) return;
+  movementState = undone.state;
+  ignoredMovementUpdates.add(movementState.tokenId);
+  try {
+    await canvas.scene.updateEmbeddedDocuments(
+      "Token",
+      [{_id: movementState.tokenId, x: undone.point.x, y: undone.point.y}],
+      {animate: getSetting("animateTokenMovement")},
+    );
+  } finally {
+    setTimeout(() => ignoredMovementUpdates.delete(movementState?.tokenId), 1000);
+  }
+  renderMovementOverlay();
+}
+
+function resetSelectedMovement() {
+  if (!movementState) return;
+  const token = canvas.scene?.tokens?.get?.(movementState.tokenId);
+  if (!token) return;
+  movementState = resetMovementAt(movementState, movementPointForToken(token));
+  renderMovementOverlay();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Settings
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -1004,6 +1266,25 @@ Hooks.once("init", () => {
     default: true
   });
 
+  game.settings.register(MODULE_ID, "physicalTapSelection", {
+    name: "Physical tap selects a mini",
+    hint: "Let the overhead camera select or deselect a player mini after a short physical tap.",
+    scope: "world",
+    config: true,
+    type: Boolean,
+    default: true
+  });
+
+  game.settings.register(MODULE_ID, "defaultMovementSpeed", {
+    name: "Fallback movement speed (feet)",
+    hint: "Used when the selected Foundry actor does not provide a walking speed.",
+    scope: "world",
+    config: true,
+    type: Number,
+    range: {min: 0, max: 120, step: 5},
+    default: 30
+  });
+
   game.settings.register(MODULE_ID, "statusPanelPosition", {
     name: "Sarween panel position",
     scope: "client",
@@ -1096,6 +1377,27 @@ function ensureStatusUI() {
       color: white;
       cursor: pointer;
     "><i class="fas fa-qrcode"></i></button>
+    <span id="sarween-movement-status" hidden style="font-weight:700;white-space:nowrap;"></span>
+    <button id="sarween-movement-undo" type="button" hidden title="Undo last tracked movement" style="
+      width: 28px;
+      height: 26px;
+      padding: 0;
+      border-radius: 4px;
+      border: 1px solid rgba(255,255,255,0.25);
+      background: rgba(255,255,255,0.10);
+      color: white;
+      cursor: pointer;
+    "><i class="fas fa-rotate-left"></i></button>
+    <button id="sarween-movement-reset" type="button" hidden title="Reset movement from the current square" style="
+      width: 28px;
+      height: 26px;
+      padding: 0;
+      border-radius: 4px;
+      border: 1px solid rgba(255,255,255,0.25);
+      background: rgba(255,255,255,0.10);
+      color: white;
+      cursor: pointer;
+    "><i class="fas fa-arrows-rotate"></i></button>
     <button id="sarween-btn" style="
       margin-left: 6px;
       padding: 3px 8px;
@@ -1135,6 +1437,12 @@ function ensureStatusUI() {
   });
   statusEl.querySelector("#sarween-marker-toggle-btn").addEventListener("click", () => {
     void toggleViewportMarkers();
+  });
+  statusEl.querySelector("#sarween-movement-undo").addEventListener("click", () => {
+    void undoSelectedMovement();
+  });
+  statusEl.querySelector("#sarween-movement-reset").addEventListener("click", () => {
+    resetSelectedMovement();
   });
 
   statusEl.querySelector("#sarween-btn").addEventListener("click", () => {
@@ -1257,6 +1565,7 @@ async function promptAssignMini(miniId) {
               tokenId: chosen.tokenId,
               actorId: chosen.actorId
             });
+            miniTokenBindings.set(String(miniId), String(chosen.tokenId));
 
             ui.notifications?.info(`Sarween: Assigned mini ${miniId} → ${chosen.tokenName}`);
             resolve(chosen);
@@ -1322,6 +1631,14 @@ function buildSceneInfoPayload(scene) {
     scene.data?.img ??
     null;
 
+  const miniBindings = Object.fromEntries(CAPTURE_MINIS.flatMap(mini => {
+    const matches = (scene.tokens ?? []).filter(token => token.name?.toLowerCase() === mini.tokenName.toLowerCase());
+    return matches.length === 1 ? [[mini.miniId, matches[0].id]] : [];
+  }));
+  for (const [miniId, tokenId] of Object.entries(miniBindings)) {
+    miniTokenBindings.set(miniId, tokenId);
+  }
+
   return {
     type: "sceneInfo",
     sceneId: scene.id,
@@ -1333,10 +1650,7 @@ function buildSceneInfoPayload(scene) {
     gridType,
     background,
     tokens: (scene.tokens ?? []).map(token => ({id: token.id, name: token.name, actorId: token.actorId})),
-    miniBindings: Object.fromEntries(CAPTURE_MINIS.flatMap(mini => {
-      const matches = (scene.tokens ?? []).filter(token => token.name?.toLowerCase() === mini.tokenName.toLowerCase());
-      return matches.length === 1 ? [[mini.miniId, matches[0].id]] : [];
-    })),
+    miniBindings,
   };
 }
 
@@ -1397,6 +1711,11 @@ async function handlePythonMessage(data) {
   if (type === "ping") return;
   if (type === "captureStatus") {
     await handleCaptureStatus(data);
+    return;
+  }
+  if (type === "miniTap") {
+    const miniId = String(data?.miniId || "").trim();
+    if (miniId) togglePhysicalMiniSelection(miniId);
     return;
   }
 
@@ -1613,6 +1932,9 @@ Hooks.once("ready", () => {
     sendViewTransform,
     toggleTestTargets,
     openCaptureSetup,
+    selectMovementToken,
+    clearMovementSelection,
+    resetSelectedMovement,
   };
 
   if (getSetting("autoConnect")) {
@@ -1625,6 +1947,7 @@ Hooks.once("ready", () => {
 });
 
 Hooks.on("canvasReady", () => {
+  clearMovementSelection();
   if (guidedCapture?.recording) stopGuidedCapture("sceneChanged");
   testSequenceTargets = [];
   renderTestTargets();
@@ -1653,11 +1976,31 @@ Hooks.on("canvasPan", () => {
   }
   scheduleViewTransformSend();
   scheduleTestTargetRender();
+  renderMovementOverlay();
+});
+
+Hooks.on("controlToken", (token, controlled) => {
+  if (guidedCapture?.recording) return;
+  const document = tokenDocument(token);
+  if (controlled) {
+    selectMovementToken(document);
+  } else if (movementState?.tokenId === document?.id) {
+    clearMovementSelection();
+  }
+});
+
+Hooks.on("updateToken", (document, changes) => {
+  recordSelectedMovement(document, changes);
+});
+
+Hooks.on("deleteToken", document => {
+  if (movementState?.tokenId === document?.id) clearMovementSelection();
 });
 
 window.addEventListener("resize", () => {
   renderViewportMarkers();
   renderTestTargets();
+  renderMovementOverlay();
   applyStatusPanelPosition();
   if (game.settings.get(MODULE_ID, "physicalGridAutoApply")) {
     applyPhysicalGridScale({animate: false});

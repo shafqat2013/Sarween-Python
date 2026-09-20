@@ -22,6 +22,7 @@ import setup as s
 import cv_core as core
 import foundryoutput as fo
 import mini_library as ml
+import tap_selection as taps
 from control_panel import ControlPanel, rc_to_a1
 from mini_calibration import load_profiles_with_curves, min_lab_dist_to_profile
 
@@ -968,6 +969,7 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
     _current_fps: float = 30.0          # updated every second; used for recording FPS
     _last_no_blob_msg: float = 0.0      # throttle the "no blobs" verbose heartbeat
     _last_library_update: float = 0.0
+    tap_detector = taps.TapGestureDetector()
 
     cam_window_open = False
     warp_window_open = False
@@ -1268,11 +1270,13 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
             # Lost-mini timeout: if anchored but undetected for >LOST_TIMEOUT s,
             # clear the spatial anchor so the mini can re-lock anywhere.
             _now_t = time.perf_counter()
+            selected_mini = fo.get_selected_mini()
             for _name in list(prev_state.keys()):
                 _ps = prev_state[_name]
                 if _ps.get("last_xy") is not None:
                     _age = _now_t - _last_seen.get(_name, _now_t)
-                    if _age > LOST_TIMEOUT:
+                    timeout = 0.75 if _name == selected_mini else LOST_TIMEOUT
+                    if _age > timeout:
                         _ps["last_xy"] = None
                         cell_hist.pop(_name, None)   # clear stale consensus buffer
                         print(f"V3 | {_name} lost ({_age:.1f}s since last detection) "
@@ -1293,6 +1297,26 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
                 if _det is None:
                     continue
                 _last_seen[_name] = _now_t
+
+            contact_ids = taps.contact_minis(
+                bundle,
+                last_physical_xy,
+                grid_px,
+            )
+            detected_positions = {
+                name: (detection.cx, detection.cy)
+                for name, detection in dets.items()
+                if detection is not None
+            }
+            tapped_mini = tap_detector.update(
+                _now_t,
+                contact_ids,
+                last_physical_xy if contact_ids else detected_positions,
+                grid_px,
+            )
+            if tapped_mini:
+                print(f"V3 | Physical tap recognized on {tapped_mini}", flush=True)
+                fo.queue_control({"type": "miniTap", "miniId": tapped_mini})
 
             # Heartbeat when verbose but nothing detected (throttled to once/3s)
             if verbose_tracking and bundle.locked and not any(d is not None for d in dets.values()):

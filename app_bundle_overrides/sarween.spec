@@ -23,6 +23,8 @@ added_files = [
     ("mini_token_map.json",     "."),   # Foundry token mapping
     ("mini_database.csv",       "."),   # mini capture DB (may be empty)
     ("module.js",               "."),   # Foundry module JS
+    ("capture_logic.mjs",       "."),   # guided dataset capture rules
+    ("movement_logic.mjs",      "."),   # movement budget state machine
     ("module.json",             "."),   # Foundry module manifest
     ("tk_camera_preview.py",    "."),   # Tkinter camera preview window
     ("maps",                    "maps"),# map image files
