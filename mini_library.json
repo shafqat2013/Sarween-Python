@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "minis": {
+    "red10": {
+      "name": "Red",
+      "ringColor": "red",
+      "tokenName": "Red",
+      "enabled": true,
+      "samples": []
+    },
+    "blue": {
+      "name": "Blue",
+      "ringColor": "blue",
+      "tokenName": "Blue",
+      "enabled": true,
+      "samples": []
+    },
+    "yellow": {
+      "name": "Yellow",
+      "ringColor": "yellow",
+      "tokenName": "Yellow",
+      "enabled": true,
+      "samples": []
+    },
+    "green": {
+      "name": "Green",
+      "ringColor": "green",
+      "tokenName": "Green",
+      "enabled": true,
+      "samples": []
+    },
+    "white": {
+      "name": "White",
+      "ringColor": "white",
+      "tokenName": "White",
+      "enabled": true,
+      "samples": []
+    }
+  }
+}

@@ -18,6 +18,8 @@ block_cipher = None
 added_files = [
     ("band_profiles.json",      "."),   # HSV band definitions
     ("hardware_config.json",    "."),   # camera index etc.
+    ("combo_profiles.json",     "."),   # live ring-color tracker profiles
+    ("mini_library.json",       "."),   # player mini metadata and scan portfolio
     ("mini_token_map.json",     "."),   # Foundry token mapping
     ("mini_database.csv",       "."),   # mini capture DB (may be empty)
     ("module.js",               "."),   # Foundry module JS

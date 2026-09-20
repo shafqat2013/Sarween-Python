@@ -81,6 +81,26 @@ has been deleted or replaced, the module tells Python to discard the stale ID
 and request assignment to the replacement token instead of silently dropping
 future movements.
 
+## Mini Library
+
+The control panel's `Mini Library` button opens the player-mini roster. It shows
+all five planned ring colors, whether each mini has a usable tracker profile,
+how many verified appearance samples are saved, its token assignment in the
+active Foundry scene, live recognition confidence, and its last known cell.
+
+`Scan selected` waits up to 15 seconds for the chosen mini to move, then uses
+the existing known-position calibration path. A successful scan updates the
+live tracking profile and adds a verified, deduplicated portfolio sample.
+`Full brightness scan` retains the existing multi-level TV calibration. Its
+valid Lab curve points are imported into the portfolio automatically the next
+time tracking starts. Existing `red10` data is migrated without changing its
+tracking thresholds.
+
+The durable metadata lives in `mini_library.json`; the detector-compatible
+profile remains in `combo_profiles.json`. Keeping these separate lets offline
+experiments evaluate larger portfolios before they are allowed to change live
+matching behavior.
+
 Scene activation and grid/background edits now resend scene geometry before the
 viewport transform. Python derives row/column counts from the Foundry grid,
 clears old anchors, and discards moves queued for a different scene. Player
@@ -136,9 +156,8 @@ false positives are caught as well as missed real movements.
 
 - Add a pre-gridded image setup mode that derives the Foundry grid dimensions,
   scale, and alignment from grid lines already baked into a map image.
-- Add a Mini Library UI showing every enrolled player mini, its ring color,
-  Foundry token assignment, current recognition confidence, and scan status.
-- Maintain a compact portfolio of verified appearance samples for each mini
-  across room lighting, map brightness, and fog conditions. Add samples during
-  a known-position session check, deduplicate similar samples, and reject
-  untrusted outliers instead of learning from arbitrary frames.
+- Evaluate how verified portfolio samples should update live color thresholds
+  without reintroducing fog-of-war false positives. Add explicit room-lighting,
+  map-brightness, and fog labels plus conservative outlier review.
+- Add import/export and archive controls for minis that are not part of the
+  default five-player roster.

@@ -21,6 +21,7 @@ import numpy as np
 import setup as s
 import cv_core as core
 import foundryoutput as fo
+import mini_library as ml
 from control_panel import ControlPanel, rc_to_a1
 from mini_calibration import load_profiles_with_curves, min_lab_dist_to_profile
 
@@ -901,6 +902,7 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
 
     # Load profiles — supports both single-point and curve-based
     profiles = load_profiles_with_curves(_PROFILES_PATH)
+    mini_library = ml.load_synced_library(profiles)
 
     sess = core.CVCoreSession(camera_index=camera_index)
 
@@ -920,6 +922,21 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
     panel = ControlPanel(mode=mode, tk_root=_shared_root)
     panel.show()
 
+    def update_library_panel(detections=None, positions=None):
+        mappings, token_names = fo.get_mini_assignments()
+        panel.update_mini_library(
+            ml.library_rows(
+                mini_library,
+                profiles=profiles,
+                mappings=mappings,
+                token_names=token_names,
+                detections=detections,
+                positions=positions,
+            )
+        )
+
+    update_library_panel()
+
     # Sync the Record button label if we resumed recording
     if sess.is_recording:
         panel.set_recording_status(True, sess._record_path or "")
@@ -937,6 +954,7 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
     last_scene_geometry = None
     last_output_paused = fo.tracking_output_paused()
     capture_started_at = None
+    pending_library_scan = None
 
     # Lost-mini tracking: if a mini goes undetected for this many seconds while
     # anchored, drop the spatial anchor so it can re-lock anywhere on the board.
@@ -949,6 +967,7 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
     last_print = time.perf_counter()
     _current_fps: float = 30.0          # updated every second; used for recording FPS
     _last_no_blob_msg: float = 0.0      # throttle the "no blobs" verbose heartbeat
+    _last_library_update: float = 0.0
 
     cam_window_open = False
     warp_window_open = False
@@ -973,6 +992,18 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
                 _last_display = _now
 
             actions = panel.pop_actions()
+            if actions.get("scan_mini"):
+                pending_library_scan = (str(actions["scan_mini"]), time.perf_counter())
+            if pending_library_scan and not actions.get("calibrate_band"):
+                scan_name, scan_started = pending_library_scan
+                if time.perf_counter() - scan_started <= 15.0:
+                    actions["calibrate_band"] = {
+                        "name": scan_name,
+                        "portfolio_scan": True,
+                    }
+                else:
+                    pending_library_scan = None
+                    panel.set_hint(f"Scan timed out for {scan_name}; try Scan selected again")
             fo.update_camera_lock(bundle.locked, bundle.last_missing_ids)
             scene = fo.get_scene_params()
             scene_geometry = (scene["sceneId"], scene["sceneW"], scene["sceneH"], scene["gridPx"], scene["shiftX"], scene["shiftY"])
@@ -1028,8 +1059,10 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
             if actions.get("calibrate_band"):
                 req = actions.get("calibrate_band")
                 name = None
+                portfolio_scan = False
                 if isinstance(req, dict):
                     name = (req.get("name") or "").strip() or None
+                    portfolio_scan = bool(req.get("portfolio_scan", False))
                 if not name:
                     name = time.strftime("mini_%Y%m%d_%H%M%S")
 
@@ -1038,7 +1071,10 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
                 else:
                     prof = calibrate_from_bundle(bundle, name, profiles)
                     if prof is None:
-                        panel.set_hint("Calibrate: no motion blob — move the mini first")
+                        if portfolio_scan:
+                            panel.set_hint(f"Waiting for {name}; move that mini to a new square")
+                        else:
+                            panel.set_hint("Calibrate: no motion blob — move the mini first")
                     else:
                         lab = tuple(prof["lab"])
                         rejection = _calibration_rejection_reason(name, lab)
@@ -1046,11 +1082,31 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
                             message = f"Calibration rejected for {name}: {rejection}"
                             print(f"COMBO CAL | {message}", flush=True)
                             panel.set_hint(message)
+                            if portfolio_scan:
+                                pending_library_scan = None
                             continue
                         profiles[name] = prof
                         try:
                             _save_profiles(profiles)
-                            panel.set_hint(f"Calibrated: {name}  Lab=({lab[0]:.0f},{lab[1]:.0f},{lab[2]:.0f})")
+                            sample_result = ml.add_verified_sample(
+                                name,
+                                lab,
+                                source="known-position-scan",
+                                conditions={"fog": "unknown", "roomLighting": "current"},
+                            )
+                            mini_library = ml.load_synced_library(profiles)
+                            update_library_panel()
+                            sample_note = (
+                                "portfolio sample added"
+                                if sample_result == "added"
+                                else "matching sample already saved"
+                            )
+                            panel.set_hint(
+                                f"Calibrated: {name}  Lab=({lab[0]:.0f},{lab[1]:.0f},{lab[2]:.0f}); "
+                                f"{sample_note}"
+                            )
+                            if portfolio_scan:
+                                pending_library_scan = None
                         except Exception as e:
                             panel.set_hint(f"Save failed: {e}")
                 continue
@@ -1425,6 +1481,9 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
                 else:
                     positions[mname] = None
             panel.update_positions(positions)
+            if _now_t - _last_library_update >= 0.5:
+                update_library_panel(dets, positions)
+                _last_library_update = _now_t
 
             if show_windows and any_cv_window_open:
                 k = cv2.waitKey(1) & 0xFF

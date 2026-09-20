@@ -9,18 +9,26 @@ import foundryoutput as foundry
 class FoundryMappingTest(unittest.TestCase):
     def test_named_players_are_reassigned_on_new_scene(self):
         original_mapping = foundry.MINI_TO_TOKEN
+        original_names = foundry.SCENE_TOKEN_NAMES
         original_path = foundry.MAP_PATH
         try:
             with tempfile.TemporaryDirectory() as directory:
                 foundry.MINI_TO_TOKEN = {"red10": "old-red", "blue": "old-blue"}
                 foundry.MAP_PATH = Path(directory) / "mini_token_map.json"
                 foundry.reconcile_scene_bindings({
-                    "tokens": [{"id": "new-red"}, {"id": "new-blue"}],
+                    "tokens": [
+                        {"id": "new-red", "name": "Red"},
+                        {"id": "new-blue", "name": "Blue"},
+                    ],
                     "miniBindings": {"red10": "new-red", "blue": "new-blue"},
                 })
                 self.assertEqual(foundry.MINI_TO_TOKEN, {"red10": "new-red", "blue": "new-blue"})
+                mappings, names = foundry.get_mini_assignments()
+                self.assertEqual(mappings["red10"], "new-red")
+                self.assertEqual(names["new-red"], "Red")
         finally:
             foundry.MINI_TO_TOKEN = original_mapping
+            foundry.SCENE_TOKEN_NAMES = original_names
             foundry.MAP_PATH = original_path
 
     def test_remove_stale_token_mapping_persists_remaining_mappings(self):

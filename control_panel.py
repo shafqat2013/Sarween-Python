@@ -77,7 +77,11 @@ class ControlPanel:
             "calibrate_minis": False,
             "toggle_recording": False,
             "dump_state": False,
+            "scan_mini": None,
         }
+        self._library_rows: List[Dict[str, object]] = []
+        self._library_window = None
+        self._library_tree = None
 
         # ── Tk root / window ─────────────────────────────────────────────────
         if tk_root is not None:
@@ -199,6 +203,8 @@ class ControlPanel:
         debug_row.pack(fill="x", pady=(4, 0))
         ttk.Button(debug_row, text="Dump State",
                    command=self._act_dump_state).pack(side="left")
+        ttk.Button(debug_row, text="Mini Library",
+                   command=self._show_mini_library).pack(side="left", padx=(6, 0))
 
         # Motion threshold
         thresh_box = ttk.Frame(outer)
@@ -286,6 +292,128 @@ class ControlPanel:
         with self._lock:
             self._actions["dump_state"] = True
 
+    def _show_mini_library(self):
+        if self._library_window is not None:
+            try:
+                if self._library_window.winfo_exists():
+                    self._library_window.deiconify()
+                    self._library_window.lift()
+                    return
+            except Exception:
+                pass
+
+        window = tk.Toplevel(self.root)
+        window.title("Sarween Mini Library")
+        window.geometry("760x340")
+        window.minsize(680, 300)
+        self._library_window = window
+
+        outer = ttk.Frame(window, padding=14)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="Mini Library", font=("Helvetica", 16, "bold")).pack(
+            anchor="w", pady=(0, 10)
+        )
+
+        columns = ("ring", "scan", "foundry", "confidence", "cell")
+        tree = ttk.Treeview(outer, columns=columns, show="headings", height=7)
+        headings = {
+            "ring": "Mini / ring",
+            "scan": "Scan portfolio",
+            "foundry": "Foundry token",
+            "confidence": "Recognition",
+            "cell": "Last cell",
+        }
+        widths = {
+            "ring": 125,
+            "scan": 150,
+            "foundry": 150,
+            "confidence": 120,
+            "cell": 85,
+        }
+        for column in columns:
+            tree.heading(column, text=headings[column])
+            tree.column(column, width=widths[column], minwidth=70, anchor="w")
+        tree.pack(fill="both", expand=True)
+        self._library_tree = tree
+
+        actions = ttk.Frame(outer)
+        actions.pack(fill="x", pady=(10, 0))
+        ttk.Button(actions, text="Scan selected", command=self._act_scan_selected).pack(
+            side="left"
+        )
+        ttk.Button(
+            actions,
+            text="Full brightness scan",
+            command=self._act_library_brightness_scan,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(actions, text="Close", command=window.destroy).pack(side="right")
+
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        self._render_mini_library()
+
+    def _act_scan_selected(self):
+        tree = self._library_tree
+        selected = tree.selection() if tree is not None else ()
+        if not selected:
+            self.set_hint("Choose a mini in the Mini Library first")
+            return
+        mini_id = str(selected[0])
+        with self._lock:
+            self._actions["scan_mini"] = mini_id
+        self.set_hint(f"Move {mini_id} now; Sarween is waiting for its ring scan")
+
+    def _act_library_brightness_scan(self):
+        with self._lock:
+            self._actions["calibrate_minis"] = True
+        self.set_hint("Starting full brightness scan")
+
+    def _render_mini_library(self):
+        tree = self._library_tree
+        if tree is None:
+            return
+        try:
+            selected = set(tree.selection())
+            for item in tree.get_children():
+                tree.delete(item)
+            color_tags = {
+                "red": "#b42318",
+                "blue": "#175cd3",
+                "yellow": "#8a6500",
+                "green": "#067647",
+                "white": "#667085",
+            }
+            for color, foreground in color_tags.items():
+                tree.tag_configure(color, foreground=foreground)
+            for row in self._library_rows:
+                mini_id = str(row["id"])
+                color = str(row.get("ringColor") or "unknown").lower()
+                count = int(row.get("sampleCount") or 0)
+                scan = f"{row.get('scanStatus', 'Needs scan')} ({count} samples)"
+                confidence = row.get("confidence")
+                confidence_text = (
+                    f"Seen {float(confidence) * 100:.0f}%"
+                    if confidence is not None
+                    else "Not seen"
+                )
+                tree.insert(
+                    "",
+                    "end",
+                    iid=mini_id,
+                    values=(
+                        f"{row.get('name', mini_id)} / {color}",
+                        scan,
+                        row.get("token") or "Not assigned",
+                        confidence_text,
+                        row.get("position") or "--",
+                    ),
+                    tags=(color,) if color in color_tags else (),
+                )
+            for mini_id in selected:
+                if tree.exists(mini_id):
+                    tree.selection_add(mini_id)
+        except Exception:
+            pass
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def update_positions(self, positions: dict) -> None:
@@ -312,6 +440,16 @@ class ControlPanel:
                     self._pos_rows[mini_id]["pos_var"].set(coord if coord else "—")
             except Exception:
                 pass
+        try:
+            self.root.after(0, _update)
+        except Exception:
+            pass
+
+    def update_mini_library(self, rows: List[Dict[str, object]]) -> None:
+        def _update():
+            self._library_rows = [dict(row) for row in rows]
+            self._render_mini_library()
+
         try:
             self.root.after(0, _update)
         except Exception:
@@ -412,6 +550,7 @@ class ControlPanel:
             self._actions["calibrate_minis"]  = False
             self._actions["toggle_recording"] = False
             self._actions["dump_state"]       = False
+            self._actions["scan_mini"]        = None
         return out
 
     def pump(self) -> bool:

@@ -28,6 +28,7 @@ DEFAULT_TOKEN_ID = "1"  # fallback
 # Populated at runtime from mini_token_map.json via _load_mapping().
 # Do not hardcode IDs here — use the assignment flow in-game instead.
 MINI_TO_TOKEN = {}
+SCENE_TOKEN_NAMES = {}
 
 # Persist mappings across runs
 MAP_PATH = Path(__file__).with_name("mini_token_map.json")
@@ -195,8 +196,14 @@ def get_scene_params() -> dict:
 
 def reconcile_scene_bindings(payload: dict) -> None:
     """Named player tokens can be reassigned automatically across scenes."""
+    global SCENE_TOKEN_NAMES
     if "tokens" not in payload:
         return
+    SCENE_TOKEN_NAMES = {
+        str(token["id"]): str(token.get("name") or token["id"])
+        for token in payload["tokens"]
+        if token.get("id")
+    }
     valid_ids = {str(token["id"]) for token in payload["tokens"] if token.get("id")}
     bindings = payload.get("miniBindings") or {}
     before = dict(MINI_TO_TOKEN)
@@ -208,6 +215,11 @@ def reconcile_scene_bindings(payload: dict) -> None:
             MINI_TO_TOKEN[mini_id] = str(token_id)
     if MINI_TO_TOKEN != before:
         _save_mapping()
+
+
+def get_mini_assignments() -> tuple[dict, dict]:
+    """Return copies of live mini mappings and scene token labels for UI use."""
+    return dict(MINI_TO_TOKEN), dict(SCENE_TOKEN_NAMES)
 
 
 def clear_view_transform() -> None:
