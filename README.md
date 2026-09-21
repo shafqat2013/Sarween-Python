@@ -31,7 +31,7 @@ C=Yellow, D=Green, and E=White. The existing trained `red10` profile remains
 the tracking identity for the Red token until profiles are migrated into the
 future Mini Library.
 
-When recording is enabled, Sarween now creates two files with the same name:
+When recording is enabled, Sarween creates a video and timeline sidecar:
 
 ```text
 sarween_rec_YYYYMMDD_HHMMSS.mp4
@@ -43,6 +43,23 @@ Foundry visual changes against exact video frame numbers. Keep the two files
 together. The regression runner discovers the sidecar automatically, so a
 fixed-marker recording can be replayed later without Foundry, the camera, or
 the TV running.
+
+In viewport-marker mode, the Foundry module also saves one low-resolution,
+mini-free canvas snapshot roughly every two seconds in a sibling
+`sarween_rec_YYYYMMDD_HHMMSS_references/` directory. This is an optional
+offline diagnostic, never a live tracking input. Keep that directory with the
+video and sidecar to compare what the camera saw with the actual rendered fog,
+lighting, and digital tokens:
+
+```bash
+python rendered_reference.py sarween_rec_YYYYMMDD_HHMMSS.mp4
+```
+
+The output reports changed-pixel percentages for frame pairs with matching
+scene and viewport, plus how much of each current mini candidate differs from
+the clean display. It does not yet score detection precision or improve live
+tracking. Older recordings have no rendered frames; the original map image
+cannot reconstruct their fog, so this comparison requires a new recording.
 
 Relevant client settings are `Fixed viewport ArUco markers`, `Viewport marker
 size`, `Viewport marker inset`, `Grid square size (inches)`, and `Animate tracked

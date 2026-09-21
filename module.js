@@ -22,6 +22,7 @@ let ws = null;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
 let heartbeatTimer = null;
+let referenceCaptureTimer = null;
 let manualDisconnect = false;
 let markerOverlayEl = null;
 let testTargetOverlayEl = null;
@@ -799,6 +800,52 @@ function getViewportRegistration() {
     right: window.innerWidth - inset - quietZone,
     bottom: window.innerHeight - inset - quietZone,
   };
+}
+
+function stopReferenceCapture() {
+  if (referenceCaptureTimer) clearInterval(referenceCaptureTimer);
+  referenceCaptureTimer = null;
+}
+
+function captureRenderedReference() {
+  if (!canvas?.ready || !canvas.scene || ws?.readyState !== WebSocket.OPEN) return;
+  try {
+    const viewTransform = buildViewTransformPayload();
+    if (!viewTransform) return;
+    // Extract the Foundry canvas, not the camera or DOM marker overlay. The
+    // registration rectangle makes its pixels correspond to the camera warp.
+    const source = canvas.app.renderer.extract.canvas();
+    const registration = getViewportRegistration();
+    const scaleX = source.width / window.innerWidth;
+    const scaleY = source.height / window.innerHeight;
+    const snapshot = document.createElement("canvas");
+    snapshot.width = 640;
+    snapshot.height = 360;
+    snapshot.getContext("2d").drawImage(
+      source,
+      registration.left * scaleX, registration.top * scaleY,
+      (registration.right - registration.left) * scaleX,
+      (registration.bottom - registration.top) * scaleY,
+      0, 0, snapshot.width, snapshot.height,
+    );
+    sendToPython({
+      type: "renderedReference",
+      sceneId: canvas.scene.id,
+      viewTransform,
+      image: snapshot.toDataURL("image/jpeg", 0.7),
+    });
+  } catch (err) {
+    stopReferenceCapture();
+    warn("Could not capture a rendered reference; video recording will continue:", err);
+  }
+}
+
+function setReferenceCapture(enabled) {
+  stopReferenceCapture();
+  if (enabled) {
+    captureRenderedReference();
+    referenceCaptureTimer = setInterval(captureRenderedReference, 2000);
+  }
 }
 
 function getClientToCanvasTransform() {
@@ -1704,11 +1751,15 @@ function scheduleReconnect(reason = "") {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async function handlePythonMessage(data) {
-  log("Received message from Python:", data);
+  if (data?.type !== "renderedReference") log("Received message from Python:", data);
 
   const { sceneId, tokenId, x, y, type } = data || {};
 
   if (type === "ping") return;
+  if (type === "referenceCapture") {
+    setReferenceCapture(Boolean(data.enabled));
+    return;
+  }
   if (type === "captureStatus") {
     await handleCaptureStatus(data);
     return;
@@ -1887,6 +1938,7 @@ function connectToPython() {
 
   ws.onclose = (event) => {
     clearTimers();
+    stopReferenceCapture();
     ws = null;
     warn("WebSocket closed:", event.code, event.reason || "(no reason)");
     setStatus("disconnected", event.reason || "closed");

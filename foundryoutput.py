@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import copy
 import json
 import math
@@ -490,9 +492,11 @@ def start_timeline_recording(
             "framesRecorded": 0,
             "trackingEvents": [],
             "groundTruth": [],
+            "referenceFrames": [],
             "events": [{"frame": 0, **snapshot}],
         }
     _write_timeline_file()
+    queue_control({"type": "referenceCapture", "enabled": marker_mode == "viewport"})
     print(f"FoundryOutput | Recording Foundry timeline -> {path}", flush=True)
     return path
 
@@ -513,6 +517,45 @@ def record_timeline_frame() -> None:
         _timeline_recording["framesRecorded"] = frame + 1
     if should_write:
         _write_timeline_file()
+
+
+def record_rendered_reference(payload: dict) -> bool:
+    """Persist a low-rate, clean Foundry canvas image beside the video."""
+    encoded = payload.get("image")
+    if not isinstance(encoded, str) or not encoded.startswith("data:image/jpeg;base64,"):
+        return False
+    if len(encoded) > 500_000:
+        return False
+    try:
+        image = base64.b64decode(encoded.split(",", 1)[1], validate=True)
+    except (ValueError, binascii.Error):
+        return False
+    if len(image) > 350_000 or not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"):
+        return False
+
+    with _timeline_lock:
+        if _timeline_recording is None or _timeline_path is None:
+            return False
+        if str(payload.get("sceneId")) != str(SCENE_ID):
+            return False
+        frame = int(_timeline_recording["framesRecorded"])
+        references = _timeline_recording["referenceFrames"]
+        min_interval = max(1, int(float(_timeline_recording["fps"])))
+        if references and frame - int(references[-1]["frame"]) < min_interval:
+            return False
+        folder = _timeline_path.parent / (_timeline_path.stem.removesuffix(".tracking") + "_references")
+        folder.mkdir(exist_ok=True)
+        path = folder / f"frame_{frame:06d}.jpg"
+        path.write_bytes(image)
+        references.append({
+            "frame": frame,
+            "sceneId": SCENE_ID,
+            "viewRevision": get_view_transform_revision(),
+            "viewTransform": get_view_transform_payload(),
+            "path": str(path.relative_to(_timeline_path.parent)),
+        })
+    _write_timeline_file()
+    return True
 
 
 def record_tracking_event(
@@ -548,6 +591,7 @@ def stop_timeline_recording() -> Path | None:
         _timeline_recording = None
         _timeline_path = None
         _timeline_last_signature = None
+    queue_control({"type": "referenceCapture", "enabled": False})
     print(f"FoundryOutput | Foundry timeline saved -> {path}", flush=True)
     return path
 
@@ -1093,6 +1137,10 @@ async def recv_loop(websocket):
         if msg_type in ("hello", "ping"):
             if msg_type == "hello":
                 queue_control(_capture_status)
+                with _timeline_lock:
+                    recording = _timeline_recording
+                    enabled = bool(recording and recording["markerMode"] == "viewport")
+                queue_control({"type": "referenceCapture", "enabled": enabled})
             continue
 
         if msg_type == "assignMiniResult":
@@ -1128,6 +1176,14 @@ async def recv_loop(websocket):
 
         elif msg_type == "viewTransform":
             set_view_transform(data)
+
+        elif msg_type == "renderedReference":
+            if data.get("viewTransform"):
+                set_view_transform(data["viewTransform"])
+            try:
+                record_rendered_reference(data)
+            except OSError as exc:
+                print(f"FoundryOutput | Reference snapshot save error: {exc}", flush=True)
 
         elif msg_type == "sceneVisualChanged":
             mark_scene_visual_changed(str(data.get("reason") or "foundry"))

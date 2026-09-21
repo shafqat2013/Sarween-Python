@@ -16,6 +16,7 @@ assert.throws(() => generateCaptureTargets({firstColumn: 0, lastColumn: 1, first
 
 const hooks = new Map();
 const sent = [];
+const snapshotDraws = [];
 const sceneTokens = participants.map((mini, index) => ({
   id: mini.tokenId,
   name: mini.tokenName,
@@ -29,14 +30,16 @@ const context = vm.createContext({
   console, crypto: {randomUUID: () => "test"},
   Hooks: {once() {}, on(name, callback) {hooks.set(name, callback);}},
   window: {innerWidth: 1200, innerHeight: 800, addEventListener() {}},
-  document: {createElement() {return {style: {}, dataset: {}, appendChild() {}, remove() {}};}, body: {appendChild() {}}},
+  document: {createElement(tag) {return tag === "canvas"
+    ? {width: 0, height: 0, getContext() {return {drawImage(...args) {snapshotDraws.push(args);}};}, toDataURL() {return "data:image/jpeg;base64,abc";}}
+    : {style: {}, dataset: {}, appendChild() {}, remove() {}};}, body: {appendChild() {}}},
   game: {settings: {get(_module, key) {return {viewportMarkersEnabled: true, viewportMarkerSize: 120, viewportMarkerInset: 8, physicalTapSelection: true, defaultMovementSpeed: 30}[key];}}},
-  canvas: {ready: true, scene, dimensions: {}, grid: {measurePath: () => ({distance: 5})}, tokens: {get(id) {return sceneTokens.get(id);}}, stage: {worldTransform: {a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0}}},
+  canvas: {ready: true, scene, dimensions: {}, app: {renderer: {extract: {canvas() {return {width: 1200, height: 800};}}}}, grid: {measurePath: () => ({distance: 5})}, tokens: {get(id) {return sceneTokens.get(id);}}, stage: {worldTransform: {a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0}}},
   WebSocket: {OPEN: 1},
   setTimeout(callback) {callback(); return 1;}, clearTimeout() {},
 });
 const source = fs.readFileSync(new URL("../module.js", import.meta.url), "utf8");
-const module = new vm.SourceTextModule(source + '\n globalThis.moduleTest = {setSocket(value) {ws = value;}, getMovementState() {return movementState;}};', {context});
+const module = new vm.SourceTextModule(source + '\n globalThis.moduleTest = {setSocket(value) {ws = value;}, getMovementState() {return movementState;}, captureRenderedReference};', {context});
 await module.link(specifier => {
   if (specifier.endsWith("capture_logic.mjs")) {
     return new vm.SyntheticModule(["CAPTURE_MINIS", "generateCaptureTargets"], function () {
@@ -70,4 +73,10 @@ hooks.get("updateToken")(sceneTokens[0], {x: 100, y: 0});
 assert.equal(context.moduleTest.getMovementState().usedFeet, 5);
 hooks.get("controlToken")(sceneTokens[0], false);
 assert.equal(context.moduleTest.getMovementState(), null);
+sent.length = 0;
+context.moduleTest.captureRenderedReference();
+assert.equal(sent[0].type, "renderedReference");
+assert.equal(sent[0].sceneId, "new-scene");
+assert.equal(snapshotDraws.length, 1);
+assert.deepEqual(snapshotDraws[0].slice(1), [28, 28, 1144, 744, 0, 0, 640, 360]);
 console.log("PASS: five-mini routes and scene-switch hooks");
