@@ -9,9 +9,10 @@ import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
+from app_paths import atomic_write_json, data_path
 
 
-LIBRARY_PATH = Path(__file__).with_name("mini_library.json")
+LIBRARY_PATH = data_path("mini_library.json")
 SCHEMA_VERSION = 1
 
 DEFAULT_MINIS = (
@@ -85,7 +86,7 @@ def load_library(path: Path = LIBRARY_PATH) -> Dict[str, Any]:
 
 def save_library(library: Mapping[str, Any], path: Path = LIBRARY_PATH) -> None:
     normalized = _normalize_library(copy.deepcopy(dict(library)))
-    path.write_text(json.dumps(normalized, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(path, normalized)
 
 
 def _valid_lab(lab: Iterable[Any]) -> list[float]:
@@ -137,24 +138,24 @@ def sync_profile_samples(
         )
         samples = entry.setdefault("samples", [])
         curve = profile.get("lab_curve") or []
-        points = [point for point in curve if point is not None]
+        points = [(index, point) for index, point in enumerate(curve) if point is not None]
         if not points and profile.get("lab") is not None:
-            points = [profile["lab"]]
+            points = [(None, profile["lab"])]
         brightness = profile.get("brightness_steps") or []
-        for index, point in enumerate(points):
+        for index, point in points:
             lab = _valid_lab(point)
             if _contains_lab(samples, lab):
                 continue
             condition = (
                 f"display-brightness:{brightness[index]}"
-                if index < len(brightness)
+                if index is not None and index < len(brightness) and brightness[index] is not None
                 else "legacy-profile"
             )
             samples.append(
                 {
                     "id": _sample_id(mini_id, lab, "profile-import", condition),
                     "lab": lab,
-                    "verified": True,
+                    "verified": False,
                     "source": "profile-import",
                     "capturedAt": None,
                     "conditions": {"display": condition},
@@ -177,7 +178,7 @@ def add_verified_sample(
     mini_id: str,
     lab: Iterable[Any],
     *,
-    source: str = "known-position-scan",
+    source: str = "manual-ring-sample",
     conditions: Optional[Mapping[str, Any]] = None,
     path: Path = LIBRARY_PATH,
 ) -> str:
@@ -198,10 +199,16 @@ def add_verified_sample(
         },
     )
     samples = entry.setdefault("samples", [])
-    if _contains_lab(samples, values):
-        return "duplicate"
     captured_at = datetime.now(timezone.utc).isoformat()
     condition_data = dict(conditions or {})
+    for sample in samples:
+        if not _contains_lab([sample], values):
+            continue
+        if sample.get("verified"):
+            return "duplicate"
+        sample.update(verified=True, source=source, capturedAt=captured_at, conditions=condition_data)
+        save_library(library, path)
+        return "verified"
     samples.append(
         {
             "id": _sample_id(mini_id, values, source, captured_at),

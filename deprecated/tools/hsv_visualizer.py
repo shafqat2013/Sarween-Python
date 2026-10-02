@@ -2,7 +2,7 @@
 """
 hsv_visualizer.py — Standalone HSV range visualizer for Sarween band profiles.
 
-Loads band_profiles.json from the same directory and shows an OpenCV window
+Loads band_profiles.json from the user-data directory and shows an OpenCV window
 visualizing each band's HSV range, with overlapping hue regions highlighted in red.
 
 No camera, no ArUco, no CV pipeline required.
@@ -18,6 +18,7 @@ import math
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
+from app_paths import data_path
 
 import cv2
 import numpy as np
@@ -196,8 +197,8 @@ def main():
     parser.add_argument(
         "--profiles",
         type=Path,
-        default=Path(__file__).with_name("band_profiles.json"),
-        help="Path to band_profiles.json (default: same directory as this script)",
+        default=data_path("band_profiles.json"),
+        help="Path to band_profiles.json (default: Sarween user-data directory)",
     )
     parser.add_argument(
         "--width", type=int, default=1280,

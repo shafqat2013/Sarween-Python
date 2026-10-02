@@ -2,8 +2,9 @@
   "cases": [
     {
       "name": "fog_off_red10_control",
+      "label_source": "legacy-unverified",
       "video": "../../sarween_rec_20260905_233022.mp4",
-      "profiles": "../../combo_profiles.json",
+      "profiles": "red10_baseline.profiles.json",
       "grid": {
         "cols": 23,
         "rows": 16,
@@ -34,8 +35,9 @@
     },
     {
       "name": "fog_on_red10_numbered_targets_48x27",
+      "label_source": "legacy-unverified",
       "video": "../../sarween_rec_20260911_135922.mp4",
-      "profiles": "../../combo_profiles.json",
+      "profiles": "red10_baseline.profiles.json",
       "timeline": "../../sarween_rec_20260911_135922.tracking.json",
       "ignore_before": 2.0,
       "tolerance_seconds": 1.0,
@@ -74,8 +76,9 @@
     },
     {
       "name": "fog_on_red10_partial_marker_lock_48x27",
+      "label_source": "legacy-unverified",
       "video": "../../sarween_rec_20260911_141952.mp4",
-      "profiles": "../../combo_profiles.json",
+      "profiles": "red10_baseline.profiles.json",
       "timeline": "../../sarween_rec_20260911_141952.tracking.json",
       "ignore_before": 2.0,
       "tolerance_seconds": 1.0,
@@ -114,8 +117,9 @@
     },
     {
       "name": "fog_on_red10_rejects_matching_foundry_token",
+      "label_source": "legacy-unverified",
       "video": "../../sarween_rec_20260911_162031.mp4",
-      "profiles": "../../combo_profiles.json",
+      "profiles": "red10_baseline.profiles.json",
       "timeline": "../../sarween_rec_20260911_162031.tracking.json",
       "ignore_before": 2.0,
       "tolerance_seconds": 1.0,
@@ -142,8 +146,9 @@
     },
     {
       "name": "fog_on_red10_a1_a5_plus_random_48x27",
+      "label_source": "legacy-unverified",
       "video": "../../sarween_rec_20260911_165442.mp4",
-      "profiles": "../../combo_profiles.json",
+      "profiles": "red10_baseline.profiles.json",
       "timeline": "../../sarween_rec_20260911_165442.tracking.json",
       "ignore_before": 10.0,
       "tolerance_seconds": 1.0,

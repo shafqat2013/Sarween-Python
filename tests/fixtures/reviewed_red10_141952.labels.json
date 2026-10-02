@@ -1,0 +1,12 @@
+{
+  "video": "sarween_rec_20260911_141952.mp4",
+  "method": "Manual visual inspection before detector evaluation; four-marker rectification and recorded grid geometry only.",
+  "reviewed_range_seconds": [0, 8.5],
+  "evidence": "tracking_reports/holdout_141952_visual/evidence.json",
+  "observations": [
+    {"frame": 0, "cell": "V16", "point_approx": [566, 422], "note": "Red ring visibly stationary at start; also visible at frame 28."},
+    {"frame": 56, "cell": "J7", "note": "Hand placing mini over highlighted first target."},
+    {"frame": 84, "cell": "J7", "point_approx": [236, 164], "note": "Hand clear, ring centered on J7; same position at frame 112."}
+  ],
+  "limitations": ["Sparse visual sampling cannot exclude very brief movements between inspected frames.", "Many later frames lack all four registration markers; no exact-cell labels inferred for them.", "Single Red mini only; not a five-mini holdout or proof of Foundry delivery."]
+}

@@ -2,12 +2,13 @@ import asyncio
 import unittest
 
 import foundryoutput as foundry
+from foundry_delivery import MoveOutbox
 
 
 class FoundryOutputSafetyTest(unittest.IsolatedAsyncioTestCase):
     async def check_output(self, paused):
         original = {name: getattr(foundry, name) for name in (
-            "SCENE_ID", "MINI_TO_TOKEN", "GRID_PX", "_move_queue", "_tracking_output_paused",
+            "SCENE_ID", "MINI_TO_TOKEN", "GRID_PX", "_delivery", "_connection_ready", "_tracking_output_paused",
         )}
         sent = []
 
@@ -21,9 +22,13 @@ class FoundryOutputSafetyTest(unittest.IsolatedAsyncioTestCase):
             foundry.MINI_TO_TOKEN = {"red10": "token"}
             foundry.GRID_PX = 50
             foundry._tracking_output_paused = paused
-            foundry._move_queue = asyncio.Queue()
-            foundry._move_queue.put_nowait(("red10", "A1", "old-scene"))
-            foundry._move_queue.put_nowait(("red10", "B2", "new-scene"))
+            foundry._delivery = MoveOutbox()
+            foundry._connection_ready = True
+            old_context = ("old-scene", *foundry._scene_context()[1:])
+            foundry._delivery.set_context(old_context)
+            foundry._delivery.offer("red10", "A1", old_context)
+            foundry._delivery.set_context(foundry._scene_context())
+            foundry.queue_cell_move("red10", "B2")
             task = asyncio.create_task(foundry.send_loop(Socket()))
             await asyncio.sleep(0.01)
             return sent

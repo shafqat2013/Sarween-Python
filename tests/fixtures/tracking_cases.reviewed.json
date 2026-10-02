@@ -1,0 +1,21 @@
+{
+  "cases": [
+    {
+      "name": "reviewed_red10_fog_on_five_placements",
+      "label_source": "assistant-visually-reviewed",
+      "label_evidence": "reviewed_red10_135922.labels.json",
+      "video": "../../sarween_rec_20260911_135922.mp4",
+      "profiles": "red10_baseline.profiles.json",
+      "timeline": "../../sarween_rec_20260911_135922.tracking.json",
+      "allow_unexpected": false,
+      "expectations": [
+        {"mini": "red10", "to": "V16", "between": [0, 1.5]},
+        {"mini": "red10", "from": "V16", "to": "J7", "between": [2.864909, 5.085286], "settled_at": 3.085286},
+        {"mini": "red10", "from": "J7", "to": "AK7", "between": [8.815103, 11.255858], "settled_at": 9.255858},
+        {"mini": "red10", "from": "AK7", "to": "Y14", "between": [14.398002, 16.544920], "settled_at": 14.544920},
+        {"mini": "red10", "from": "Y14", "to": "K21", "between": [20.201278, 22.421656], "settled_at": 20.421656},
+        {"mini": "red10", "from": "K21", "to": "AL20", "between": [25.563799, 27.784177], "settled_at": 25.784177}
+      ]
+    }
+  ]
+}

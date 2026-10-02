@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "review_date": "2026-09-21",
+  "reviewer": "Codex visual inspection; not user-confirmed",
+  "label_source": "assistant-visually-reviewed",
+  "video": "../../sarween_rec_20260911_135922.mp4",
+  "video_sha256": "70c9c9116c7e60a9cc50a308789afc2979317a5bec6059b4699ac014831ebb3c",
+  "timeline_sha256": "f484c590cfd9b21d4f6799baef97f1d6e1bf8a2c6e6fb5af5c455c054236b62b",
+  "fps": 13.613,
+  "frame_convention": "Zero-based decoded frame index. Seconds = frame / nominal FPS, not reconstructed live wall time.",
+  "method": "Visually follow the physical red miniature and its circular base, not the blue digital token or projected torso. Rectify each reviewed frame using all four viewport markers. Map manually identified base centers using the captured Foundry scene transform. The planned target labels corroborate registration but do not establish physical placement.",
+  "not_blind": "Historical expected destinations had been read before review. Each placement was checked against visible footage independently; this is not a held-out or blinded evaluation.",
+  "coverage": "Whole-clip overview every 14 frames (0 through 378), plus dense transition samples listed below. Not a frame-by-frame exhaustive audit. One physical mini; stable fog/display, no panning or scene changes.",
+  "identity": "red10 is the single physical red mini from the user's session description. Its historical scan is unavailable; the regression profile is a frozen later baseline copy.",
+  "response_rule": "Initial acquisition by 1.5 seconds; each subsequent destination must emit within the placement uncertainty interval or up to 2 seconds after its first clear registered sample. No extra movements anywhere in the recording. Bounds chosen from footage, not detector emission times.",
+  "timing_limit": "settled_at uses the first reviewed registered sample with the hand clear of the base, not an exact physical touchdown time. Raw frame 123 is already clear but lacks all four markers; the second placement uses registered frame 126 conservatively. Exact response latency is uncertain by the listed interval and nominal-video timing.",
+  "evidence_directory": "../../tracking_reports/visual-review-20260921",
+  "overview_step_seconds": 1.0,
+  "transition_frames": [33,36,39,42,45,48,51,114,117,120,123,126,198,201,204,207,210,269,272,275,278,281,345,348,351,354,357,360,363],
+  "placements": [
+    {"kind": "initial", "cell": "V16", "evidence_frame": 0, "base_center_warp_xy": [560,411], "clear_frame": 0},
+    {"kind": "move", "cell": "J7", "evidence_frame": 56, "base_center_warp_xy": [233,164], "clear_frame": 42, "clear_interval_frames": [39,42]},
+    {"kind": "move", "cell": "AK7", "evidence_frame": 140, "base_center_warp_xy": [980,164], "clear_frame": 126, "clear_interval_frames": [120,126]},
+    {"kind": "move", "cell": "Y14", "evidence_frame": 224, "base_center_warp_xy": [642,360], "clear_frame": 198, "clear_interval_frames": [196,198]},
+    {"kind": "move", "cell": "K21", "evidence_frame": 294, "base_center_warp_xy": [261,557], "clear_frame": 278, "clear_interval_frames": [275,278]},
+    {"kind": "move", "cell": "AL20", "evidence_frame": 378, "base_center_warp_xy": [1003,534], "clear_frame": 351, "clear_interval_frames": [348,351]}
+  ],
+  "stationary_sample_ranges": [[0,14],[56,84],[126,154],[210,238],[280,308],[354,378]],
+  "exclusions": "No independent Foundry delivery claim: the blue token and revealed area stay near their initial position in the reviewed images. This case scores tracker output only. No claim about Blue, Green, Yellow, White or changing fog."
+}

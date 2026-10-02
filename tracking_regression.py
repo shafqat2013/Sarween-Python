@@ -8,11 +8,15 @@ expected movements from a JSON case file.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
+import subprocess
 import sys
-from collections import Counter, deque
-from dataclasses import asdict, dataclass
+import tempfile
+import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -21,8 +25,14 @@ import cv2
 import cv_core as core
 import foundryoutput as fo
 import v3_tracking as tracking
-from control_panel import rc_to_a1
 from mini_calibration import load_profiles_with_curves
+from tracking_engine import TrackingEngine
+from app_paths import data_path
+from tracking_evaluation import (
+    CaseResult, MovementEvent, a1_to_row_col, evaluate_events,
+    event_matches_expectation as _event_matches_expectation,
+    format_time, normalize_cell, parse_time_seconds, validate_case,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -33,7 +43,7 @@ class FoundryTimelineReplay:
     def __init__(self, path: Path):
         self.path = path.resolve()
         self.data = json.loads(self.path.read_text(encoding="utf-8"))
-        if int(self.data.get("schemaVersion", 0)) != 1:
+        if int(self.data.get("schemaVersion", 0)) not in (1, 2):
             raise ValueError(f"Unsupported Foundry timeline schema: {self.path}")
         self.events = sorted(
             list(self.data.get("events") or []), key=lambda event: int(event["frame"])
@@ -42,6 +52,18 @@ class FoundryTimelineReplay:
             raise ValueError(f"Foundry timeline has no events: {self.path}")
         self._next_event = 0
         self._last_visual_revision: Optional[int] = None
+        self.selected_mini = None
+        self.paused = False
+        self.has_controls = all("trackingControls" in event for event in self.events)
+        self.clocks = {int(item["frame"]): item for item in self.data.get("frameClocks", [])}
+        self.checkpoints = self.data.get("checkpoints", [])
+        self.has_checkpoint = any(item["frame"] == 0 and item.get("kind") == "initial" for item in self.checkpoints)
+
+    @property
+    def prediction_paused(self):
+        # Guided footage pauses live predictions to collect labels; evaluation
+        # must run the tracker rather than reproduce that intentional pause.
+        return self.paused and not bool(self.data.get("capture"))
 
     def apply_through(self, frame: int) -> None:
         while self._next_event < len(self.events):
@@ -52,6 +74,9 @@ class FoundryTimelineReplay:
             self._next_event += 1
 
     def _apply_event(self, event: Dict[str, Any]) -> None:
+        controls = event.get("trackingControls") or {}
+        self.selected_mini = controls.get("selectedMini")
+        self.paused = bool(controls.get("paused", False))
         scene = event.get("sceneInfo") or {}
         if scene:
             fo.set_scene_params(
@@ -80,98 +105,16 @@ class FoundryTimelineReplay:
                 str(event.get("sceneVisualReason") or "timelineReplay")
             )
         self._last_visual_revision = visual_revision
+        if self.data.get("schemaVersion") == 2:
+            # This only runs in the isolated replay process.
+            with fo._view_transform_lock:
+                fo._view_transform_revision = int(event.get("viewTransformRevision", fo._view_transform_revision))
+                fo._scene_visual_revision = visual_revision
 
 
 def find_timeline_path(video_path: Path) -> Optional[Path]:
     candidate = fo.timeline_path_for_video(video_path)
     return candidate if candidate.exists() else None
-
-
-@dataclass
-class MovementEvent:
-    mini: str
-    from_cell: Optional[str]
-    to_cell: str
-    frame_idx: int
-    time_seconds: float
-    raw_from: Optional[str]
-    raw_to: str
-    lab_dist: float
-    score: float
-    source: str = "detection"
-
-
-@dataclass
-class CaseResult:
-    name: str
-    video: str
-    events: List[MovementEvent]
-    failures: List[str]
-    matched_expectations: int
-    total_expectations: int
-    skipped: Optional[str] = None
-
-    @property
-    def ok(self) -> bool:
-        return not self.failures
-
-
-def parse_time_seconds(value: Any) -> float:
-    if value is None:
-        return 0.0
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip()
-    if not text:
-        return 0.0
-    parts = text.split(":")
-    if len(parts) == 1:
-        return float(parts[0])
-    if len(parts) == 2:
-        minutes, seconds = parts
-        return int(minutes) * 60 + float(seconds)
-    if len(parts) == 3:
-        hours, minutes, seconds = parts
-        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
-    raise ValueError(f"Invalid time value: {value!r}")
-
-
-def format_time(seconds: float) -> str:
-    seconds = max(0.0, float(seconds))
-    whole = int(seconds)
-    millis = int(round((seconds - whole) * 1000))
-    minutes, sec = divmod(whole, 60)
-    hours, minute = divmod(minutes, 60)
-    if hours:
-        return f"{hours:02d}:{minute:02d}:{sec:02d}.{millis:03d}"
-    return f"{minute:02d}:{sec:02d}.{millis:03d}"
-
-
-def normalize_cell(cell: Optional[str]) -> Optional[str]:
-    if cell is None:
-        return None
-    text = str(cell).strip()
-    if not text:
-        return None
-    if text.startswith("r") and "c" in text:
-        row_text, col_text = text[1:].split("c", 1)
-        return rc_to_a1(int(row_text), int(col_text)).upper()
-    return text.upper()
-
-
-def a1_to_row_col(cell: str) -> Tuple[int, int]:
-    text = normalize_cell(cell)
-    if not text:
-        raise ValueError("Cell cannot be empty")
-    idx = 0
-    col = 0
-    while idx < len(text) and text[idx].isalpha():
-        col = col * 26 + (ord(text[idx]) - ord("A") + 1)
-        idx += 1
-    row_text = text[idx:]
-    if not row_text.isdigit() or col <= 0:
-        raise ValueError(f"Invalid A1 cell: {cell!r}")
-    return int(row_text) - 1, col - 1
 
 
 def a1_to_raw(cell: str) -> str:
@@ -202,37 +145,10 @@ def _video_metadata(video_path: Path) -> Tuple[float, int]:
     return fps, frame_count
 
 
-def _seed_initial_positions(
-    initial_positions: Dict[str, str],
-    grid_w: int,
-    grid_h: int,
-    warp_w: int,
-    warp_h: int,
-    marker_mode: str = "legacy",
-) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
-    prev_state: Dict[str, Dict[str, Any]] = {}
-    last_emitted: Dict[str, str] = {}
-    cell_w = warp_w / float(grid_w)
-    cell_h = warp_h / float(grid_h)
-    for mini, cell in (initial_positions or {}).items():
-        row, col = a1_to_row_col(cell)
-        raw = tracking._cell_label(row, col)
-        last_emitted[str(mini)] = raw
-        prev_state[str(mini)] = {
-            "last_xy": (
-                None
-                if marker_mode == "viewport"
-                else ((col + 0.5) * cell_w, (row + 0.5) * cell_h)
-            ),
-            "last_dist": None,
-        }
-    return prev_state, last_emitted
-
-
-def run_video(
+def _run_video(
     video_path: Path,
     *,
-    profiles_path: Path = ROOT / "combo_profiles.json",
+    profiles_path: Optional[Path] = None,
     grid_w: Optional[int] = None,
     grid_h: Optional[int] = None,
     warp_w: Optional[int] = None,
@@ -248,16 +164,27 @@ def run_video(
     timeline_path: Optional[Path] = None,
     marker_mode: Optional[str] = None,
     view_settle_seconds: float = core.VIEW_SETTLE_SECONDS,
+    frames_undistorted: Optional[bool] = None,
+    diagnostics: Optional[Dict[str, Any]] = None,
+    restore_recorded_profiles: bool = True,
+    progress_path: Optional[str] = None,
 ) -> List[MovementEvent]:
+    started = time.monotonic()
+    diagnostics = diagnostics if diagnostics is not None else {}
     video_path = video_path.resolve()
-    profiles_path = profiles_path.resolve()
+    timeline_path = timeline_path or find_timeline_path(video_path)
+    timeline = FoundryTimelineReplay(timeline_path) if timeline_path else None
+    saved_profiles = video_path.with_suffix(".profiles.json")
+    profiles_path = (profiles_path or (saved_profiles if saved_profiles.exists() else data_path("combo_profiles.json"))).resolve()
     profiles = load_profiles_with_curves(profiles_path)
     if not profiles:
         raise RuntimeError(f"No mini profiles found in {profiles_path}")
+    for value in (grid_w, grid_h, warp_w, warp_h):
+        if value is not None and int(value) <= 0:
+            raise ValueError("Grid and warp dimensions must be positive")
 
     if timeline_path is None:
         timeline_path = find_timeline_path(video_path)
-    timeline = FoundryTimelineReplay(timeline_path) if timeline_path else None
     source_frames_undistorted = False
     if timeline is not None:
         timeline.apply_through(0)
@@ -274,16 +201,62 @@ def run_video(
         )
         print(f"TrackingRegression | Replaying Foundry timeline: {timeline.path}")
 
+    if frames_undistorted is not None:
+        source_frames_undistorted = bool(frames_undistorted)
+    # Offline results must not depend on the last interactive hardware setup.
+    marker_mode = marker_mode or "legacy"
+    grid_w, grid_h = int(grid_w or 23), int(grid_h or 16)
+    warp_w, warp_h = int(warp_w or 1280), int(warp_h or 720)
+    if min(grid_w, grid_h, warp_w, warp_h) <= 0:
+        raise ValueError("Grid and warp dimensions must be positive")
+    if not 1 <= consensus_k <= consensus_n:
+        raise ValueError("Consensus requires 1 <= k <= n")
+    for name, value in (("max_seconds", max_seconds), ("max_frames", max_frames)):
+        if value is not None and (not math.isfinite(float(value)) or value <= 0):
+            raise ValueError(f"{name} must be finite and positive")
+
     fps, frame_count = _video_metadata(video_path)
     if max_seconds is not None:
         by_seconds = max(1, int(math.ceil(float(max_seconds) * fps)))
         max_frames = min(max_frames, by_seconds) if max_frames else by_seconds
     if max_frames is None and frame_count > 0:
-        # CVCoreSession consumes one frame to seed camera-space background before
-        # frames() starts yielding, so this prevents one looped playback frame
-        # from being considered at EOF.
-        max_frames = max(1, frame_count - 1)
+        # The initial frame seeds camera background; remaining frames are scored.
+        max_frames = max(1, frame_count if timeline and timeline.has_checkpoint else frame_count - 1)
 
+    diagnostics.update({
+        "fps": fps, "source_frames": frame_count, "processed_frames": 0,
+        "locked_frames": 0, "unlocked_frames": 0, "unmapped_frames": 0,
+        "tracked_frames": 0, "unusable_warp_frames": 0,
+        "marker_missing_frames": {}, "profile_ids": sorted(profiles),
+        "marker_mode": marker_mode, "frames_undistorted": source_frames_undistorted,
+        "grid": [grid_w, grid_h], "warp": [warp_w, warp_h],
+        "timeline_ground_truth_count": len(timeline.data.get("groundTruth", [])) if timeline else 0,
+        "rendered_reference_count": len(timeline.data.get("referenceFrames", [])) if timeline else 0,
+        "frame_limit": max_frames,
+        "paused_frames": 0, "taps": [],
+        "clock_source": "recorded_monotonic" if timeline and timeline.has_checkpoint else "video_fps",
+        "map_states": [],
+        "controls_source": "timeline" if timeline and timeline.has_controls else "defaults",
+        "pause_policy": "evaluate_guided_capture" if timeline and timeline.data.get("capture") else "recorded",
+        "replay_limitations": [
+            "Timeouts use nominal video FPS; original per-frame wall-clock timing was not recorded.",
+            "Replay starts with fresh tracking/background state; mid-recording rescans and background recaptures are not restored.",
+        ],
+    })
+    if timeline and timeline.has_checkpoint:
+        diagnostics["replay_limitations"] = [
+            "Video compression can change pixel values; checkpoint replay is not a lossless copy of camera frames."]
+        if any(timeline.clocks.get(i, {}).get("captureTime") is None for i in range(frame_count)):
+            diagnostics["replay_limitations"].append("Some capture clocks are missing; timing fidelity is partial.")
+            diagnostics["clock_source"] = "partial_recorded_monotonic"
+    if not timeline or not timeline.has_controls:
+        diagnostics["replay_limitations"].append(
+            "Selection/pause inputs were not fully recorded; missing inputs default to no selection and tracking enabled.")
+    for limitation in diagnostics["replay_limitations"]:
+        print(f"TrackingRegression | Replay limitation: {limitation}", file=sys.stderr, flush=True)
+
+    engine = TrackingEngine(tracking.detect_minis, consensus_n=consensus_n,
+                            consensus_k=consensus_k, lost_timeout=lost_timeout)
     sess = core.CVCoreSession(
         source_path=str(video_path),
         warp_w=warp_w,
@@ -296,191 +269,253 @@ def run_video(
         view_settle_seconds=view_settle_seconds,
     )
     sess.warp_motion_thresh = int(motion_thresh)
+    if timeline and timeline.has_checkpoint:
+        from recording_state import restore_checkpoint
+        sess.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        sess.frame_idx = -1
+        def before_exact_frame(frame):
+            nonlocal profiles
+            timeline.apply_through(frame)
+            clock = timeline.clocks.get(frame, {})
+            if clock.get("stateEvent") is not None:
+                timeline._apply_event(timeline.data["events"][int(clock["stateEvent"])])
+            for item in timeline.checkpoints:
+                if item["frame"] == frame:
+                    recorded = restore_checkpoint(timeline.path, item, sess, engine)
+                    if recorded is not None and restore_recorded_profiles:
+                        profiles = recorded
+            sess.replay_frame_clock = clock.get("captureTime")
+            if clock.get("motionThreshold") is not None:
+                sess.warp_motion_thresh = int(clock["motionThreshold"])
+        sess.before_frame_callback = before_exact_frame
+    last_map_time = -1.0
 
-    initial_positions = initial_positions or {}
-    prev_state, last_emitted = _seed_initial_positions(
-        initial_positions,
-        sess.grid_w,
-        sess.grid_h,
-        sess.warp_w,
-        sess.warp_h,
-        marker_mode=sess.marker_mode,
-    )
-    cell_hist: Dict[str, deque] = {}
-    last_seen: Dict[str, float] = {str(mini): 0.0 for mini in initial_positions}
     events: List[MovementEvent] = []
-    last_physical_xy: Dict[str, Tuple[float, float]] = {}
-    last_view_transform_revision = fo.get_view_transform_revision()
+    next_progress = time.monotonic() + 5
 
     try:
+        engine.seed_positions({str(mini): a1_to_raw(cell) for mini, cell in (initial_positions or {}).items()}, sess)
         for bundle in sess.frames():
-            if max_frames is not None and bundle.frame_idx > max_frames:
+            if max_frames is not None and diagnostics["processed_frames"] >= max_frames:
                 break
-            if not bundle.locked or bundle.warp_bgr is None:
-                continue
-
+            diagnostics["processed_frames"] += 1
+            diagnostics["locked_frames" if bundle.locked else "unlocked_frames"] += 1
+            for marker in bundle.last_missing_ids:
+                key = str(marker)
+                diagnostics["marker_missing_frames"][key] = diagnostics["marker_missing_frames"].get(key, 0) + 1
+            if time.monotonic() >= next_progress:
+                print(f"TrackingRegression | {video_path.name}: frame {bundle.frame_idx}/{frame_count}, "
+                      f"{len(events)} moves, {time.monotonic() - started:.0f}s elapsed", file=sys.stderr, flush=True)
+                next_progress = time.monotonic() + 5
             video_frame_idx = int(sess.cap.get(cv2.CAP_PROP_POS_FRAMES) or bundle.frame_idx)
             time_seconds = max(0, video_frame_idx - 1) / fps
-            grid_px = tracking._grid_px_for_bundle(bundle)
-            if grid_px is None:
+            clock = timeline.clocks.get(video_frame_idx - 1, {}) if timeline and timeline.has_checkpoint else {}
+            if clock.get("trackingState"):
+                timeline._apply_event(clock["trackingState"])
+            if timeline and timeline.has_checkpoint:
+                for change in timeline.data.get("profileChanges", []):
+                    if change["frame"] == video_frame_idx - 1:
+                        if restore_recorded_profiles:
+                            profiles = change["profiles"]
+                        engine.reset_mini(change["mini"])
+            tracking_now = clock.get("trackingTime") or clock.get("captureTime") or time_seconds
+            context = tracking.tracking_context(
+                bundle, now=tracking_now, selected_mini=timeline.selected_mini if timeline else None,
+                paused=timeline.prediction_paused if timeline else False)
+            if clock and not clock.get("tracked") and not timeline.data.get("capture"):
+                engine.synchronize(context)
                 continue
-
-            current_view_revision = fo.get_view_transform_revision()
-            if current_view_revision != last_view_transform_revision:
-                last_view_transform_revision = current_view_revision
-                for mini, (physical_x, physical_y) in list(last_physical_xy.items()):
-                    mapped = tracking._bundle_to_cell(
-                        bundle, physical_x, physical_y
-                    )
-                    if mapped is None:
-                        continue
-                    col, row = mapped
-                    raw_cell = tracking._cell_label(row, col)
-                    raw_from = last_emitted.get(mini)
-                    if raw_cell == raw_from:
-                        continue
-                    last_emitted[mini] = raw_cell
-                    cell_hist.pop(mini, None)
-                    event = MovementEvent(
-                        mini=mini,
-                        from_cell=raw_to_a1(raw_from),
-                        to_cell=raw_to_a1(raw_cell) or raw_cell,
-                        frame_idx=video_frame_idx,
-                        time_seconds=time_seconds,
-                        raw_from=raw_from,
-                        raw_to=raw_cell,
-                        lab_dist=0.0,
-                        score=1.0,
-                        source="viewportTransform",
-                    )
-                    events.append(event)
-                    if verbose:
-                        print(
-                            f"{format_time(event.time_seconds)} {mini}: "
-                            f"{event.from_cell or '?'} -> {event.to_cell} "
-                            "(Foundry viewport moved)"
-                        )
-
-            for mini, state in list(prev_state.items()):
-                if state.get("last_xy") is None:
-                    continue
-                age = time_seconds - last_seen.get(mini, time_seconds)
-                if age > lost_timeout:
-                    state["last_xy"] = None
-                    cell_hist.pop(mini, None)
-                    if verbose:
-                        print(f"{format_time(time_seconds)} {mini} lost; search mode")
-
-            dets, prev_state = tracking.detect_minis(
-                bundle=bundle,
-                profiles=profiles,
-                grid_px=grid_px,
-                prev_state=prev_state,
-                verbose=verbose,
-            )
-
-            for mini, det in dets.items():
-                if det is None:
-                    continue
-                last_seen[mini] = time_seconds
-
-            for mini, det in dets.items():
-                if det is None:
-                    continue
-                mapped = tracking._bundle_to_cell(bundle, det.cx, det.cy)
-                if mapped is None:
-                    continue
-                col, row = mapped
-                raw_cell = tracking._cell_label(row, col)
-                buf = cell_hist.setdefault(mini, deque(maxlen=consensus_n))
-                buf.append(raw_cell)
-                most, count = Counter(buf).most_common(1)[0]
-                if count >= consensus_k and raw_cell == most:
-                    last_physical_xy[mini] = (det.cx, det.cy)
-                if count < consensus_k or most == last_emitted.get(mini):
-                    continue
-
-                raw_from = last_emitted.get(mini)
-                last_emitted[mini] = most
-
-                if bundle.marker_mode == "viewport":
-                    anchor = (det.cx, det.cy)
-                else:
-                    cell_w = bundle.warp_w / float(bundle.grid_w)
-                    cell_h = bundle.warp_h / float(bundle.grid_h)
-                    parts = most[1:].split("c", 1)
-                    anchor_row, anchor_col = int(parts[0]), int(parts[1])
-                    anchor = (
-                        (anchor_col + 0.5) * cell_w,
-                        (anchor_row + 0.5) * cell_h,
-                    )
-                prev_state.setdefault(mini, {})["last_xy"] = anchor
-
+            step = engine.step(bundle, profiles, context, verbose=verbose)
+            if time_seconds - last_map_time >= .2 or step.moves or step.lost_minis:
+                scene = fo.get_scene_params()
+                grid = [scene.get("gridCols") or bundle.grid_w, scene.get("gridRows") or bundle.grid_h]
+                diagnostics["map_states"].append({"time_seconds": time_seconds, "grid": grid,
+                    "scene": fo.get_scene_params().get("sceneId"), "locked": bool(bundle.locked),
+                    "positions": {mini: {"cell": raw_to_a1(cell),
+                        "status": "tracked" if not step.reason and tracking_now - engine.last_seen.get(mini, -1e9) <= 2 else "lost"}
+                        for mini, cell in engine.last_emitted.items()}})
+                last_map_time = time_seconds
+            if progress_path and (diagnostics["processed_frames"] % 15 == 0):
+                from app_paths import atomic_write_json
+                atomic_write_json(progress_path, {"frame": video_frame_idx, "total": frame_count,
+                                                  "moves": len(events)}, backup=False)
+            if bundle.locked and bundle.warp_bgr is None:
+                diagnostics["unusable_warp_frames"] += 1
+            if step.reason == "unmapped":
+                diagnostics["unmapped_frames"] += 1
+            if step.reason == "paused":
+                diagnostics["paused_frames"] += 1
+            if step.reason:
+                continue
+            diagnostics["tracked_frames"] += 1
+            if step.tapped_mini:
+                diagnostics["taps"].append({"mini": step.tapped_mini, "frame": video_frame_idx,
+                                            "time_seconds": time_seconds})
+            for move in step.moves:
                 event = MovementEvent(
-                    mini=mini,
-                    from_cell=raw_to_a1(raw_from),
-                    to_cell=raw_to_a1(most) or most,
+                    mini=move.mini,
+                    from_cell=raw_to_a1(move.raw_from),
+                    to_cell=raw_to_a1(move.raw_to) or move.raw_to,
                     frame_idx=video_frame_idx,
                     time_seconds=time_seconds,
-                    raw_from=raw_from,
-                    raw_to=most,
-                    lab_dist=float(det.lab_dist),
-                    score=float(det.score),
+                    raw_from=move.raw_from,
+                    raw_to=move.raw_to,
+                    lab_dist=move.lab_dist,
+                    score=move.score,
+                    source=move.source,
                 )
                 events.append(event)
                 if verbose:
-                    from_text = event.from_cell or "?"
-                    print(
-                        f"{format_time(event.time_seconds)} "
-                        f"{event.mini}: {from_text} -> {event.to_cell}"
-                    )
+                    print(f"{format_time(event.time_seconds)} {event.mini}: "
+                          f"{event.from_cell or '?'} -> {event.to_cell} ({event.source})")
     finally:
         sess.close()
+        diagnostics["elapsed_seconds"] = time.monotonic() - started
+        diagnostics["processed_fps"] = diagnostics["processed_frames"] / max(0.001, diagnostics["elapsed_seconds"])
 
+    if frame_count > 1:
+        available = frame_count if timeline and timeline.has_checkpoint else frame_count - 1
+        expected_frames = min(available, max_frames) if max_frames is not None else available
+        if diagnostics["processed_frames"] < expected_frames:
+            raise RuntimeError(f"Video decoding ended early: {diagnostics['processed_frames']}/{expected_frames} frames processed")
     return events
 
 
-def _expectation_label(expectation: Dict[str, Any]) -> str:
-    mini = expectation.get("mini", "*")
-    from_cell = normalize_cell(expectation.get("from"))
-    to_cell = normalize_cell(expectation.get("to"))
-    at = expectation.get("at", expectation.get("time", expectation.get("between", "?")))
-    if from_cell:
-        return f"{mini} {from_cell}->{to_cell} at {at}"
-    return f"{mini} ->{to_cell} at {at}"
+def file_fingerprint(path: Path) -> dict:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"path": str(path.resolve()), "sha256": digest.hexdigest(), "bytes": path.stat().st_size}
 
 
-def _event_matches_expectation(
-    event: MovementEvent,
-    expectation: Dict[str, Any],
-    default_tolerance: float,
-) -> bool:
-    if str(event.mini) != str(expectation.get("mini")):
-        return False
-    expected_to = normalize_cell(expectation.get("to"))
-    if expected_to and event.to_cell != expected_to:
-        return False
-    expected_from = normalize_cell(expectation.get("from"))
-    if expected_from and event.from_cell != expected_from:
-        return False
-    if "between" in expectation:
-        start, end = expectation["between"]
-        return parse_time_seconds(start) <= event.time_seconds <= parse_time_seconds(end)
-    expected_time = parse_time_seconds(expectation.get("at", expectation.get("time")))
-    tolerance = float(expectation.get("tolerance_seconds", default_tolerance))
-    return abs(event.time_seconds - expected_time) <= tolerance
+def run_video(video_path: Path, *, timeout_seconds: float = 180, threads: int = 1,
+              diagnostics: Optional[dict] = None, **options) -> List[MovementEvent]:
+    """Run in a disposable process, with a wall-clock deadline and no live state."""
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be finite and positive")
+    if threads < 1:
+        raise ValueError("threads must be positive")
+    video_path = video_path.expanduser().resolve()
+    if not video_path.is_file():
+        raise ValueError(f"Video file does not exist: {video_path}")
+    options = {key: str(value.resolve()) if isinstance(value, Path) else value for key, value in options.items()}
+    payload = {"video_path": str(video_path), "threads": threads, "options": options,
+               "timeout_seconds": min(timeout_seconds, 3600), "parent_pid": os.getpid()}
+    env = os.environ.copy()
+    for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "MKL_NUM_THREADS"):
+        env[key] = str(threads)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    with tempfile.TemporaryDirectory(prefix="sarween-replay-") as directory:
+        request = Path(directory) / "request.json"
+        response = Path(directory) / "response.json"
+        request.write_text(json.dumps(payload), encoding="utf-8")
+        try:
+            # subprocess.run kills AND waits for this worker on timeout or Ctrl-C.
+            completed = subprocess.run(
+                worker_command(request, response),
+                cwd=ROOT, env=env, timeout=timeout_seconds, check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"Replay exceeded {timeout_seconds:g}s wall-clock limit; worker stopped") from exc
+        if not response.exists():
+            raise RuntimeError(f"Replay worker exited with code {completed.returncode} without a result")
+        data = json.loads(response.read_text(encoding="utf-8"))
+        if completed.returncode or "error" in data:
+            raise RuntimeError(data.get("error") or f"Replay worker exited with code {completed.returncode}")
+        if diagnostics is not None:
+            diagnostics.update(data["diagnostics"])
+        return [MovementEvent(**item) for item in data["events"]]
 
 
-def check_case(case: Dict[str, Any], *, cases_base_dir: Path) -> CaseResult:
+def worker_command(request, response):
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--replay-worker", str(request), str(response)]
+    return [sys.executable, str(Path(__file__).resolve()), "_worker", str(request), str(response)]
+
+
+def start_worker_guard(timeout_seconds, parent_pid=None):
+    """The worker exits even if its parent UI freezes or is force-quit."""
+    import threading
+    deadline = time.monotonic() + float(timeout_seconds)
+    stopped = threading.Event()
+    def guard():
+        while not stopped.wait(.25):
+            expired = time.monotonic() >= deadline
+            if parent_pid:
+                try:
+                    os.kill(int(parent_pid), 0)
+                except ProcessLookupError:
+                    expired = True
+                except PermissionError:
+                    pass
+            if expired:
+                os._exit(124)
+    thread = threading.Thread(target=guard, name="replay-deadline", daemon=True)
+    thread.start()
+    return stopped, thread
+
+
+def _worker(request: Path, response: Path) -> int:
+    guard = None
+    try:
+        payload = json.loads(request.read_text(encoding="utf-8"))
+        timeout = float(payload.get("timeout_seconds", 180))
+        if not math.isfinite(timeout) or not 0 < timeout <= 3600:
+            raise ValueError("Invalid worker time limit")
+        guard = start_worker_guard(timeout, payload.get("parent_pid"))
+        # Apple's GCD backend ignores positive limits; zero disables parallelism.
+        cv2.setNumThreads(0 if int(payload["threads"]) == 1 else int(payload["threads"]))
+        cv2.setRNGSeed(0)
+        if hasattr(os, "nice"):
+            try:
+                os.nice(10)
+            except OSError:
+                pass  # Sandboxed macOS may disallow even lowering priority.
+        options = payload["options"]
+        video = Path(payload["video_path"])
+        for key in ("profiles_path", "timeline_path"):
+            if options.get(key) is not None:
+                options[key] = Path(options[key])
+        saved_profiles = video.with_suffix(".profiles.json")
+        profiles = options.get("profiles_path") or (saved_profiles if saved_profiles.exists() else data_path("combo_profiles.json"))
+        timeline = options.get("timeline_path") or find_timeline_path(video)
+        diagnostics = {"opencv_version": cv2.__version__, "threads": cv2.getNumThreads(),
+                       "inputs": {"video": file_fingerprint(video), "profiles": file_fingerprint(profiles)}}
+        diagnostics["code_sha256"] = {
+            name: file_fingerprint(ROOT / name)["sha256"] for name in
+            ("tracking_regression.py", "tracking_evaluation.py", "cv_core.py", "v3_tracking.py",
+             "tracking_engine.py", "tap_selection.py", "mini_tracking.py", "mini_calibration.py", "foundryoutput.py", "app_paths.py", "recording_state.py")
+            if (ROOT / name).is_file()
+        }
+        if getattr(sys, "frozen", False):
+            diagnostics["executable_sha256"] = file_fingerprint(Path(sys.executable))["sha256"]
+        if timeline:
+            diagnostics["inputs"]["timeline"] = file_fingerprint(timeline)
+        for filename in ("camera_matrix.npy", "dist_coeffs.npy"):
+            if data_path(filename).exists():
+                diagnostics["inputs"][filename] = file_fingerprint(data_path(filename))
+        events = _run_video(video, diagnostics=diagnostics, **options)
+        response.write_text(json.dumps({"events": [asdict(event) for event in events], "diagnostics": diagnostics}), encoding="utf-8")
+        return 0
+    except Exception as exc:
+        response.write_text(json.dumps({"error": f"{type(exc).__name__}: {exc}"}), encoding="utf-8")
+        return 2
+    finally:
+        if guard:
+            guard[0].set()
+            guard[1].join(timeout=1)
+
+
+def check_case(case: Dict[str, Any], *, cases_base_dir: Path,
+               timeout_seconds: float = 180, threads: int = 1,
+               profiles_override: Optional[Path] = None) -> CaseResult:
+    validate_case(case)
     name = str(case.get("name") or case.get("video") or "unnamed")
     video = _resolve_path(str(case["video"]), cases_base_dir)
-    profiles = _resolve_path(str(case.get("profiles", ROOT / "combo_profiles.json")), cases_base_dir)
+    profiles = profiles_override or _resolve_path(str(case.get("profiles", data_path("combo_profiles.json"))), cases_base_dir)
     grid = case.get("grid") or {}
     expectations = list(case.get("expectations") or [])
-    default_tolerance = float(case.get("tolerance_seconds", 2.0))
-    ignore_before = parse_time_seconds(case.get("ignore_before", 0))
-    ignore_after_value = case.get("ignore_after")
-    ignore_after = parse_time_seconds(ignore_after_value) if ignore_after_value is not None else None
     timeline_value = case.get("timeline")
     timeline_path = (
         _resolve_path(str(timeline_value), cases_base_dir)
@@ -502,8 +537,15 @@ def check_case(case: Dict[str, Any], *, cases_base_dir: Path) -> CaseResult:
             matched_expectations=0,
             total_expectations=len(expectations),
             skipped="Missing local " + " and ".join(missing),
+            label_source=case.get("label_source", "unverified"),
         )
 
+    loaded_profiles = load_profiles_with_curves(profiles)
+    expected_minis = {str(item["mini"]) for item in expectations} | set(case.get("initial_positions") or {})
+    absent = expected_minis - set(loaded_profiles)
+    if absent:
+        raise ValueError(f"Profiles missing for minis: {', '.join(sorted(absent))}")
+    diagnostics = {}
     events = run_video(
         video,
         profiles_path=profiles,
@@ -524,49 +566,22 @@ def check_case(case: Dict[str, Any], *, cases_base_dir: Path) -> CaseResult:
         view_settle_seconds=float(
             case.get("view_settle_seconds", core.VIEW_SETTLE_SECONDS)
         ),
+        frames_undistorted=case.get("frames_undistorted"),
+        restore_recorded_profiles=profiles_override is None and bool(case.get("restore_recorded_profiles", True)),
+        timeout_seconds=timeout_seconds,
+        threads=threads,
+        diagnostics=diagnostics,
     )
-
-    scoped_events = [
-        event for event in events
-        if event.time_seconds >= ignore_before
-        and (ignore_after is None or event.time_seconds <= ignore_after)
-    ]
-
-    failures: List[str] = []
-    used_event_indexes: set[int] = set()
-    for expectation in expectations:
-        matches = [
-            (idx, event) for idx, event in enumerate(scoped_events)
-            if idx not in used_event_indexes
-            and _event_matches_expectation(event, expectation, default_tolerance)
-        ]
-        if not matches:
-            failures.append(f"Missing expected movement: {_expectation_label(expectation)}")
-            continue
-        window = expectation.get("between")
-        expected_time = (sum(parse_time_seconds(value) for value in window) / 2.0) if window else parse_time_seconds(expectation.get("at", expectation.get("time")))
-        idx, _ = min(matches, key=lambda item: abs(item[1].time_seconds - expected_time))
-        used_event_indexes.add(idx)
-
-    if not bool(case.get("allow_unexpected", False)):
-        for idx, event in enumerate(scoped_events):
-            if idx in used_event_indexes:
-                continue
-            from_text = event.from_cell or "?"
-            failures.append(
-                "Unexpected movement: "
-                f"{event.mini} {from_text}->{event.to_cell} "
-                f"at {format_time(event.time_seconds)}"
-            )
-
-    return CaseResult(
-        name=name,
-        video=str(video),
-        events=events,
-        failures=failures,
-        matched_expectations=len(used_event_indexes),
-        total_expectations=len(expectations),
-    )
+    result = evaluate_events(case, events, video=str(video))
+    result.diagnostics = diagnostics
+    result.diagnostics["case"] = case
+    if not diagnostics.get("locked_frames"):
+        result.failures.append("No frames had marker lock; tracking was not evaluated")
+    elif not diagnostics.get("tracked_frames"):
+        result.failures.append("No locked frames had a usable Foundry grid transform")
+    if diagnostics.get("unusable_warp_frames"):
+        result.failures.append(f"Camera processing failed on {diagnostics['unusable_warp_frames']} locked frames")
+    return result
 
 
 def load_cases(path: Path) -> List[Dict[str, Any]]:
@@ -576,9 +591,28 @@ def load_cases(path: Path) -> List[Dict[str, Any]]:
     return list(data.get("cases") or [])
 
 
-def check_cases(path: Path) -> List[CaseResult]:
+def check_cases(path: Path, *, names: Optional[List[str]] = None, **options) -> List[CaseResult]:
     cases = load_cases(path)
-    return [check_case(case, cases_base_dir=path.parent) for case in cases]
+    case_names = [str(case.get("name") or case.get("video")) for case in cases]
+    if len(case_names) != len(set(case_names)):
+        raise ValueError("Case names must be unique")
+    if names and set(names) - set(case_names):
+        raise ValueError(f"Unknown case names: {sorted(set(names) - set(case_names))}")
+    results = []
+    for case, name in zip(cases, case_names):
+        if names and name not in names:
+            continue
+        print(f"TrackingRegression | Starting {name}", flush=True)
+        try:
+            result = check_case(case, cases_base_dir=path.parent, **options)
+        except Exception as exc:
+            result = CaseResult(name=name, video=str(case.get("video", "")), events=[],
+                                failures=[f"Replay error: {exc}"], matched_expectations=0,
+                                total_expectations=len(case.get("expectations") or []),
+                                label_source=case.get("label_source", "unverified"))
+        results.append(result)
+        _print_case_result(result)
+    return results
 
 
 def events_to_json(events: Iterable[MovementEvent]) -> List[Dict[str, Any]]:
@@ -595,7 +629,8 @@ def _print_case_result(result: CaseResult) -> None:
         print(f"SKIP {result.name}: {result.skipped}")
         return
     status = "PASS" if result.ok else "FAIL"
-    print(f"{status} {result.name}: {result.matched_expectations}/{result.total_expectations} expected movements matched")
+    print(f"{status} {result.name}: {result.matched_expectations}/{result.total_expectations} expected movements matched; "
+          f"{len(result.unexpected)} extra; labels={result.label_source}", flush=True)
     for event in result.events:
         from_text = event.from_cell or "?"
         source = f" [{event.source}]" if event.source != "detection" else ""
@@ -608,12 +643,15 @@ def _print_case_result(result: CaseResult) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "_worker":
+        return _worker(Path(argv[1]), Path(argv[2]))
     parser = argparse.ArgumentParser(description="Run Sarween mini tracking against video regressions.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     run_parser = sub.add_parser("run", help="Print movement events detected in one video.")
     run_parser.add_argument("video", help="Video file to process.")
-    run_parser.add_argument("--profiles", default=str(ROOT / "combo_profiles.json"))
+    run_parser.add_argument("--profiles", help="Override recorded profiles and profile changes.")
     run_parser.add_argument("--grid-cols", type=int, default=None)
     run_parser.add_argument("--grid-rows", type=int, default=None)
     run_parser.add_argument("--warp-width", type=int, default=None)
@@ -635,16 +673,38 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=core.VIEW_SETTLE_SECONDS,
     )
     run_parser.add_argument("--verbose", action="store_true")
+    run_parser.add_argument("--frames-undistorted", action="store_true", default=None)
 
     check_parser = sub.add_parser("check", help="Check a JSON regression case file.")
     check_parser.add_argument("cases", nargs="?", default=str(DEFAULT_CASES_PATH))
+    check_parser.add_argument("--case", action="append", dest="names", help="Run only this case; repeat to select several.")
+    check_parser.add_argument("--profiles", help="Override frozen profiles for a comparison run.")
+    check_parser.add_argument("--report-dir", default=str(ROOT / "tracking_reports" / "latest"))
+    check_parser.add_argument("--baseline", help="Previous report.json to compare against.")
+    check_parser.add_argument("--require-videos", action="store_true", help="Fail when any selected local video is missing.")
+    for command in (run_parser, check_parser):
+        command.add_argument("--timeout-seconds", type=float, default=180, help="Wall-clock deadline per video (default: 180).")
+        command.add_argument("--threads", type=int, default=1, help="OpenCV/BLAS threads per replay (default: 1).")
+
+    inventory_parser = sub.add_parser("inventory", help="List recordings and independent labels without replaying them.")
+    inventory_parser.add_argument("directory", nargs="?", default=str(ROOT))
 
     args = parser.parse_args(argv)
     try:
+        if args.command == "inventory":
+            for video in sorted(Path(args.directory).expanduser().glob("*.mp4")):
+                timeline_path = find_timeline_path(video)
+                data = json.loads(timeline_path.read_text(encoding="utf-8")) if timeline_path else {}
+                print(f"{video.name}: timeline={'yes' if timeline_path else 'no'}, "
+                      f"confirmed placements={len(data.get('groundTruth', []))}, "
+                      f"rendered references={len(data.get('referenceFrames', []))}, "
+                      f"scan snapshot={'yes' if video.with_suffix('.profiles.json').exists() else 'no'}")
+            return 0
         if args.command == "run":
             events = run_video(
                 Path(args.video).expanduser().resolve(),
-                profiles_path=Path(args.profiles).expanduser().resolve(),
+                profiles_path=Path(args.profiles).expanduser().resolve() if args.profiles else None,
+                restore_recorded_profiles=not bool(args.profiles),
                 grid_w=args.grid_cols,
                 grid_h=args.grid_rows,
                 warp_w=args.warp_width,
@@ -660,16 +720,30 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ),
                 marker_mode=args.marker_mode,
                 view_settle_seconds=args.view_settle_seconds,
+                frames_undistorted=args.frames_undistorted,
+                timeout_seconds=args.timeout_seconds,
+                threads=args.threads,
             )
             print(json.dumps(events_to_json(events), indent=2))
             return 0
 
-        results = check_cases(Path(args.cases).expanduser().resolve())
-        for result in results:
-            _print_case_result(result)
-        if any(not result.ok for result in results):
+        cases_path = Path(args.cases).expanduser().resolve()
+        results = check_cases(cases_path, names=args.names, timeout_seconds=args.timeout_seconds,
+                              threads=args.threads,
+                              profiles_override=Path(args.profiles).expanduser().resolve() if args.profiles else None)
+        from tracking_reports import write_report
+        paths = write_report(results, Path(args.report_dir).expanduser(), cases_path=cases_path,
+                             baseline_path=Path(args.baseline).expanduser() if args.baseline else None)
+        print(f"Reports: {paths[0]} and {paths[1]}")
+        if not results or all(result.skipped for result in results):
+            print("No videos were evaluated", file=sys.stderr)
+            return 2
+        if any(not result.ok or (args.require_videos and result.skipped) for result in results):
             return 1
         return 0
+    except KeyboardInterrupt:
+        print("Replay cancelled; worker stopped.", file=sys.stderr)
+        return 130
     except Exception as exc:
         print(f"tracking_regression: {exc}", file=sys.stderr)
         return 2

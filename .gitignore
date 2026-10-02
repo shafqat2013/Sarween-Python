@@ -3,12 +3,17 @@ __pycache__/
 *.pyc
 
 # Project artifacts (keep out of git)
+/build/
+/dist/
 mini_captures/
 *.npy
 mini_database.csv
 
-# Deprecated
-Deprecated/
+# Archived code remains versionable; old binaries/caches and the pre-existing
+# ignored archive stay local. See deprecated/README.md.
+/deprecated/builds/
+/deprecated/generated/
+/deprecated/legacy/
 
 # Large map assets
 maps/Digital/
@@ -20,3 +25,15 @@ maps/Print/
 /sarween_rec_*.tracking.json
 /sarween_rec_*.profiles.json
 /sarween_rec_*.case.json
+/sarween_rec_*.movements.*
+/sarween_rec_*.tracking_state/
+/tracking_reports/
+combo_profiles.json.bak
+mini_library.json.bak
+
+# Authentication tooling: credentials belong in Keychain or server secrets.
+supabase/node_modules/
+supabase/.temp/
+.env
+.env.*
+*.private.pem

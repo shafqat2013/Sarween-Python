@@ -7,6 +7,7 @@ import {
   movementColor,
   movementOverage,
   remainingMovement,
+  rebaseMovementAt,
   resetMovementAt,
   undoMovementPoint,
 } from "./movement_logic.mjs";
@@ -19,6 +20,7 @@ const VIEWPORT_MARKER_IDS = [10, 11, 12, 13];
 const MARKER_QUIET_ZONE_FRACTION = 1 / 6;
 
 let ws = null;
+let moveMessageChain = Promise.resolve();
 let reconnectAttempts = 0;
 let reconnectTimer = null;
 let heartbeatTimer = null;
@@ -1133,12 +1135,17 @@ function togglePhysicalMiniSelection(miniId) {
   if (movementState?.tokenId !== document.id) selectMovementToken(document);
 }
 
-function recordSelectedMovement(token, changes = {}) {
+function recordSelectedMovement(token, changes = {}, options = {}) {
   const document = tokenDocument(token);
   if (!movementState || document?.id !== movementState.tokenId) return;
   if (ignoredMovementUpdates.delete(document.id)) return;
   if (changes.x === undefined && changes.y === undefined) return;
   const next = movementPointForToken(document, changes);
+  if (options.sarweenSource === "viewportTransform") {
+    movementState = rebaseMovementAt(movementState, next);
+    renderMovementOverlay();
+    return;
+  }
   const previous = movementState.points.at(-1);
   movementState = addMovementPoint(
     movementState,
@@ -1605,9 +1612,15 @@ async function promptAssignMini(miniId) {
               resolve(null);
               return;
             }
+            if (canvas.scene?.id !== scene.id) {
+              ui.notifications?.warn("Sarween: Scene changed; assign the mini in the active scene.");
+              resolve(null);
+              return;
+            }
 
             sendToPython({
               type: "assignMiniResult",
+              sceneId: scene.id,
               miniId: String(miniId),
               tokenId: chosen.tokenId,
               actorId: chosen.actorId
@@ -1623,6 +1636,7 @@ async function promptAssignMini(miniId) {
           callback: () => {
             sendToPython({
               type: "assignMiniResult",
+              sceneId: scene.id,
               miniId: String(miniId),
               tokenId: null,
               actorId: null,
@@ -1794,6 +1808,7 @@ async function handlePythonMessage(data) {
 
   // Assign request
   if (type === "assignMini") {
+    if (data.sceneId !== canvas.scene?.id) return;
     const miniId = data?.miniId;
     if (!miniId) {
       warn("assignMini missing miniId:", data);
@@ -1803,43 +1818,49 @@ async function handlePythonMessage(data) {
     return;
   }
 
-  // Default behavior: move token
-  if (guidedCapture?.recording || guidedCapture?.phase === "Starting") return;
-  if (!sceneId || !tokenId || typeof x !== "number" || typeof y !== "number") {
-    warn("Invalid payload from Python:", data);
+  if (type !== "moveToken") return;
+  const reply = (replyType, values = {}) => sendToPython({
+    type: replyType, commandId: data.commandId, miniId: data.miniId,
+    sceneId, tokenId, ...values,
+  });
+  if (!data.commandId || !sceneId || !tokenId || !Number.isFinite(x) || !Number.isFinite(y)) {
+    reply("tokenMoveError", {error: "Invalid move command"});
     return;
   }
-
-  const scene = game.scenes.get(sceneId) ?? canvas.scene;
-  if (!scene) {
-    warn("Scene not found:", sceneId);
+  if (guidedCapture?.recording || guidedCapture?.phase === "Starting") {
+    reply("tokenMoveError", {error: "Tracking is paused for guided capture"});
+    return;
+  }
+  const scene = canvas.scene;
+  if (!canvas.ready || scene?.id !== sceneId) {
+    reply("tokenMoveError", {error: "Requested scene is not the active display scene"});
     return;
   }
 
   if (!scene.tokens.get(tokenId)) {
     warn(`Mapped token ${tokenId} no longer exists in scene ${scene.id}`);
-    sendToPython({
-      type: "tokenMissing",
-      sceneId: scene.id,
-      tokenId
-    });
+    reply("tokenMoveError", {code: "tokenMissing", error: "Assigned token no longer exists"});
     return;
   }
 
   try {
-    await scene.updateEmbeddedDocuments(
-      "Token",
-      [{ _id: tokenId, x, y }],
-      { animate: getSetting("animateTokenMovement") }
-    );
+    const token = scene.tokens.get(tokenId);
+    // A retry after a lost acknowledgement must not replay animation or budget.
+    if (token.x !== x || token.y !== y) {
+      await scene.updateEmbeddedDocuments(
+        "Token",
+        [{ _id: tokenId, x, y }],
+        { animate: getSetting("animateTokenMovement"), sarweenSource: data.source }
+      );
+    }
+    const applied = scene.tokens.get(tokenId);
+    if (applied?.x !== x || applied?.y !== y) {
+      throw new Error("Foundry did not apply the requested position");
+    }
+    reply("tokenMoveApplied", {x: applied.x, y: applied.y});
   } catch (error) {
     warn(`Failed to move token ${tokenId}:`, error);
-    sendToPython({
-      type: "tokenMoveError",
-      sceneId: scene.id,
-      tokenId,
-      error: String(error?.message ?? error)
-    });
+    reply("tokenMoveError", {error: String(error?.message ?? error)});
     return;
   }
   log(`Moved token ${tokenId} to (${x}, ${y}) in scene ${scene.id}`);
@@ -1857,6 +1878,16 @@ async function handlePythonMessage(data) {
 // ──────────────────────────────────────────────────────────────────────────────
 // Connect / Disconnect
 // ──────────────────────────────────────────────────────────────────────────────
+
+function dispatchPythonMessage(data, socket) {
+  if (data.type !== "moveToken") return handlePythonMessage(data);
+  moveMessageChain = moveMessageChain.then(async () => {
+    if (socket === ws && ws.readyState === WebSocket.OPEN) {
+      await handlePythonMessage(data);
+    }
+  }).catch(err => error("Move handling failed:", err));
+  return moveMessageChain;
+}
 
 function connectToPython() {
   ensureStatusUI();
@@ -1900,7 +1931,7 @@ function connectToPython() {
     setStatus("connected");
 
     try {
-      ws.send(JSON.stringify({ type: "hello", source: "foundry-sarween" }));
+      ws.send(JSON.stringify({ type: "hello", source: "foundry-sarween", protocolVersion: 2 }));
       if (testSequenceTargets.length) sendTestSequence();
     } catch (err) {
       error("Failed to send hello:", err);
@@ -1927,10 +1958,11 @@ function connectToPython() {
     }, 10000);
   };
 
+  const connectedSocket = ws;
   ws.onmessage = async (event) => {
     try {
       const data = JSON.parse(event.data);
-      await handlePythonMessage(data);
+      await dispatchPythonMessage(data, connectedSocket);
     } catch (err) {
       error("Error parsing/handling message:", err);
     }
@@ -2041,8 +2073,8 @@ Hooks.on("controlToken", (token, controlled) => {
   }
 });
 
-Hooks.on("updateToken", (document, changes) => {
-  recordSelectedMovement(document, changes);
+Hooks.on("updateToken", (document, changes, options) => {
+  recordSelectedMovement(document, changes, options);
 });
 
 Hooks.on("deleteToken", document => {

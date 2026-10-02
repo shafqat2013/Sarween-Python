@@ -1,0 +1,20 @@
+project_id = "sarween-alpha"
+
+[auth]
+enable_signup = false
+enable_anonymous_sign_ins = false
+
+[auth.email]
+enable_signup = false
+enable_confirmations = true
+otp_expiry = 600
+otp_length = 8
+
+[auth.email.template.magic_link]
+subject = "Your Sarween sign-in code"
+content_path = "./supabase/templates/magic_link.html"
+
+# The function forwards the user JWT to PostgREST, which verifies it before
+# invoking the restricted RPC. This supports current asymmetric Auth signing keys.
+[functions.alpha-access]
+verify_jwt = false

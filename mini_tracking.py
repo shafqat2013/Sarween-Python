@@ -7,15 +7,12 @@ import numpy as np
 import time
 import setup as s
 from datetime import datetime
+from app_paths import capture_asset_path, data_path
 
 
 def _resource_path(filename: str) -> str:
-    """Resolve a path relative to this file, whether running live or frozen in a .app."""
-    if getattr(sys, "frozen", False):
-        base = os.path.dirname(sys.executable)
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, filename)
+    """Legacy capture/database callers need writable paths, not bundled assets."""
+    return str(data_path(filename))
 
 # ── Canonical DB path ─────────────────────────────────────────────────────────
 DB_CSV = _resource_path("mini_database.csv")
@@ -29,10 +26,10 @@ def get_camera_params():
     """
     global _camera_params_cache
     if _camera_params_cache is None:
-        if os.path.exists("camera_matrix.npy") and os.path.exists("dist_coeffs.npy"):
+        if data_path("camera_matrix.npy").exists() and data_path("dist_coeffs.npy").exists():
             _camera_params_cache = (
-                np.load("camera_matrix.npy"),
-                np.load("dist_coeffs.npy")
+                np.load(data_path("camera_matrix.npy"), allow_pickle=False),
+                np.load(data_path("dist_coeffs.npy"), allow_pickle=False)
             )
         else:
             print("⚠️ Camera calibration files not found (camera_matrix.npy / dist_coeffs.npy). "
@@ -732,6 +729,9 @@ def load_mini_database(db_csv_path=DB_CSV):
     with open(db_csv_path, "r", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            for field in ("image", "mask", "hist_npy", "contour_npy"):
+                if row.get(field):
+                    row[field] = capture_asset_path(row[field], db_csv_path)
             rid = (row.get("id") or row.get("timestamp") or "").strip()
             mini_id = (row.get("mini_id") or rid).strip()
             view_id = (row.get("view_id") or rid).strip()

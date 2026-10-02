@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "synthetic": true,
+  "fps": 10,
+  "gridCols": 20,
+  "gridRows": 12,
+  "warpWidth": 800,
+  "warpHeight": 480,
+  "markerMode": "legacy",
+  "framesUndistorted": true,
+  "events": [
+    {
+      "frame": 0,
+      "sceneInfo": {
+        "sceneId": "synthetic-demo",
+        "width": 800,
+        "height": 480,
+        "gridSize": 40,
+        "gridType": 1
+      },
+      "trackingControls": {
+        "paused": false,
+        "selectedMini": null
+      }
+    }
+  ]
+}

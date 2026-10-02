@@ -1,0 +1,75 @@
+{
+  "cases": [
+    {
+      "name": "synthetic-five-minis",
+      "video": "five_minis.mp4",
+      "profiles": "five_minis.profiles.json",
+      "label_source": "synthetic-scripted",
+      "expectations": [
+        {
+          "mini": "Red",
+          "to": "C4",
+          "at": 1.6
+        },
+        {
+          "mini": "Blue",
+          "to": "G4",
+          "at": 1.6
+        },
+        {
+          "mini": "Yellow",
+          "to": "K4",
+          "at": 1.6
+        },
+        {
+          "mini": "Green",
+          "to": "O4",
+          "at": 1.6
+        },
+        {
+          "mini": "White",
+          "to": "R4",
+          "at": 1.6
+        },
+        {
+          "mini": "Red",
+          "from": "C4",
+          "to": "C9",
+          "at": 4.6
+        },
+        {
+          "mini": "Blue",
+          "from": "G4",
+          "to": "G9",
+          "at": 7.6
+        },
+        {
+          "mini": "Yellow",
+          "from": "K4",
+          "to": "K9",
+          "at": 10.6
+        },
+        {
+          "mini": "Green",
+          "from": "O4",
+          "to": "O9",
+          "at": 13.6
+        },
+        {
+          "mini": "White",
+          "from": "R4",
+          "to": "R9",
+          "at": 16.6
+        },
+        {
+          "mini": "Red",
+          "from": "C9",
+          "to": "E9",
+          "at": 20.6
+        }
+      ],
+      "tolerance_seconds": 1.0,
+      "allow_unexpected": false
+    }
+  ]
+}

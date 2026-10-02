@@ -1,0 +1,18 @@
+{
+  "cases": [
+    {
+      "name": "red10-141952-independently-reviewed-prefix",
+      "video": "../../sarween_rec_20260911_141952.mp4",
+      "profiles": "red10_baseline.profiles.json",
+      "label_source": "assistant-visual-review-independent-prefix",
+      "notes": "Only the first 8.5 seconds are labeled. Labels were fixed from raw footage rectified using four ArUco markers and recorded scene geometry, before viewing detector predictions or trackingEvents. Sampled visual review is not exhaustive frame-by-frame ground truth. Later footage has intermittent registration and is deliberately excluded.",
+      "max_seconds": 8.5,
+      "ignore_after": 8.5,
+      "allow_unexpected": false,
+      "expectations": [
+        {"mini": "red10", "to": "V16", "between": [0, 2.5]},
+        {"mini": "red10", "from": "V16", "to": "J7", "between": [4.0, 7.0]}
+      ]
+    }
+  ]
+}

@@ -10,7 +10,7 @@ import json
 import math
 import re
 import time
-from collections import deque, Counter
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -22,13 +22,15 @@ import setup as s
 import cv_core as core
 import foundryoutput as fo
 import mini_library as ml
-import tap_selection as taps
+from tracking_engine import TrackingContext, TrackingEngine
+from ring_calibration import profile_with_sample, sample_ring_patch, save_profiles
 from control_panel import ControlPanel, rc_to_a1
 from mini_calibration import load_profiles_with_curves, min_lab_dist_to_profile
+from app_paths import data_path, initialize_user_data, recordings_dir
 
 ensure_window = core.ensure_window
 
-_PROFILES_PATH = Path(__file__).with_name("combo_profiles.json")
+_PROFILES_PATH = data_path("combo_profiles.json")
 
 # Recording state carried across session restarts (e.g. "Calibrate Minis" mid-session)
 _pending_recorder: Optional[Any] = None   # cv2.VideoWriter
@@ -646,25 +648,21 @@ def detect_minis(
 
     # Distinct ring colors are expected, but if two profiles select the same
     # physical region, retain only the stronger color/shape match.
-    names = [name for name, detection in detections.items() if detection is not None]
-    for i, name in enumerate(names):
-        detection = detections.get(name)
-        if detection is None:
-            continue
-        for other in names[i + 1:]:
-            other_detection = detections.get(other)
-            if other_detection is None:
-                continue
-            if math.hypot(
-                detection.cx - other_detection.cx,
-                detection.cy - other_detection.cy,
-            ) > grid_px * 0.50:
-                continue
-            loser = other if detection.score >= other_detection.score else name
-            detections[loser] = None
-            new_state[loser] = _empty_presence_state(
-                prev_state.get(loser, {}), change_histories[loser]
+    names = sorted(
+        (name for name, detection in detections.items() if detection is not None),
+        key=lambda name: (-detections[name].score, name),
+    )
+    survivors = []
+    for name in names:
+        detection = detections[name]
+        if any(math.hypot(detection.cx - kept.cx, detection.cy - kept.cy) <= grid_px * 0.50
+               for kept in survivors):
+            detections[name] = None
+            new_state[name] = _empty_presence_state(
+                prev_state.get(name, {}), change_histories[name]
             )
+        else:
+            survivors.append(detection)
 
     return detections, new_state
 
@@ -770,12 +768,34 @@ def _cell_label(row, col):
     return f"r{int(row)}c{int(col)}"
 
 
+def tracking_context(bundle, *, now, selected_mini=None, paused=False):
+    """Freeze mapping inputs once per frame for both live and replay decisions."""
+    scene = fo.get_scene_params()
+    revision, view = fo.get_tracking_view_snapshot()
+    marker_mode = getattr(bundle, "marker_mode", "legacy")
+    geometry = (marker_mode, bundle.warp_w, bundle.warp_h, bundle.grid_w, bundle.grid_h)
+    geometry += tuple(scene[key] for key in
+                      ("sceneId", "sceneW", "sceneH", "gridPx", "gridType", "shiftX", "shiftY", "background"))
+    if marker_mode == "viewport":
+        dimensions = fo.warp_grid_dimensions_from_snapshot(view, bundle.warp_w, bundle.warp_h)
+        valid = (view is not None and view["sceneId"] == scene["sceneId"]
+                 and scene["gridType"] in (None, 1))
+        grid_px = min(dimensions) if dimensions and valid else None
+        to_cell = lambda x, y: fo.warp_to_grid_cell_from_snapshot(
+            view, scene, x, y, bundle.warp_w, bundle.warp_h)
+    else:
+        revision = 0
+        grid_px = _grid_px_for_bundle(bundle)
+        to_cell = lambda x, y: _warp_to_cell(x, y, bundle.grid_w, bundle.grid_h, bundle.warp_w, bundle.warp_h)
+    return TrackingContext(now, geometry, revision, grid_px, to_cell, selected_mini, paused)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Single-point calibration (fallback — still works without full curve capture)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _save_profiles(profiles: Dict) -> None:
-    _PROFILES_PATH.write_text(json.dumps(profiles, indent=2), encoding="utf-8")
+    save_profiles(profiles, _PROFILES_PATH)
 
 
 def _calibration_rejection_reason(
@@ -809,36 +829,17 @@ def calibrate_from_bundle(
     bundle: "core.FrameBundle",
     name: str,
     existing_profiles: Dict,
+    *, sample_xy=None,
 ) -> Optional[Dict]:
     if not bundle.locked or bundle.warp_bgr is None:
         return None
 
-    grid_px = _grid_px_for_bundle(bundle)
-    if grid_px is None:
-        return None
-    blobs = _find_mini_blobs(bundle, grid_px)
-
-    if not blobs:
-        return None
-
-    cnt, cx, cy, area, circ = max(blobs, key=lambda b: b[3])
-    equiv_r = math.sqrt(area / math.pi)
-    sample_r = max(2.0, equiv_r * SAMPLE_RADIUS_FRAC)
-    lab = _sample_lab_at_centroid(bundle.warp_bgr, cx, cy, sample_r)
-
+    lab = sample_ring_patch(bundle.warp_bgr, sample_xy)
     if lab is None:
         return None
-
-    diameter_squares = (equiv_r * 2.0) / grid_px
-    print(f"COMBO CAL | name={name}  Lab=({lab[0]:.1f},{lab[1]:.1f},{lab[2]:.1f})  "
-          f"diam_sq={diameter_squares:.2f}  area={area:.0f}")
-
-    return {
-        "lab": list(lab),
-        "expected_diameter_squares": float(diameter_squares),
-        "max_lab_dist": DEFAULT_MAX_LAB_DIST,
-        "presence_lab_dist": PRESENCE_MAX_LAB_DIST,
-    }
+    if _calibration_rejection_reason(name, lab):
+        return None
+    return profile_with_sample(existing_profiles.get(name), lab)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -897,7 +898,22 @@ def render_calibration_preview(bundle: "core.FrameBundle") -> np.ndarray:
 # Session runner
 # ──────────────────────────────────────────────────────────────────────────────
 
-def begin_session(on_mini_moved, camera_index=None, show_windows=True):
+def close_pending_recording():
+    """Finish a carried recording if brightness calibration is cancelled."""
+    global _pending_recorder, _pending_record_path
+    recorder = _pending_recorder
+    _pending_recorder = _pending_record_path = None
+    if recorder is not None:
+        try:
+            recorder.release()
+        finally:
+            fo.stop_timeline_recording()
+
+
+def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access=None):
+    if access is not None:
+        access.require()
+    initialize_user_data()
     sel = s.load_last_selection() or {}
     mode = (sel.get("mode") or "self_hosted").strip().lower()
 
@@ -947,29 +963,19 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
     except Exception:
         pass
 
-    prev_state: Dict[str, Any] = {}
-    cell_hist: Dict[str, deque] = {}
-    last_emitted: Dict[str, str] = {}
-    last_physical_xy: Dict[str, Tuple[float, float]] = {}
-    last_view_transform_revision = fo.get_view_transform_revision()
-    last_scene_geometry = None
-    last_output_paused = fo.tracking_output_paused()
+    engine = TrackingEngine(detect_minis, consensus_n=CONSENSUS_N, consensus_k=CONSENSUS_K)
+    sess.recording_state_provider = lambda: {"engine": engine.snapshot(), "profiles": profiles}
+    prev_state, cell_hist = engine.prev_state, engine.cell_hist
+    last_emitted, last_physical_xy = engine.last_emitted, engine.last_physical_xy
+    _last_seen = engine.last_seen
     capture_started_at = None
-    pending_library_scan = None
-
-    # Lost-mini tracking: if a mini goes undetected for this many seconds while
-    # anchored, drop the spatial anchor so it can re-lock anywhere on the board.
-    # This handles the pick-up-and-place pattern (teleport moves) where the mini
-    # disappears and reappears more than 3 cells away.
-    LOST_TIMEOUT: float = 2.0
-    _last_seen: Dict[str, float] = {}  # timestamp of last successful detection per mini
 
     fps_count = 0
     last_print = time.perf_counter()
     _current_fps: float = 30.0          # updated every second; used for recording FPS
     _last_no_blob_msg: float = 0.0      # throttle the "no blobs" verbose heartbeat
     _last_library_update: float = 0.0
-    tap_detector = taps.TapGestureDetector()
+    _last_map_update: float = 0.0
 
     cam_window_open = False
     warp_window_open = False
@@ -987,38 +993,29 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
         for bundle in sess.frames():
             if not panel.pump():
                 break
+            if access is not None:
+                panel.set_access_status(access.status())
+                if not access.allowed:
+                    break
+                if hasattr(access, "usage_state"):
+                    access.usage_state("tracking", True)
 
             _now = time.perf_counter()
+            if sess.is_recording:
+                fo.record_tracking_input(_now)
             _do_display = show_windows and (_now - _last_display >= _display_interval)
             if _do_display:
                 _last_display = _now
 
             actions = panel.pop_actions()
+            if actions.get("retry_moves"):
+                fo.retry_failed_moves()
             if actions.get("scan_mini"):
-                pending_library_scan = (str(actions["scan_mini"]), time.perf_counter())
-            if pending_library_scan and not actions.get("calibrate_band"):
-                scan_name, scan_started = pending_library_scan
-                if time.perf_counter() - scan_started <= 15.0:
-                    actions["calibrate_band"] = {
-                        "name": scan_name,
-                        "portfolio_scan": True,
-                    }
-                else:
-                    pending_library_scan = None
-                    panel.set_hint(f"Scan timed out for {scan_name}; try Scan selected again")
+                actions["calibrate_band"] = {"name": str(actions["scan_mini"])}
             fo.update_camera_lock(bundle.locked, bundle.last_missing_ids)
             scene = fo.get_scene_params()
-            scene_geometry = (scene["sceneId"], scene["sceneW"], scene["sceneH"], scene["gridPx"], scene["shiftX"], scene["shiftY"])
-            output_paused = fo.tracking_output_paused()
-            if scene_geometry != last_scene_geometry or output_paused != last_output_paused:
-                prev_state.clear()
-                cell_hist.clear()
-                last_emitted.clear()
-                last_physical_xy.clear()
-                _last_seen.clear()
-                last_view_transform_revision = fo.get_view_transform_revision()
-                last_scene_geometry = scene_geometry
-                last_output_paused = output_paused
+            engine.synchronize(tracking_context(bundle, now=_now, selected_mini=fo.get_selected_mini(),
+                                                paused=fo.tracking_output_paused()))
 
             command = fo.pop_capture_command()
             if command:
@@ -1030,7 +1027,7 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
                             raise ValueError("Wait for marker lock and Foundry geometry before starting capture")
                         if sess.is_recording:
                             raise ValueError("Stop the existing recording before starting guided capture")
-                        rec_path = str(Path(__file__).parent / f"sarween_rec_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
+                        rec_path = str(recordings_dir() / f"sarween_rec_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
                         if not sess.start_recording(rec_path, fps=max(1.0, _current_fps)):
                             raise ValueError("Camera recording failed to start")
                         capture_started_here = True
@@ -1060,57 +1057,38 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
 
             if actions.get("calibrate_band"):
                 req = actions.get("calibrate_band")
-                name = None
-                portfolio_scan = False
-                if isinstance(req, dict):
-                    name = (req.get("name") or "").strip() or None
-                    portfolio_scan = bool(req.get("portfolio_scan", False))
-                if not name:
-                    name = time.strftime("mini_%Y%m%d_%H%M%S")
-
-                if not bundle.locked:
-                    panel.set_hint("Calibrate: wait for ArUco lock")
-                else:
-                    prof = calibrate_from_bundle(bundle, name, profiles)
-                    if prof is None:
-                        if portfolio_scan:
-                            panel.set_hint(f"Waiting for {name}; move that mini to a new square")
-                        else:
-                            panel.set_hint("Calibrate: no motion blob — move the mini first")
+                req = req if isinstance(req, dict) else {}
+                name = (req.get("name") or "").strip() or time.strftime("mini_%Y%m%d_%H%M%S")
+                if req.get("sample_lab") is None:
+                    if bundle.locked and bundle.warp_bgr is not None:
+                        panel.choose_ring_sample(name, bundle.warp_bgr)
                     else:
-                        lab = tuple(prof["lab"])
-                        rejection = _calibration_rejection_reason(name, lab)
-                        if rejection:
-                            message = f"Calibration rejected for {name}: {rejection}"
-                            print(f"COMBO CAL | {message}", flush=True)
-                            panel.set_hint(message)
-                            if portfolio_scan:
-                                pending_library_scan = None
-                            continue
-                        profiles[name] = prof
-                        try:
-                            _save_profiles(profiles)
-                            sample_result = ml.add_verified_sample(
-                                name,
-                                lab,
-                                source="known-position-scan",
-                                conditions={"fog": "unknown", "roomLighting": "current"},
-                            )
-                            mini_library = ml.load_synced_library(profiles)
-                            update_library_panel()
-                            sample_note = (
-                                "portfolio sample added"
-                                if sample_result == "added"
-                                else "matching sample already saved"
-                            )
-                            panel.set_hint(
-                                f"Calibrated: {name}  Lab=({lab[0]:.0f},{lab[1]:.0f},{lab[2]:.0f}); "
-                                f"{sample_note}"
-                            )
-                            if portfolio_scan:
-                                pending_library_scan = None
-                        except Exception as e:
-                            panel.set_hint(f"Save failed: {e}")
+                        panel.set_hint("Calibrate: wait for ArUco lock")
+                    continue
+                lab = tuple(req["sample_lab"])
+                rejection = _calibration_rejection_reason(name, lab)
+                if rejection:
+                    panel.set_hint(f"Calibration rejected for {name}: {rejection}")
+                    continue
+                try:
+                    prof = profile_with_sample(profiles.get(name), lab,
+                                               replace_colors=bool(req.get("replace_colors")))
+                    updated = {**profiles, name: prof}
+                    _save_profiles(updated)
+                    profiles = updated
+                    engine.reset_mini(name)
+                    if sess.is_recording:
+                        fo.record_profile_change(profiles, name)
+                    try:
+                        ml.add_verified_sample(name, lab, source="manual-ring-sample",
+                                               conditions={"fog": "unknown", "roomLighting": "current"})
+                        mini_library = ml.load_synced_library(profiles)
+                        panel.set_hint(f"Ring sample saved: {name}")
+                    except Exception as e:
+                        panel.set_hint(f"Profile saved; portfolio update failed: {e}")
+                    update_library_panel()
+                except Exception as e:
+                    panel.set_hint(f"Save failed: {e}")
                 continue
 
             if actions.get("recapture_bg"):
@@ -1122,6 +1100,8 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
                     bg_warp = core.warp_gray_blur(cam, sess.H_saved, sess.warp_w, sess.warp_h)
                     sess.BG_warp_f32 = bg_warp.astype(np.float32)
                     sess._bg_seeded = True
+                    if sess.is_recording:
+                        sess._checkpoint_kind = "background"
                     panel.set_hint("Background recaptured ✅")
                 except Exception as e:
                     panel.set_hint(f"Recapture failed: {e}")
@@ -1136,7 +1116,7 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
                     panel.set_hint("Recording and tracking timeline saved ✅")
                 else:
                     rec_path = str(
-                        Path(__file__).parent
+                        recordings_dir()
                         / f"sarween_rec_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
                     )
                     ok = sess.start_recording(rec_path, fps=max(1.0, _current_fps))
@@ -1184,7 +1164,10 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
 
             sess.warp_motion_thresh = panel.get_motion_thresh()
 
+            delivery = fo.get_delivery_status()
+            panel.set_delivery_status(delivery)
             panel.set_status(
+                foundry_connected=delivery["connected"] if mode == "foundry" else None,
                 locked=bool(bundle.locked),
                 marker_count=int(bundle.last_marker_count),
                 missing_ids=list(bundle.last_missing_ids),
@@ -1220,10 +1203,24 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
                         pass
                     cam_window_open = False
 
-            if not bundle.locked or bundle.warp_bgr is None:
-                continue
-
-            if fo.tracking_output_paused():
+            _do_verbose = verbose_tracking and bundle.locked
+            _now_t = time.perf_counter()
+            if sess.is_recording:
+                fo.record_tracking_input(_now_t, tracked=True)
+            context = tracking_context(bundle, now=_now_t, selected_mini=fo.get_selected_mini(),
+                                       paused=fo.tracking_output_paused())
+            step = engine.step(bundle, profiles, context, verbose=_do_verbose)
+            if _now_t - _last_map_update >= .5 and hasattr(panel, "update_map"):
+                map_scene = fo.get_scene_params()
+                map_positions = {}
+                for name, cell in engine.last_emitted.items():
+                    row, col = (int(value) for value in cell[1:].split("c"))
+                    map_positions[name] = {"cell": rc_to_a1(row, col), "status": "tracked" if
+                        not step.reason and _now_t - engine.last_seen.get(name, -1e9) <= 2 else "lost"}
+                panel.update_map({"grid": [map_scene.get("gridCols") or bundle.grid_w,
+                    map_scene.get("gridRows") or bundle.grid_h], "locked": bundle.locked, "positions": map_positions})
+                _last_map_update = _now_t
+            if step.reason == "paused":
                 panel.set_hint("Capture mode: tracking predictions paused")
                 if show_windows and show_h_view and _do_display:
                     core.show_homography_view(bundle.cam_bgr, bundle.H_use,
@@ -1232,91 +1229,18 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
                                               marker_mode=bundle.marker_mode,
                                               corner_ids=sess.corner_ids)
                 continue
-
-            grid_px = _grid_px_for_bundle(bundle)
-            if bundle.marker_mode == "viewport" and scene.get("gridType") not in (None, 1):
-                panel.set_hint("Foundry tracking requires a square Foundry grid")
+            if step.reason == "unmapped":
+                panel.set_hint("Foundry tracking requires a square grid" if scene.get("gridType") not in (None, 1)
+                               else "Waiting for Foundry viewport transform...")
                 continue
-            if grid_px is None:
-                panel.set_hint("Waiting for Foundry viewport transform...")
+            if step.reason:
                 continue
-
-            current_view_revision = fo.get_view_transform_revision()
-            if current_view_revision != last_view_transform_revision:
-                last_view_transform_revision = current_view_revision
-                for _name, (_px, _py) in list(last_physical_xy.items()):
-                    mapped = _bundle_to_cell(bundle, _px, _py)
-                    if mapped is None:
-                        continue
-                    _col, _row = mapped
-                    _cell = _cell_label(_row, _col)
-                    if _cell == last_emitted.get(_name):
-                        continue
-                    last_emitted[_name] = _cell
-                    cell_hist.pop(_name, None)
-                    print(
-                        f"V3 | Foundry map moved under {_name}; "
-                        f"now at {rc_to_a1(_row, _col)}",
-                        flush=True,
-                    )
-                    fo.record_tracking_event(
-                        _name, _cell, source="viewportTransform"
-                    )
-                    if on_mini_moved is not None:
-                        on_mini_moved(_name, _cell)
-
-            _do_verbose = verbose_tracking and bundle.locked
-
-            # Lost-mini timeout: if anchored but undetected for >LOST_TIMEOUT s,
-            # clear the spatial anchor so the mini can re-lock anywhere.
-            _now_t = time.perf_counter()
-            selected_mini = fo.get_selected_mini()
-            for _name in list(prev_state.keys()):
-                _ps = prev_state[_name]
-                if _ps.get("last_xy") is not None:
-                    _age = _now_t - _last_seen.get(_name, _now_t)
-                    timeout = 0.75 if _name == selected_mini else LOST_TIMEOUT
-                    if _age > timeout:
-                        _ps["last_xy"] = None
-                        cell_hist.pop(_name, None)   # clear stale consensus buffer
-                        print(f"V3 | {_name} lost ({_age:.1f}s since last detection) "
-                              f"→ search mode", flush=True)
-
-            if _do_verbose:
-                print(f"── TRACK f{bundle.frame_idx} ─────────────────────────────")
-
-            dets, prev_state = detect_minis(
-                bundle=bundle, profiles=profiles,
-                grid_px=grid_px, prev_state=prev_state,
-                verbose=_do_verbose,
-            )
-
-            # Presence detection sees a settled ring continuously, so every
-            # successful detection refreshes last-seen.
-            for _name, _det in dets.items():
-                if _det is None:
-                    continue
-                _last_seen[_name] = _now_t
-
-            contact_ids = taps.contact_minis(
-                bundle,
-                last_physical_xy,
-                grid_px,
-            )
-            detected_positions = {
-                name: (detection.cx, detection.cy)
-                for name, detection in dets.items()
-                if detection is not None
-            }
-            tapped_mini = tap_detector.update(
-                _now_t,
-                contact_ids,
-                last_physical_xy if contact_ids else detected_positions,
-                grid_px,
-            )
-            if tapped_mini:
-                print(f"V3 | Physical tap recognized on {tapped_mini}", flush=True)
-                fo.queue_control({"type": "miniTap", "miniId": tapped_mini})
+            dets = step.detections
+            for name in step.lost_minis:
+                print(f"V3 | {name} lost; search mode", flush=True)
+            if step.tapped_mini:
+                print(f"V3 | Physical tap recognized on {step.tapped_mini}", flush=True)
+                fo.queue_control({"type": "miniTap", "miniId": step.tapped_mini})
 
             # Heartbeat when verbose but nothing detected (throttled to once/3s)
             if verbose_tracking and bundle.locked and not any(d is not None for d in dets.values()):
@@ -1446,51 +1370,14 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
                     homography_window_open = False
 
             # ── Emit movements ───────────────────────────────────────────────
-            if _do_verbose and any(d is not None for d in dets.values()):
-                print("  CONSENSUS:")
-            for mname, det in dets.items():
-                if det is None:
-                    continue
-                mapped = _bundle_to_cell(bundle, det.cx, det.cy)
-                if mapped is None:
-                    continue
-                col, row = mapped
-                cell = _cell_label(row, col)
-                buf = cell_hist.setdefault(mname, deque(maxlen=CONSENSUS_N))
-                buf.append(cell)
-                most, count = Counter(buf).most_common(1)[0]
-                if _do_verbose:
-                    a1 = rc_to_a1(row, col)
-                    if count >= CONSENSUS_K:
-                        if most != last_emitted.get(mname):
-                            emit_note = f"→ EMIT {a1} ✅"
-                        else:
-                            emit_note = f"→ already at {a1}"
-                    else:
-                        emit_note = f"→ hold ({count}/{CONSENSUS_N} need {CONSENSUS_K})"
-                    print(f"    {mname:20s}  buf={list(buf)[-CONSENSUS_N:]}  "
-                          f"top={most}({count}/{len(buf)})  {emit_note}")
-                if count >= CONSENSUS_K and cell == most:
-                    last_physical_xy[mname] = (det.cx, det.cy)
-                if count >= CONSENSUS_K and most != last_emitted.get(mname):
-                    last_emitted[mname] = most
-                    # Every confirmed placement becomes the new spatial anchor.
-                    parts = most[1:].split('c')
-                    r_idx, c_idx = int(parts[0]), int(parts[1])
-                    if getattr(bundle, "marker_mode", "legacy") == "viewport":
-                        anchor = (det.cx, det.cy)
-                    else:
-                        cell_w = bundle.warp_w / float(bundle.grid_w)
-                        cell_h = bundle.warp_h / float(bundle.grid_h)
-                        anchor = ((c_idx + 0.5) * cell_w, (r_idx + 0.5) * cell_h)
-                    if mname not in prev_state:
-                        prev_state[mname] = {}
-                    prev_state[mname]["last_xy"] = anchor
-                    print(f"V3 | {mname} anchored at {rc_to_a1(r_idx, c_idx)} "
-                          f"({anchor[0]:.0f},{anchor[1]:.0f})", flush=True)
-                    fo.record_tracking_event(mname, most)
-                    if on_mini_moved is not None:
-                        on_mini_moved(mname, most)
+            for move in step.moves:
+                if access is not None and not access.allowed:
+                    break
+                row, col = (int(value) for value in move.raw_to[1:].split("c"))
+                print(f"V3 | {move.mini} at {rc_to_a1(row, col)} ({move.source})", flush=True)
+                fo.record_tracking_event(move.mini, move.raw_to, source=move.source)
+                if on_mini_moved is not None:
+                    on_mini_moved(move.mini, move.raw_to, source=move.source)
 
             # ── Update positions panel ───────────────────────────────────────
             positions = {}
@@ -1515,6 +1402,8 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
                     break
 
     finally:
+        if access is not None and hasattr(access, "usage_state"):
+            access.usage_state("tracking", False)
         if fo.guided_capture_active():
             fo.finish_guided_capture("appClosed")
         fo.update_camera_lock(False, [])
@@ -1524,6 +1413,10 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True):
             pass
         try:
             cv2.destroyAllWindows()
+        except Exception:
+            pass
+        try:
+            panel.root.destroy()
         except Exception:
             pass
 

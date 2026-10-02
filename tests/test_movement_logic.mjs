@@ -6,6 +6,7 @@ import {
   movementColor,
   movementOverage,
   remainingMovement,
+  rebaseMovementAt,
   resetMovementAt,
   undoMovementPoint,
 } from "../movement_logic.mjs";
@@ -37,7 +38,22 @@ const undone = undoMovementPoint(state);
 assert.deepEqual(undone.point, g3);
 assert.equal(undone.state.usedFeet, 30);
 
+const shifted = rebaseMovementAt(state, {x: 450, y: 150, row: 3, column: 9});
+assert.equal(shifted.usedFeet, 35);
+assert.equal(movementColor(shifted), "#ef4444");
+assert.equal(shifted.segments.length, state.segments.length);
+assert.deepEqual(shifted.points[0], {x: 100, y: 50, row: 1, column: 2});
+assert.deepEqual(shifted.points.at(-1), {x: 450, y: 150, row: 3, column: 9});
+assert.deepEqual(shifted.segments.at(-1).to, shifted.points.at(-1));
+assert.equal(undoMovementPoint(shifted).state.usedFeet, 30);
+assert.deepEqual(undoMovementPoint(shifted).point, {x: 400, y: 150, row: 3, column: 8});
+assert.deepEqual(state.points.at(-1), {x: 350, y: 100, row: 2, column: 7}, "Rebase must not mutate old state");
+const repeated = rebaseMovementAt(shifted, shifted.points.at(-1));
+assert.deepEqual(repeated, shifted);
+const resumed = addMovementPoint(shifted, {x: 500, y: 150, row: 3, column: 10}, 5);
+assert.equal(resumed.usedFeet, 40);
+
 state = resetMovementAt(undone.state, c3);
 assert.equal(state.usedFeet, 0);
 assert.deepEqual(state.points, [c3]);
-console.log("PASS: movement budget, white/red state, undo and reset");
+console.log("PASS: movement budget, white/red state, viewport rebase, undo and reset");

@@ -6,6 +6,8 @@ import time
 import setup as s
 import json
 import hashlib
+import io
+from app_paths import atomic_write_bytes, data_path, initialize_user_data
 
 from screeninfo import get_monitors
 
@@ -39,16 +41,9 @@ _BLENDED_IMG_CACHE = None
 _BLENDED_WINDOW_OPEN = False
 BLENDED_WINDOW_NAME = "Blended ArUco Markers"
 
-# Writable cache directory — inside .app bundle the Frameworks dir is read-only,
-# so we write to ~/Library/Application Support/Sarween/ instead.
+# Cache lookup is pure; runtime generation creates the required directories.
 def _writable_dir() -> str:
-    import sys
-    if getattr(sys, "frozen", False):
-        d = os.path.expanduser("~/Library/Application Support/Sarween")
-    else:
-        d = os.path.dirname(os.path.abspath(__file__))
-    os.makedirs(d, exist_ok=True)
-    return d
+    return str(data_path("Cache"))
 
 BLENDED_OUTPUT_PATH = os.path.join(_writable_dir(), "blended_output.jpg")
 
@@ -177,7 +172,7 @@ def is_blended_display_window_open():
     return bool(_BLENDED_WINDOW_OPEN)
 
 
-def _foundry_wait_for_scene_grid():
+def _foundry_wait_for_scene_grid(access=None):
     """
     Blocks until sceneInfo arrives. Cancel button or window close cancels.
     Returns (cols, rows, scene_info_dict)
@@ -192,6 +187,9 @@ def _foundry_wait_for_scene_grid():
     wait_win = TkFoundryWait()
 
     while True:
+        if access is not None and not access.allowed:
+            wait_win.close()
+            access.require()
         try:
             fo.request_scene_info()
         except Exception:
@@ -314,8 +312,10 @@ def calibrate_webcam(camera_index=s.load_last_selection().get("webcam_index", 0)
         all_charuco_corners, all_charuco_ids, board, gray.shape[::-1], None, None
     )
 
-    np.save('camera_matrix.npy', camera_matrix)
-    np.save('dist_coeffs.npy', dist_coeffs)
+    for name, array in (("camera_matrix.npy", camera_matrix), ("dist_coeffs.npy", dist_coeffs)):
+        buffer = io.BytesIO()
+        np.save(buffer, array, allow_pickle=False)
+        atomic_write_bytes(data_path(name), buffer.getvalue())
     print("✅ Calibration complete. Saved camera_matrix.npy and dist_coeffs.npy.")
 
     for i, frame in enumerate(used_frames):
@@ -440,8 +440,7 @@ def _compute_border_px(cell_px):
     return max(1, int(round(cell_px * border_ratio)))
 
 
-def generate_aruco_marker_tiles(cell_px, border_px):
-    os.makedirs(MARKERS_DIR, exist_ok=True)
+def make_aruco_marker_tile(marker_id, cell_px, border_px):
     inner_px = max(10, cell_px - border_px)
 
     border_map = {
@@ -451,28 +450,32 @@ def generate_aruco_marker_tiles(cell_px, border_px):
         3: (border_px, 0,         0,         border_px),
     }
 
+    try:
+        marker_gray = cv2.aruco.generateImageMarker(aruco_dict, marker_id, inner_px)
+    except AttributeError:
+        marker_gray = np.zeros((inner_px, inner_px), dtype=np.uint8)
+        cv2.aruco.drawMarker(aruco_dict, marker_id, inner_px, marker_gray, 1)
+
+    marker_bgr = cv2.cvtColor(marker_gray, cv2.COLOR_GRAY2BGR)
+    t, b, l, r = border_map[marker_id]
+    tile = cv2.copyMakeBorder(marker_bgr, t, b, l, r, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+    if tile.shape[0] != cell_px or tile.shape[1] != cell_px:
+        tile = cv2.resize(tile, (cell_px, cell_px), interpolation=cv2.INTER_NEAREST)
+    return tile
+
+
+def generate_aruco_marker_tiles(cell_px, border_px):
+    os.makedirs(MARKERS_DIR, exist_ok=True)
     for i in range(4):
-        try:
-            marker_gray = cv2.aruco.generateImageMarker(aruco_dict, i, inner_px)
-        except AttributeError:
-            marker_gray = np.zeros((inner_px, inner_px), dtype=np.uint8)
-            cv2.aruco.drawMarker(aruco_dict, i, inner_px, marker_gray, 1)
-
-        marker_bgr = cv2.cvtColor(marker_gray, cv2.COLOR_GRAY2BGR)
-        t, b, l, r = border_map[i]
-        tile = cv2.copyMakeBorder(marker_bgr, t, b, l, r, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-
-        if tile.shape[0] != cell_px or tile.shape[1] != cell_px:
-            tile = cv2.resize(tile, (cell_px, cell_px), interpolation=cv2.INTER_NEAREST)
-
+        tile = make_aruco_marker_tile(i, cell_px, border_px)
         cv2.imwrite(os.path.join(MARKERS_DIR, f"marker_{i}.png"), tile)
 
 
-def prepare_map_asset():
+def prepare_map_asset(access=None):
     mode = _get_mode()
 
     if mode == "foundry":
-        cols, rows, info = _foundry_wait_for_scene_grid()
+        cols, rows, info = _foundry_wait_for_scene_grid(access)
         s.grid_cols = cols
         s.grid_rows = rows
         return None, None, None, cols, rows, None, None
@@ -611,11 +614,12 @@ def generate_display():
     _BLENDED_WINDOW_OPEN = True
 
 
-def calibrate():
+def calibrate(access=None):
+    initialize_user_data()
     mode = _get_mode()
 
     if mode == "foundry":
-        prepare_map_asset()
+        prepare_map_asset(access)
     else:
         generate_display()
 

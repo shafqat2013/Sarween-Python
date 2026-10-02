@@ -10,9 +10,10 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 from typing import Dict, List, Optional
+from app_paths import atomic_write_json, data_path
 
 
-CONFIG_FILE = "hardware_config.json"
+CONFIG_FILE = str(data_path("hardware_config.json"))
 
 
 def rc_to_a1(row: int, col: int) -> str:
@@ -41,13 +42,18 @@ def _save_config_patch(patch: Dict[str, object]) -> None:
     data = _load_config()
     try:
         data.update(patch)
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(data, f)
+        atomic_write_json(CONFIG_FILE, data)
     except Exception:
         pass
 
 
 class ControlPanel:
+    def set_access_status(self, message):
+        if not hasattr(self, "_access_label"):
+            self._access_label = ttk.Label(self.root, wraplength=450)
+            self._access_label.pack(side="bottom", fill="x", padx=8, pady=4)
+        self._access_label.configure(text=message)
+
     def __init__(self, mode: str = "self_hosted", tk_root: tk.Tk = None):
         self.mode = (mode or "self_hosted").strip().lower()
         if self.mode not in ("self_hosted", "foundry"):
@@ -78,10 +84,12 @@ class ControlPanel:
             "toggle_recording": False,
             "dump_state": False,
             "scan_mini": None,
+            "retry_moves": False,
         }
         self._library_rows: List[Dict[str, object]] = []
         self._library_window = None
         self._library_tree = None
+        self._ring_scan_window = None
 
         # ── Tk root / window ─────────────────────────────────────────────────
         if tk_root is not None:
@@ -94,7 +102,8 @@ class ControlPanel:
             self.root = self._tk_root
 
         self.root.title("Sarween Control Panel")
-        self.root.geometry("480x640")
+        self.root.geometry(f"540x{min(700, self.root.winfo_screenheight() - 100)}")
+        self.root.minsize(500, 420)
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -104,6 +113,7 @@ class ControlPanel:
         self.var_markers = tk.StringVar(value="Markers: --")
         self.var_missing = tk.StringVar(value="Missing: --")
         self.var_foundry = tk.StringVar(value="Foundry: (n/a)")
+        self.var_delivery = tk.StringVar(value="")
         self.var_fps     = tk.StringVar(value="FPS: --")
         self.var_hint    = tk.StringVar(value="")
 
@@ -122,14 +132,34 @@ class ControlPanel:
         self._var_verbose_tracking   = tk.BooleanVar(value=self._toggles["verbose_tracking"])
 
         # ── Layout ────────────────────────────────────────────────────────────
-        outer = ttk.Frame(self.root, padding=14)
-        outer.pack(fill="both", expand=True)
+        scroll = tk.Canvas(self.root, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=scroll.yview)
+        scrollbar.pack(side="right", fill="y")
+        scroll.pack(side="left", fill="both", expand=True)
+        scroll.configure(yscrollcommand=scrollbar.set)
+        outer = ttk.Frame(scroll, padding=14)
+        content = scroll.create_window(0, 0, window=outer, anchor="nw")
+        outer.bind("<Configure>", lambda _event: scroll.configure(scrollregion=scroll.bbox("all")))
+        scroll.bind("<Configure>", lambda event: scroll.itemconfigure(content, width=event.width))
+        self.root.bind("<MouseWheel>", lambda event: scroll.yview_scroll(-1 if event.delta > 0 else 1, "units"))
 
         ttk.Label(outer, text="Sarween Control Panel",
                   font=("Helvetica", 16, "bold")).pack(anchor="w", pady=(0, 10))
 
+        self.tabs = ttk.Notebook(outer)
+        self.tabs.pack(fill="both", expand=True)
+        session_tab = ttk.Frame(self.tabs, padding=10)
+        scans_tab = ttk.Frame(self.tabs, padding=10)
+        diagnostics_tab = ttk.Frame(self.tabs, padding=10)
+        self.tabs.add(session_tab, text="Session")
+        self.tabs.add(scans_tab, text="Scans")
+        self.tabs.add(diagnostics_tab, text="Diagnostics")
+        from map_view import MapView
+        self.map_view = MapView(self.tabs)
+        self.tabs.add(self.map_view, text="Map")
+
         # Calibration row
-        cal_box = ttk.Frame(outer)
+        cal_box = ttk.Frame(scans_tab)
         cal_box.pack(fill="x", pady=(0, 10))
         ttk.Label(cal_box, text="Mini name").pack(side="left")
         self._band_name_var = tk.StringVar(value="")
@@ -140,19 +170,21 @@ class ControlPanel:
         ttk.Button(cal_box, text="Auto",
                    command=self._act_calibrate_band_auto).pack(side="left")
 
-        ttk.Separator(outer, orient="horizontal").pack(fill="x", pady=8)
-
         # Status
-        status_box = ttk.Frame(outer)
+        status_box = ttk.Frame(session_tab)
         status_box.pack(fill="x", pady=(0, 6))
         for var in (self.var_mode, self.var_lock, self.var_markers,
                     self.var_missing, self.var_fps, self.var_foundry):
             ttk.Label(status_box, textvariable=var).pack(anchor="w")
+        if self.mode == "foundry":
+            ttk.Label(status_box, textvariable=self.var_delivery, wraplength=420).pack(anchor="w")
+            self._retry_moves_btn = ttk.Button(status_box, text="Retry moves", command=self._act_retry_moves, state="disabled")
+            self._retry_moves_btn.pack(anchor="w")
 
-        ttk.Separator(outer, orient="horizontal").pack(fill="x", pady=8)
+        ttk.Separator(session_tab, orient="horizontal").pack(fill="x", pady=8)
 
         # Windows toggles
-        ttk.Label(outer, text="Windows").pack(anchor="w")
+        ttk.Label(diagnostics_tab, text="Windows").pack(anchor="w")
         for text, var in [
             ("Live Camera View",                   self._var_show_live),
             ("Homography View",                    self._var_show_h),
@@ -161,36 +193,35 @@ class ControlPanel:
             ("Show Timing (terminal)",             self._var_show_timing),
             ("Verbose Tracking (terminal)",        self._var_verbose_tracking),
         ]:
-            ttk.Checkbutton(outer, text=text, variable=var,
+            ttk.Checkbutton(diagnostics_tab, text=text, variable=var,
                             command=self._sync_toggles_from_ui).pack(anchor="w")
 
-        ttk.Separator(outer, orient="horizontal").pack(fill="x", pady=8)
+        ttk.Separator(diagnostics_tab, orient="horizontal").pack(fill="x", pady=8)
 
         # Masks toggles
-        ttk.Label(outer, text="Masks").pack(anchor="w")
+        ttk.Label(diagnostics_tab, text="Masks").pack(anchor="w")
         for text, var in [
             ("Motion (warp)",          self._var_show_motion_warp),
             ("Motion (camera)",        self._var_show_motion_cam),
             ("Shadow-free mask",       self._var_show_shadowfree),
             ("Final mask",             self._var_show_final_mask),
         ]:
-            ttk.Checkbutton(outer, text=text, variable=var,
+            ttk.Checkbutton(diagnostics_tab, text=text, variable=var,
                             command=self._sync_toggles_from_ui).pack(anchor="w")
 
-        ttk.Separator(outer, orient="horizontal").pack(fill="x", pady=8)
+        ttk.Separator(diagnostics_tab, orient="horizontal").pack(fill="x", pady=8)
 
         # Actions
-        ttk.Label(outer, text="Actions").pack(anchor="w")
-        btn_row = ttk.Frame(outer)
+        btn_row = ttk.Frame(session_tab)
         btn_row.pack(fill="x", pady=(6, 0))
         ttk.Button(btn_row, text="Recapture BG",
                    command=self._act_recapture_bg).pack(side="left", padx=(0, 6))
-        ttk.Button(btn_row, text="Calibrate Minis",
-                   command=self._act_calibrate_minis).pack(side="left", padx=(0, 6))
-        ttk.Button(btn_row, text="Exit",
+        ttk.Button(scans_tab, text="Calibrate Minis",
+                   command=self._act_calibrate_minis).pack(anchor="w", pady=(8, 0))
+        ttk.Button(btn_row, text="Stop session",
                    command=self._act_exit).pack(side="right")
 
-        rec_row = ttk.Frame(outer)
+        rec_row = ttk.Frame(session_tab)
         rec_row.pack(fill="x", pady=(4, 0))
         self._rec_btn_var = tk.StringVar(value="⏺  Record")
         ttk.Button(rec_row, textvariable=self._rec_btn_var,
@@ -199,15 +230,15 @@ class ControlPanel:
         ttk.Label(rec_row, textvariable=self.var_recording,
                   foreground="red").pack(side="left", padx=(10, 0))
 
-        debug_row = ttk.Frame(outer)
+        debug_row = ttk.Frame(diagnostics_tab)
         debug_row.pack(fill="x", pady=(4, 0))
         ttk.Button(debug_row, text="Dump State",
                    command=self._act_dump_state).pack(side="left")
-        ttk.Button(debug_row, text="Mini Library",
-                   command=self._show_mini_library).pack(side="left", padx=(6, 0))
+        ttk.Button(btn_row, text="Mini Library",
+                   command=self._show_mini_library).pack(side="left", padx=(0, 6))
 
         # Motion threshold
-        thresh_box = ttk.Frame(outer)
+        thresh_box = ttk.Frame(diagnostics_tab)
         thresh_box.pack(fill="x", pady=(10, 0))
         ttk.Label(thresh_box, text="Motion threshold:").pack(anchor="w")
         thresh_row = ttk.Frame(thresh_box)
@@ -222,13 +253,13 @@ class ControlPanel:
         ttk.Label(thresh_row, textvariable=self._thresh_label_var, width=4).pack(side="left")
 
         # Hint
-        ttk.Label(outer, textvariable=self.var_hint).pack(anchor="w", pady=(8, 0))
+        ttk.Label(outer, textvariable=self.var_hint, wraplength=460).pack(anchor="w", pady=(8, 0))
 
-        ttk.Separator(outer, orient="horizontal").pack(fill="x", pady=8)
+        ttk.Separator(session_tab, orient="horizontal").pack(fill="x", pady=8)
 
         # Mini positions
-        ttk.Label(outer, text="Mini Positions").pack(anchor="w", pady=(0, 4))
-        self._pos_table = ttk.Frame(outer)
+        ttk.Label(session_tab, text="Mini Positions").pack(anchor="w", pady=(0, 4))
+        self._pos_table = ttk.Frame(session_tab)
         self._pos_table.pack(fill="both", expand=True)
         self._pos_rows: dict = {}
 
@@ -416,6 +447,9 @@ class ControlPanel:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    def update_map(self, state: dict) -> None:
+        self.map_view.set_state(state)
+
     def update_positions(self, positions: dict) -> None:
         def _update():
             try:
@@ -490,6 +524,27 @@ class ControlPanel:
         except Exception:
             pass
 
+    def choose_ring_sample(self, name, image):
+        from ring_scan_dialog import show_ring_scan
+        if self._ring_scan_window is not None and self._ring_scan_window.winfo_exists():
+            self._ring_scan_window.destroy()
+
+        def confirmed(sample):
+            with self._lock:
+                self._actions["calibrate_band"] = sample
+
+        self._ring_scan_window = show_ring_scan(self.root, name, image, confirmed)
+
+    def _act_retry_moves(self):
+        with self._lock:
+            self._actions["retry_moves"] = True
+
+    def set_delivery_status(self, status):
+        if self.mode != "foundry":
+            return
+        self.var_delivery.set(str(status["message"]))
+        self._retry_moves_btn.configure(state="normal" if status["retryAvailable"] else "disabled")
+
     def set_status(
         self,
         *,
@@ -517,14 +572,12 @@ class ControlPanel:
                 )
             except Exception:
                 pass
-        if foundry_connected is None:
-            ftxt = "Foundry: (n/a)" if self.mode != "foundry" else "Foundry: (unknown)"
-        else:
+        if foundry_connected is not None:
             ftxt = "Foundry: ✅ connected" if foundry_connected else "Foundry: ❌ disconnected"
-        try:
-            self.var_foundry.set(ftxt)
-        except Exception:
-            pass
+            try:
+                self.var_foundry.set(ftxt)
+            except Exception:
+                pass
         if fps is not None:
             try:
                 self.var_fps.set(f"FPS: {float(fps):.1f}")
@@ -551,6 +604,7 @@ class ControlPanel:
             self._actions["toggle_recording"] = False
             self._actions["dump_state"]       = False
             self._actions["scan_mini"]        = None
+            self._actions["retry_moves"]      = False
         return out
 
     def pump(self) -> bool:

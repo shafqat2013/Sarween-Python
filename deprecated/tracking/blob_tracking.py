@@ -14,6 +14,7 @@ from collections import deque, Counter
 import setup as s
 import mini_tracking as mt
 import calibration as c
+from app_paths import data_path, initialize_user_data
 import foundryoutput as fo
 from control_panel import ControlPanel
 
@@ -469,6 +470,7 @@ def begin_session(
 ):
     global DRAW_ARUCO_OVERLAY
 
+    initialize_user_data()
     # Load defaults from setup
     if camera_index is None:
         sel = s.load_last_selection() or {}
@@ -890,7 +892,7 @@ def begin_session(
                             frame_bgr=cam,
                             contour=selected,
                             min_area=int(min_area_for_ident),
-                            save_dir="mini_captures",
+                            save_dir=str(data_path("mini_captures")),
                             return_info=False,
                             mini_id=None,
                             name=name
@@ -900,7 +902,7 @@ def begin_session(
                             frame_bgr=cam,
                             contour=selected,
                             min_area=int(min_area_for_ident),
-                            save_dir="mini_captures",
+                            save_dir=str(data_path("mini_captures")),
                             return_info=False,
                             mini_id=choice,
                             name=None

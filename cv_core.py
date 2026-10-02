@@ -1,7 +1,7 @@
 # cv_core.py
 #
 # Shared CV pipeline core for Sarween.
-# This module owns the parts that BOTH engines should share:
+# This module owns the CV inputs shared by live tracking and replay:
 # - camera open + optional undistortion
 # - ArUco detection + homography solve + ROI masks (mask_cam/mask_warp)
 # - warp-space background EMA + motion mask
@@ -9,7 +9,7 @@
 #
 # It does NOT do:
 # - mini DB matching / capture picker / name logic
-# - band color detection (that belongs in band_tracking.py)
+# - ring detection or identity tracking (that belongs in tracking_engine.py)
 # - any control panel UI (engines can consume status/bundles and render)
 #
 # Typical usage (engine side):
@@ -20,8 +20,7 @@
 #   for bundle in sess.frames():
 #       if not bundle["locked"]:
 #           continue
-#       # blob engine: use bundle["final_mask_cam"] + bundle["cam_bgr"]
-#       # band engine: use bundle["warp_bgr"] (or warp cam using bundle["H_use"])
+#       # Pass bundle["warp_bgr"] and motion/registration state to the tracker.
 #
 #   sess.close()
 
@@ -39,6 +38,7 @@ PRINT_TIMING: bool = False
 
 import cv2
 import numpy as np
+from app_paths import data_path
 
 import setup as s
 import mini_tracking as mt
@@ -177,10 +177,10 @@ _camera_params_cache: Optional[Tuple[Optional[np.ndarray], Optional[np.ndarray]]
 def get_camera_params() -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     global _camera_params_cache
     if _camera_params_cache is None:
-        if os.path.exists("camera_matrix.npy") and os.path.exists("dist_coeffs.npy"):
+        if data_path("camera_matrix.npy").exists() and data_path("dist_coeffs.npy").exists():
             _camera_params_cache = (
-                np.load("camera_matrix.npy"),
-                np.load("dist_coeffs.npy"),
+                np.load(data_path("camera_matrix.npy"), allow_pickle=False),
+                np.load(data_path("dist_coeffs.npy"), allow_pickle=False),
             )
         else:
             _camera_params_cache = (None, None)
@@ -451,6 +451,11 @@ class CVCoreSession:
         self.source_frames_undistorted = bool(source_frames_undistorted)
         self.view_settle_seconds = max(0.0, float(view_settle_seconds))
         self.loop_video = bool(loop_video)
+        self._frame_phase_offset = 0
+        self.recording_state_provider = None
+        self._checkpoint_kind = None
+        self.replay_frame_clock = None
+        self.frame_time = None
 
         _src = (source_path or os.environ.get("TRUESIGHT_SOURCE", "")).strip()
         if marker_mode is None:
@@ -507,12 +512,14 @@ class CVCoreSession:
             print(f"CV_CORE | TRUESIGHT_SOURCE mode — reading from: {_src}", flush=True)
             self.cap = cv2.VideoCapture(_src)
             if not self.cap.isOpened():
+                self.cap.release()
                 raise RuntimeError(f"TRUESIGHT_SOURCE: failed to open '{_src}'")
             # No warm-up for file sources
         else:
             # Open camera
             self.cap = cv2.VideoCapture(self.camera_index)
             if not self.cap.isOpened():
+                self.cap.release()
                 raise RuntimeError("Failed to open webcam.")
 
             # Warm-up reads — macOS cameras need time to stabilise after open
@@ -533,6 +540,7 @@ class CVCoreSession:
                 break
             time.sleep(0.1)
         if frame_bg is None:
+            self.cap.release()
             raise RuntimeError("Failed to capture camera-space background after retries.")
         frame_bg = self._maybe_undistort(frame_bg)
         gray_bg = cv2.cvtColor(frame_bg, cv2.COLOR_BGR2GRAY)
@@ -621,6 +629,7 @@ class CVCoreSession:
             self.stop_recording()
         self._recorder = recorder
         self._record_path = path
+        self._checkpoint_kind = "restart"
         print(f"CV_CORE | Recording resumed → {path}", flush=True)
 
     def start_recording(self, path: str, fps: Optional[float] = None) -> bool:
@@ -648,6 +657,7 @@ class CVCoreSession:
                 return False
             self._recorder = writer
             self._record_path = path
+            self._checkpoint_kind = "initial"
             if fo is not None and hasattr(fo, "start_timeline_recording"):
                 try:
                     fo.start_timeline_recording(
@@ -695,7 +705,7 @@ class CVCoreSession:
         need_fast = (not have_lock) or (self.last_marker_count < 4)
         aruco_interval = self.aruco_every_n_fast if need_fast else self.aruco_every_n
 
-        if (self.frame_idx % aruco_interval) != 0:
+        if ((self.frame_idx + self._frame_phase_offset) % aruco_interval) != 0:
             return
 
         H_view, detected_count, seen_ids, det_corners, det_ids = solve_H_from_markers(
@@ -887,10 +897,10 @@ class CVCoreSession:
         # genuine motion pixels.
         alpha_bg = self.bg_alpha_fast if change_ratio >= self.fog_change_ratio else self.bg_alpha_slow
 
-        now = time.perf_counter()
+        now = self.frame_time if self.frame_time is not None else time.perf_counter()
         dt = now - self._last_frame_time
         self._last_frame_time = now
-        if dt > 0 and not self._source_is_file:
+        if dt > 0 and (not self._source_is_file or self.replay_frame_clock is not None):
             self._fps_estimate = 0.9 * self._fps_estimate + 0.1 * (1.0 / dt)
         heal_frames = max(1, int(round(self._fps_estimate * self._heal_ms / 1000.0)))
 
@@ -982,15 +992,18 @@ class CVCoreSession:
         Engines can consume these bundles.
         """
         while True:
+            if getattr(self, "_recorder", None) is not None and self._checkpoint_kind and self.recording_state_provider:
+                fo.record_checkpoint(self, self.recording_state_provider(), self._checkpoint_kind)
+                self._checkpoint_kind = None
             self.frame_idx += 1
 
             try:
+                if self.before_frame_callback is not None:
+                    self.before_frame_callback(self.frame_idx)
                 if self.marker_mode == "viewport" and fo is not None:
                     scene = fo.get_scene_params()
                     self.grid_w = int(scene["gridCols"])
                     self.grid_h = int(scene["gridRows"])
-                if self.before_frame_callback is not None:
-                    self.before_frame_callback(self.frame_idx)
                 ok, cam = self.cap.read()
                 if not ok or cam is None:
                     if self._source_is_file:
@@ -1014,13 +1027,16 @@ class CVCoreSession:
                             break
 
                 cam = self._maybe_undistort(cam)
+                self.frame_time = (float(self.replay_frame_clock) if self.replay_frame_clock is not None
+                                   else time.perf_counter())
 
                 # Write frame to recorder if active
                 if self._recorder is not None:
                     try:
                         self._recorder.write(cam)
                         if fo is not None and hasattr(fo, "record_timeline_frame"):
-                            fo.record_timeline_frame()
+                            fo.record_timeline_frame(capture_time=self.frame_time, core_frame=self.frame_idx,
+                                                     motion_thresh=self.warp_motion_thresh)
                     except Exception:
                         pass
 

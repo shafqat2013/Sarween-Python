@@ -25,7 +25,20 @@ const sceneTokens = participants.map((mini, index) => ({
   actor: {system: {attributes: {movement: {walk: 30}}}},
 }));
 sceneTokens.get = id => sceneTokens.find(token => token.id === id);
-const scene = {id: "new-scene", width: 1200, height: 800, grid: {type: 1, size: 100, distance: 5}, tokens: sceneTokens};
+let updateCount = 0;
+let rejectUpdate = false;
+let updateGate = null;
+const scene = {id: "new-scene", width: 1200, height: 800, grid: {type: 1, size: 100, distance: 5}, tokens: sceneTokens,
+  async updateEmbeddedDocuments(_type, updates, options) {
+    if (updateGate) await updateGate;
+    if (rejectUpdate) throw new Error("Simulated rejected update");
+    updateCount += 1;
+    for (const update of updates) {
+      const token = sceneTokens.get(update._id);
+      Object.assign(token, {x: update.x, y: update.y});
+      hooks.get("updateToken")(token, {x: update.x, y: update.y}, options);
+    }
+  }};
 const context = vm.createContext({
   console, crypto: {randomUUID: () => "test"},
   Hooks: {once() {}, on(name, callback) {hooks.set(name, callback);}},
@@ -39,7 +52,7 @@ const context = vm.createContext({
   setTimeout(callback) {callback(); return 1;}, clearTimeout() {},
 });
 const source = fs.readFileSync(new URL("../module.js", import.meta.url), "utf8");
-const module = new vm.SourceTextModule(source + '\n globalThis.moduleTest = {setSocket(value) {ws = value;}, getMovementState() {return movementState;}, captureRenderedReference};', {context});
+const module = new vm.SourceTextModule(source + '\n globalThis.moduleTest = {setSocket(value) {ws = value;}, getMovementState() {return movementState;}, captureRenderedReference, handlePythonMessage, dispatchPythonMessage};', {context});
 await module.link(specifier => {
   if (specifier.endsWith("capture_logic.mjs")) {
     return new vm.SyntheticModule(["CAPTURE_MINIS", "generateCaptureTargets"], function () {
@@ -80,3 +93,71 @@ assert.equal(sent[0].sceneId, "new-scene");
 assert.equal(snapshotDraws.length, 1);
 assert.deepEqual(snapshotDraws[0].slice(1), [28, 28, 1144, 744, 0, 0, 640, 360]);
 console.log("PASS: five-mini routes and scene-switch hooks");
+
+const socket = {readyState: 1, send(raw) {sent.push(JSON.parse(raw));}};
+context.moduleTest.setSocket(socket);
+hooks.get("controlToken")(sceneTokens[0], true);
+const command = {type: "moveToken", commandId: "move-1", sceneId: scene.id,
+  tokenId: "A", miniId: "red10", x: 100, y: 0};
+sent.length = 0;
+await context.moduleTest.handlePythonMessage(command);
+assert.equal(updateCount, 1);
+assert.equal(sent[0].type, "tokenMoveApplied");
+assert.equal(sent[0].commandId, "move-1");
+assert.equal(context.moduleTest.getMovementState().usedFeet, 5);
+await context.moduleTest.handlePythonMessage(command);
+assert.equal(updateCount, 1, "Retry must not repeat the update or animation");
+assert.equal(context.moduleTest.getMovementState().usedFeet, 5);
+rejectUpdate = true;
+sent.length = 0;
+const second = {...command, commandId: "move-2", x: 200};
+await context.moduleTest.handlePythonMessage(second);
+assert.equal(sent[0].type, "tokenMoveError");
+assert.equal(sent[0].commandId, second.commandId);
+rejectUpdate = false;
+sent.length = 0;
+await context.moduleTest.handlePythonMessage(second);
+assert.equal(sent[0].type, "tokenMoveApplied");
+assert.equal(sceneTokens[0].x, 200);
+sent.length = 0;
+await context.moduleTest.handlePythonMessage({...command, commandId: "stale-scene", sceneId: "old-scene"});
+assert.equal(sent[0].type, "tokenMoveError");
+assert.equal(sceneTokens[0].x, 200);
+sent.length = 0;
+await context.moduleTest.handlePythonMessage({...command, commandId: "deleted", tokenId: "missing"});
+assert.equal(sent[0].code, "tokenMissing");
+
+let release;
+updateGate = new Promise(resolve => {release = resolve;});
+const firstPending = context.moduleTest.dispatchPythonMessage({...command, commandId: "ordered-1", x: 300}, socket);
+const lastPending = context.moduleTest.dispatchPythonMessage({...command, commandId: "ordered-2", x: 400}, socket);
+await Promise.resolve();
+assert.equal(sceneTokens[0].x, 200);
+release();
+await Promise.all([firstPending, lastPending]);
+assert.equal(sceneTokens[0].x, 400, "Delayed updates must finish in wire order");
+await context.moduleTest.dispatchPythonMessage({...command, x: 500}, {});
+assert.equal(sceneTokens[0].x, 400, "Discard commands queued on an obsolete connection");
+console.log("PASS: move acknowledgements, idempotent retry, rejection, scene safety and serialized delivery");
+
+updateGate = null;
+const budgetBeforePan = context.moduleTest.getMovementState().usedFeet;
+const segmentsBeforePan = context.moduleTest.getMovementState().segments.length;
+const pan = {...command, commandId: "pan", x: 700, y: 200, source: "viewportTransform"};
+await context.moduleTest.handlePythonMessage(pan);
+assert.equal(context.moduleTest.getMovementState().usedFeet, budgetBeforePan);
+assert.equal(context.moduleTest.getMovementState().segments.length, segmentsBeforePan);
+assert.equal(context.moduleTest.getMovementState().points.at(-1).x, 700);
+assert.equal(context.moduleTest.getMovementState().points[0].x, 300);
+const updatesAfterPan = updateCount;
+await context.moduleTest.handlePythonMessage(pan);
+assert.equal(updateCount, updatesAfterPan);
+assert.equal(context.moduleTest.getMovementState().usedFeet, budgetBeforePan);
+await context.moduleTest.handlePythonMessage({...pan, commandId: "after-pan", x: 800, source: "detection"});
+assert.equal(context.moduleTest.getMovementState().usedFeet, budgetBeforePan + 5);
+const stateBeforeRejection = context.moduleTest.getMovementState();
+rejectUpdate = true;
+await context.moduleTest.handlePythonMessage({...pan, commandId: "rejected-pan", x: 900});
+assert.equal(context.moduleTest.getMovementState(), stateBeforeRejection);
+rejectUpdate = false;
+console.log("PASS: viewport remaps preserve budget/history, retries are harmless, real moves still count");

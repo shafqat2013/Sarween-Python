@@ -2,6 +2,7 @@
   "cases": [
     {
       "name": "sample_session_01",
+      "label_source": "example-only",
       "video": "../../sarween_rec_20260420_163421.mp4",
       "profiles": "../../combo_profiles.json",
       "grid": {

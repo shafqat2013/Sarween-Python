@@ -16,29 +16,24 @@ block_cipher = None
 # These are files Sarween reads at runtime (not imported as Python modules).
 # Format: (source_path, dest_folder_inside_app)
 added_files = [
-    ("band_profiles.json",      "."),   # HSV band definitions
-    ("hardware_config.json",    "."),   # camera index etc.
-    ("combo_profiles.json",     "."),   # live ring-color tracker profiles
-    ("mini_library.json",       "."),   # player mini metadata and scan portfolio
-    ("mini_token_map.json",     "."),   # Foundry token mapping
-    ("mini_database.csv",       "."),   # mini capture DB (may be empty)
+    ("auth_config.json",        "."),   # validated public configuration only
+    # Personal profiles, settings, calibration and captures never ship in the app.
     ("module.js",               "."),   # Foundry module JS
     ("capture_logic.mjs",       "."),   # guided dataset capture rules
     ("movement_logic.mjs",      "."),   # movement budget state machine
     ("module.json",             "."),   # Foundry module manifest
     ("tk_camera_preview.py",    "."),   # Tkinter camera preview window
     ("maps/dnd1.jpg",           "maps"),# demo map only
+    ("demo",                   "demo"),# synthetic footage, never personal recordings
 ]
 
 # ── Hidden imports ─────────────────────────────────────────────────────────────
 # PyInstaller's static analysis misses some imports (dynamic imports, plugins).
 hidden = [
+    "keyring.backends.macOS",
+    "jwt.algorithms",
     # OpenCV internals
     "cv2",
-    # band/blob engines are imported dynamically in main.py
-    "band_tracking",
-    "blob_tracking",
-    "alt_band_tracking",
     # tk_camera_preview new dependency
     "tk_camera_preview",
     "PIL",
@@ -52,8 +47,7 @@ hidden = [
     "tkinter.ttk",
     "tkinter.messagebox",
     "tkinter.filedialog",
-    # numpy / scipy internals sometimes missed
-    "numpy.core._methods",
+    # The NumPy hook collects version-specific private modules.
     "numpy.lib.format",
 ]
 
@@ -119,8 +113,8 @@ app = BUNDLE(
         # ── App metadata ───────────────────────────────────────────────────
         "CFBundleName":                 "Sarween",
         "CFBundleDisplayName":          "Sarween",
-        "CFBundleVersion":              "0.1.0",
-        "CFBundleShortVersionString":   "0.1.0",
+        "CFBundleVersion":              "0.2.0",
+        "CFBundleShortVersionString":   "0.2.0",
         "LSMinimumSystemVersion":       "12.0",     # Monterey+
         "NSHighResolutionCapable":      True,
         "NSRequiresAquaSystemAppearance": False,    # allow dark mode

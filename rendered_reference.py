@@ -18,6 +18,7 @@ import cv_core
 import foundryoutput as fo
 import v3_tracking as tracking
 from mini_calibration import load_profiles_with_curves
+from app_paths import data_path
 from tracking_regression import FoundryTimelineReplay
 
 
@@ -95,7 +96,7 @@ def compare_video(video_path: Path, timeline_path: Path, max_frames: int | None 
     timeline.apply_through(0)
     profiles_path = video_path.with_suffix(".profiles.json")
     if not profiles_path.exists():
-        profiles_path = Path(__file__).with_name("combo_profiles.json")
+        profiles_path = data_path("combo_profiles.json")
     profiles = load_profiles_with_curves(profiles_path)
     prev_state = {}
     sess = cv_core.CVCoreSession(

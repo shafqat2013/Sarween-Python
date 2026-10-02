@@ -118,6 +118,29 @@ class FoundryViewTransformTest(unittest.TestCase):
         self.assertEqual(revision, start + 1)
         self.assertEqual(foundry.get_scene_visual_revision(), start + 1)
 
+    def test_tracking_context_freezes_mapping_until_next_frame(self):
+        from types import SimpleNamespace
+        from v3_tracking import tracking_context
+        frame = SimpleNamespace(warp_w=1001, warp_h=801, grid_w=20, grid_h=16, marker_mode="viewport")
+        foundry.set_view_transform(self.payload())
+        before = tracking_context(frame, now=0)
+        foundry.set_view_transform(self.payload(canvasTransform={"a": 1, "b": 0, "c": 0, "d": 1,
+                                                                 "tx": -50, "ty": 0}))
+        after = tracking_context(frame, now=1)
+        self.assertEqual(before.to_cell(25, 25), (2, 1))
+        self.assertEqual(after.to_cell(25, 25), (3, 1))
+        self.assertNotEqual(before.view_revision, after.view_revision)
+
+    def test_legacy_context_still_resets_on_scene_switch(self):
+        from types import SimpleNamespace
+        from v3_tracking import tracking_context
+        frame = SimpleNamespace(warp_w=1000, warp_h=800, grid_w=20, grid_h=16, marker_mode="legacy")
+        before = tracking_context(frame, now=0)
+        foundry.set_scene_params("different-scene", 1000, 800, 50)
+        after = tracking_context(frame, now=1)
+        self.assertNotEqual(before.scene_key, after.scene_key)
+        self.assertEqual(after.to_cell(25, 25), (0, 0))
+
     def test_scene_switch_recalculates_grid_and_discards_old_view(self):
         foundry.set_view_transform(self.payload())
         foundry.set_scene_params("new-map", 2400, 1350, 50)

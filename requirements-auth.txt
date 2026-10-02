@@ -1,0 +1,6 @@
+# Install alongside Sarween's existing camera/UI environment.
+supabase-auth==2.31.0
+httpx==0.28.1
+PyJWT[crypto]==2.15.1
+cryptography==50.0.2
+keyring==25.6.0

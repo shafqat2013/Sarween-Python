@@ -49,6 +49,22 @@ export function resetMovementAt(state, point) {
   };
 }
 
+export function rebaseMovementAt(state, point) {
+  const next = normalizePoint(point);
+  const previous = state.points.at(-1);
+  const shift = Object.fromEntries(Object.keys(next).map(key => [key, next[key] - previous[key]]));
+  const points = state.points.map(value => Object.fromEntries(
+    Object.keys(next).map(key => [key, value[key] + shift[key]]),
+  ));
+  return {
+    ...state,
+    points,
+    segments: state.segments.map((segment, index) => ({
+      ...segment, from: points[index], to: points[index + 1],
+    })),
+  };
+}
+
 export function remainingMovement(state) {
   return Math.max(0, Number(state?.budgetFeet || 0) - Number(state?.usedFeet || 0));
 }

@@ -39,6 +39,9 @@ class GuidedCaptureTest(unittest.TestCase):
         case = regression_case(data, "capture.mp4")["cases"][0]
         expected = case["expectations"][0]
         self.assertEqual(expected["between"], [1.0, 5.0])
+        self.assertEqual(expected["confirmed_at"], 2.0)
+        self.assertEqual(case["profiles"], "capture.profiles.json")
+        self.assertEqual(case["label_source"], "user-confirmed")
         event = regression.MovementEvent("red10", None, "A3", 30, 3, None, "r2c0", 0, 1)
         self.assertTrue(regression._event_matches_expectation(event, expected, 2))
         event.time_seconds = 6

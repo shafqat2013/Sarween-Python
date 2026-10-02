@@ -1,5 +1,7 @@
 import unittest
+from itertools import permutations
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -145,6 +147,32 @@ class PresenceTrackingTest(unittest.TestCase):
                 prev_state=state,
             )
         self.assertIsNotNone(detections["red"])
+
+    def check_candidates(self, candidates, order):
+        def find(_lab, _index, name, *args, **kwargs):
+            x, y, score = candidates[name]
+            return [tracking.ComboDetection(name, x, y, 1, 500, .9, score,
+                                            (0, 0, 25, 25), (50, 30, 30))]
+        profiles = {name: {} for name in order}
+        state = {name: self.settled_state(last_xy=(10, 10)) for name in profiles}
+        with patch.object(tracking, "_find_presence_candidates", find):
+            return tracking.detect_minis(self.bundle(self.frame()), profiles, self.GRID_PX, state)
+
+    def test_rejected_candidate_cannot_eliminate_third_mini(self):
+        candidates = {"A": (90, 90, .8), "B": (106, 90, .9), "C": (74, 90, .7)}
+        for order in permutations(candidates):
+            with self.subTest(order=order):
+                detections, state = self.check_candidates(candidates, order)
+                self.assertEqual({name for name, det in detections.items() if det}, {"B", "C"})
+                self.assertEqual(state["A"]["pending_hits"], 0)
+                self.assertEqual(state["A"]["last_xy"], (10, 10))
+
+    def test_five_mini_survivors_are_order_independent_including_ties(self):
+        candidates = {"A": (40, 40, .8), "B": (40, 40, .8), "C": (110, 40, .7),
+                      "D": (40, 110, .7), "E": (110, 110, .7)}
+        for order in permutations(candidates):
+            detections, _ = self.check_candidates(candidates, order)
+            self.assertEqual({name for name, det in detections.items() if det}, {"A", "C", "D", "E"})
 
 
 if __name__ == "__main__":

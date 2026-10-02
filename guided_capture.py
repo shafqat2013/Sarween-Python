@@ -85,6 +85,7 @@ def regression_case(data, video_name):
             "mini": mini,
             "to": event["cell"],
             "between": [event["promptFrame"] / fps, event["frame"] / fps + 3.0],
+            "confirmed_at": event["frame"] / fps,
         }
         if mini in previous:
             expectation["from"] = previous[mini]
@@ -95,7 +96,9 @@ def regression_case(data, video_name):
             "name": video_name.removesuffix(".mp4"),
             "video": video_name,
             "timeline": video_name.removesuffix(".mp4") + ".tracking.json",
-            "profiles": "combo_profiles.json",
+            "profiles": video_name.removesuffix(".mp4") + ".profiles.json",
+            "label_source": "user-confirmed",
+            "capture_complete": bool(data.get("captureComplete", False)),
             "allow_unexpected": False,
             "expectations": expectations,
         }]

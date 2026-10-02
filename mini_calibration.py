@@ -31,12 +31,14 @@ import numpy as np
 import setup as s
 import cv_core as core
 import calibration as cal
+from ring_calibration import sample_ring_patch, merge_profiles
+from app_paths import data_path, initialize_user_data
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-_PROFILES_PATH = Path(__file__).with_name("combo_profiles.json")
+_PROFILES_PATH = data_path("combo_profiles.json")
 
 BRIGHTNESS_STEPS = [255, 200, 150, 100, 60, 30, 0]
 SETTLE_TIME = 2.5
@@ -131,14 +133,7 @@ def _generate_calibration_image(
     for i, (wx0, wy0, wx1, wy1, tx, ty) in enumerate(corners):
         img[wy0:wy1, wx0:wx1] = 255  # white quiet zone
 
-        path = os.path.join(cal.MARKERS_DIR, f"marker_{i}.png")
-        if not os.path.exists(path):
-            print(f"MINI_CAL | Warning: marker tile {path} not found")
-            continue
-        tile = cv2.imread(path, cv2.IMREAD_COLOR)
-        if tile is None:
-            continue
-        tile = cv2.resize(tile, (cell_px, cell_px), interpolation=cv2.INTER_NEAREST)
+        tile = cal.make_aruco_marker_tile(i, cell_px, cal._compute_border_px(cell_px))
         img[ty:ty+cell_px, tx:tx+cell_px] = tile
 
     return img
@@ -238,25 +233,46 @@ class BlobLabeler:
     def __init__(self):
         self.blobs: List = []
         self.labels: Dict[int, str] = {}
+        self.sample_points: Dict[int, Tuple[int, int]] = {}
         self._pending_idx: Optional[int] = None
         self._input_text: str = ""
         self._input_active: bool = False
         self.done: bool = False
 
     def set_blobs(self, blobs):
-        self.blobs = blobs
+        if self._input_active:
+            return
+        if not self.labels:
+            self.blobs = blobs
+            return
+        # Labeled minis stay put during capture setup. Preserve their identities
+        # while allowing the next moved mini to appear in the motion mask.
+        indices = sorted(self.labels)
+        retained = [self.blobs[index] for index in indices]
+        self.labels = {new: self.labels[old] for new, old in enumerate(indices)}
+        self.sample_points = {new: self.sample_points[old] for new, old in enumerate(indices)
+                              if old in self.sample_points}
+        for blob in blobs:
+            _, x, y, area, _ = blob
+            if not any(math.hypot(x - old[1], y - old[2]) <= math.sqrt(max(area, old[3]) / math.pi)
+                       for old in retained):
+                retained.append(blob)
+        self.blobs = retained
 
     def on_mouse(self, event, x, y, flags, param):
         if event != cv2.EVENT_LBUTTONDOWN or self._input_active:
             return
         best_idx, best_dist = None, float("inf")
         for i, (cnt, cx, cy, area, circ) in enumerate(self.blobs):
+            if cv2.pointPolygonTest(cnt, (float(x), float(y)), False) < 0:
+                continue
             d = math.hypot(x - cx, y - cy)
             if d < best_dist:
                 best_dist = d
                 best_idx = i
         if best_idx is not None and best_dist < 120:
             self._pending_idx = best_idx
+            self.sample_points[best_idx] = (x, y)
             self._input_text = self.labels.get(best_idx, "")
             self._input_active = True
 
@@ -302,6 +318,8 @@ class BlobLabeler:
             else:
                 color, thickness = (180, 180, 0), 1
             cv2.drawContours(vis, [cnt.astype(np.int32)], -1, color, thickness)
+            if i in self.sample_points:
+                cv2.circle(vis, self.sample_points[i], 4, (255, 0, 255), 1)
             label = (self._input_text + "|") if is_selected else self.labels.get(i, "?")
             cv2.putText(vis, label, (int(cx)+6, int(cy)-6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,0), 2, cv2.LINE_AA)
@@ -327,11 +345,19 @@ class BlobLabeler:
 # Main entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _calibration_session(camera_index, scene_w, scene_h):
+    return core.CVCoreSession(camera_index=camera_index, marker_mode="legacy",
+                              warp_w=scene_w, warp_h=scene_h,
+                              grid_w=getattr(s, "grid_cols", 23),
+                              grid_h=getattr(s, "grid_rows", 16))
+
+
 def run_mini_calibration(camera_index: Optional[int] = None) -> bool:
     """
     Run full mini calibration. Returns True on success, False on cancel.
     Saves results to combo_profiles.json.
     """
+    initialize_user_data()
     # ── Screen dimensions ────────────────────────────────────────────────────
     sel = s.load_last_selection() or {}
     display_idx = sel.get("display_index", 0)
@@ -408,7 +434,9 @@ def run_mini_calibration(camera_index: Optional[int] = None) -> bool:
     _cam_idx = camera_index if camera_index is not None else (
         (s.load_last_selection() or {}).get("webcam_index", 0))
     print(f"MINI_CAL | Starting camera (index {_cam_idx})...")
-    sess = core.CVCoreSession(camera_index=camera_index)
+    # This dedicated calibration image owns its registration, not Foundry's
+    # hidden viewport overlay. Keep its explicit geometry and IDs together.
+    sess = _calibration_session(camera_index, scene_w, scene_h)
 
     # Camera is open — now create the labeling window. Qt event loop is free
     # and will assign a valid native handle immediately.
@@ -518,10 +546,13 @@ def run_mini_calibration(camera_index: Optional[int] = None) -> bool:
 
             # Wait for settle
             settle_start = time.perf_counter()
+            last_bundle = None
             for bundle in sess.frames():
                 cv2.waitKey(1)
                 if bundle.locked and bundle.warp_bgr is not None:
                     last_bundle = bundle
+                else:
+                    last_bundle = None
                 if time.perf_counter() - settle_start >= SETTLE_TIME:
                     break
 
@@ -532,7 +563,7 @@ def run_mini_calibration(camera_index: Optional[int] = None) -> bool:
 
             for idx, (cx, cy, area) in blob_info.items():
                 name = labeler.labels[idx]
-                lab = _sample_lab(last_bundle.warp_bgr, cx, cy, area)
+                lab = sample_ring_patch(last_bundle.warp_bgr, labeler.sample_points.get(idx))
                 curves[name].append(lab)
                 if lab:
                     print(f"MINI_CAL |   {name}: L={lab[0]:.1f} a={lab[1]:.1f} b={lab[2]:.1f}")
@@ -566,7 +597,10 @@ def run_mini_calibration(camera_index: Optional[int] = None) -> bool:
             }
             print(f"MINI_CAL | Saved '{name}' with {len(valid)} valid samples")
 
-        _PROFILES_PATH.write_text(json.dumps(profiles, indent=2), encoding="utf-8")
+        if not profiles:
+            print("MINI_CAL | No valid ring samples; existing profiles unchanged")
+            return False
+        merge_profiles(profiles, _PROFILES_PATH)
         print(f"MINI_CAL | Profiles saved to {_PROFILES_PATH}")
 
         # Restore full brightness
@@ -637,6 +671,7 @@ if __name__ == "__main__":
     parser.add_argument("-c", "--camera", type=int, default=None,
                         help="Camera index to use (default: read from hardware_config.json)")
     args = parser.parse_args()
+    initialize_user_data()
 
     def _run_foundry():
         asyncio.run(fo.main())

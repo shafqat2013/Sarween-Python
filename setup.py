@@ -11,12 +11,22 @@ import time
 import tkinter as tk
 from tkinter import ttk
 from screeninfo import get_monitors
+from app_paths import atomic_write_json, data_path, initialize_user_data, resource_path, saved_map_path
+
+
+def _get_persistent_root() -> tk.Tk:
+    if not hasattr(_get_persistent_root, "_root"):
+        root = tk.Tk()
+        root.withdraw()
+        root.title("Sarween")
+        _get_persistent_root._root = root
+    return _get_persistent_root._root
 
 # ===========================
 # CONFIGURATION
 # ===========================
-CONFIG_FILE = "hardware_config.json"
-MAPS_DIR = "maps"
+CONFIG_FILE = str(data_path("hardware_config.json"))
+MAPS_DIR = resource_path("maps")
 MAP_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
 MODE_SELF_HOSTED = "self_hosted"
@@ -48,6 +58,8 @@ def load_last_selection():
         try:
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
+                if isinstance(data, dict) and data.get("map_path"):
+                    data["map_path"] = saved_map_path(data["map_path"])
                 return data if isinstance(data, dict) else {}
         except Exception:
             pass
@@ -64,8 +76,7 @@ def save_last_selection(display_index=None, webcam_index=None, mode=None, map_pa
         data["mode"] = str(mode)
     if map_path is not None:
         data["map_path"] = str(map_path)
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(data, f)
+    atomic_write_json(CONFIG_FILE, data)
 
 
 config_data = load_last_selection()
@@ -90,7 +101,8 @@ def detect_setup():
         result = subprocess.run(
             ["system_profiler", "SPDisplaysDataType"],
             capture_output=True,
-            text=True
+            text=True,
+            timeout=10,
         )
 
         resolutions = re.findall(r"Resolution:\s+(\d+) x (\d+)", result.stdout)
@@ -106,6 +118,8 @@ def detect_setup():
     except Exception:
         displays = detect_displays_backup()
 
+    if not displays:
+        displays = detect_displays_backup()
     webcams = detect_webcams_backup()
     return displays, webcams
 
@@ -127,14 +141,16 @@ def detect_webcams_backup():
     webcams = []
     for i in range(6):
         cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            webcams.append({
-                "index": i,
-                "model": f"Webcam {i}",
-                "resolution": f"{width}x{height}"
-            })
+        try:
+            if cap.isOpened():
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                webcams.append({
+                    "index": i,
+                    "model": f"Webcam {i}",
+                    "resolution": f"{width}x{height}"
+                })
+        finally:
             cap.release()
     return webcams
 
@@ -197,7 +213,11 @@ def unified_selection_window(displays, webcams, default_display_index=None,
     selection = {"value": None}
 
     def submit():
+        if display_combo.current() < 0 or webcam_combo.current() < 0:
+            return
         sel_mode = MODE_LABEL_TO_VALUE[mode_combo.get()]
+        if sel_mode == MODE_SELF_HOSTED and map_combo.current() < 0:
+            return
         sel_map = None
         if sel_mode == MODE_SELF_HOSTED and map_files and map_combo.current() >= 0:
             sel_map = map_files[map_combo.current()]
@@ -214,7 +234,8 @@ def unified_selection_window(displays, webcams, default_display_index=None,
         window.destroy()
 
     def preview_webcam():
-        preview_webcam_device(cam_device_by_pos[webcam_combo.current()])
+        if webcam_combo.current() >= 0:
+            preview_webcam_device(cam_device_by_pos[webcam_combo.current()])
 
     def on_mode_change(event=None):
         sel_mode = MODE_LABEL_TO_VALUE.get(mode_combo.get(), MODE_SELF_HOSTED)
@@ -224,10 +245,18 @@ def unified_selection_window(displays, webcams, default_display_index=None,
         else:
             map_combo.configure(state="readonly" if map_options else "disabled")
             map_label.configure(state="normal")
+        available = display_combo.current() >= 0 and webcam_combo.current() >= 0
+        map_available = sel_mode == MODE_FOUNDRY or map_combo.current() >= 0
+        select_button.configure(state="normal" if available and map_available else "disabled")
+        selection_status.set(
+            "No camera detected" if not webcams else
+            "No display detected" if not displays else
+            "No self-hosted map available" if not map_available else "")
 
-    window = tk.Tk()
+    root = _get_persistent_root()
+    window = tk.Toplevel(root)
     window.title("Sarween Setup")
-    window.geometry("520x320")
+    window.geometry("520x360")
     window.resizable(False, False)
     window.bind("<Escape>", cancel)
 
@@ -242,12 +271,16 @@ def unified_selection_window(displays, webcams, default_display_index=None,
     display_combo.grid(row=0, column=1)
     if default_display_index in disp_index_by_pos:
         display_combo.current(disp_index_by_pos.index(default_display_index))
+    elif disp_options:
+        display_combo.current(0)
 
     ttk.Label(frame, text="Webcam").grid(row=1, column=0, sticky="e", padx=10)
     webcam_combo = ttk.Combobox(frame, values=cam_options, state="readonly", width=40)
     webcam_combo.grid(row=1, column=1)
     if default_webcam_device_index in cam_device_by_pos:
         webcam_combo.current(cam_device_by_pos.index(default_webcam_device_index))
+    elif cam_options:
+        webcam_combo.current(0)
 
     ttk.Label(frame, text="Mode").grid(row=2, column=0, sticky="e", padx=10)
     mode_combo = ttk.Combobox(frame, values=mode_options, state="readonly", width=40)
@@ -273,16 +306,19 @@ def unified_selection_window(displays, webcams, default_display_index=None,
     else:
         map_combo.configure(state="disabled")
 
-    on_mode_change()
-
     btns = ttk.Frame(window)
     btns.pack(pady=10)
 
-    ttk.Button(btns, text="Preview Webcam", command=preview_webcam).pack(side=tk.LEFT, padx=5)
-    ttk.Button(btns, text="Select", command=submit).pack(side=tk.LEFT, padx=5)
+    ttk.Button(btns, text="Preview Webcam", command=preview_webcam,
+               state="normal" if webcams else "disabled").pack(side=tk.LEFT, padx=5)
+    select_button = ttk.Button(btns, text="Select", command=submit)
+    select_button.pack(side=tk.LEFT, padx=5)
     ttk.Button(btns, text="Cancel", command=cancel).pack(side=tk.LEFT, padx=5)
+    selection_status = tk.StringVar(master=window)
+    ttk.Label(window, textvariable=selection_status).pack(pady=6)
+    on_mode_change()
 
-    window.mainloop()
+    root.wait_window(window)
     return selection["value"]
 
 
@@ -292,19 +328,21 @@ def unified_selection_window(displays, webcams, default_display_index=None,
 
 def initialize():
     """
-    If the user cancels setup, EXIT THE PROGRAM.
+    Raise SystemExit on cancel; the application returns to its home window.
     """
     global selected_display, selected_webcam, selected_mode
 
+    initialize_user_data()
+    selection = load_last_selection()
     displays, webcams = detect_setup()
 
     sel = unified_selection_window(
         displays=displays,
         webcams=webcams,
-        default_display_index=last_display_index,
-        default_webcam_device_index=last_webcam_device_index,
-        default_mode=last_mode,
-        default_map_path=last_map_path
+        default_display_index=selection.get("display_index"),
+        default_webcam_device_index=selection.get("webcam_index"),
+        default_mode=selection.get("mode", MODE_SELF_HOSTED),
+        default_map_path=selection.get("map_path")
     )
 
     if sel is None:

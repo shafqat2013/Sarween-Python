@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import json
+from app_paths import atomic_write_json, data_path, initialize_user_data
 import math
 import time
 import random
@@ -182,13 +183,19 @@ def detect_bands(
     color_profiles: Dict[str, ColorProfile],
     grid_px: float,
     prev_state: Optional[Dict[str, Any]] = None,
-    motion_mask: Optional[np.ndarray] = None,  # unused, kept for API compat
+    motion_mask: Optional[np.ndarray] = None,
 ) -> Tuple[Dict[str, Optional[BandDetection]], Dict[str, Any]]:
     """
-    Full-frame HSV detection every frame — no motion gating.
-    For each color profile, find the best matching blob in the whole warp image.
-    Distance from last known position is the primary disambiguation signal,
-    so each color naturally sticks to its mini even when multiple are present.
+    Two-mode detection per color:
+
+    SEARCHING — motion pixels exist on the board.
+                Hard-gate HSV detection to the motion region only.
+                Find the best color-matching blob inside that window.
+
+    HOLDING   — no motion anywhere (minis are stationary).
+                Do NOT scan the whole board — that causes false positives.
+                Hold the last known position from prev_state and emit a
+                synthetic detection so consensus keeps ticking correctly.
     """
     if prev_state is None:
         prev_state = {}
@@ -199,17 +206,93 @@ def detect_bands(
 
     expected_radius = 0.5 * grid_px
     expected_area = math.pi * expected_radius * expected_radius * 0.55
+
     min_area = (grid_px * grid_px) * 0.05
     max_area = (grid_px * grid_px) * 2.00
+
+    # Build ring-annulus search windows from motion contours.
+    # We don't just dilate the whole motion mask — that covers the entire mini
+    # body and lets non-ring color blobs through.  Instead, for each motion
+    # contour we erode its filled mask to get the interior, subtract to get the
+    # outer ring border, and use that as the search region.  This means the HSV
+    # match only fires on the actual band pixels, not the mini body.
+    any_motion = False
+    motion_search: Optional[np.ndarray] = None
+    if motion_mask is not None:
+        any_motion = cv2.countNonZero(motion_mask) > 0
+        if any_motion:
+            # Find contours of the motion blobs
+            cnts_info = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            motion_cnts = cnts_info[0] if len(cnts_info) == 2 else cnts_info[1]
+
+            ring_map = np.zeros(motion_mask.shape[:2], dtype=np.uint8)
+            for mc in motion_cnts:
+                mc_area = float(cv2.contourArea(mc))
+                if mc_area < 4:
+                    continue
+
+                # Work on a tight crop around the contour — avoids eroding a
+                # full 1280×720 image with a potentially huge kernel each frame.
+                bx, by, bw, bh = cv2.boundingRect(mc)
+                pad = 4
+                x0 = max(0, bx - pad)
+                y0 = max(0, by - pad)
+                x1 = min(motion_mask.shape[1], bx + bw + pad)
+                y1 = min(motion_mask.shape[0], by + bh + pad)
+
+                crop_h, crop_w = y1 - y0, x1 - x0
+                filled_crop = np.zeros((crop_h, crop_w), dtype=np.uint8)
+                shifted = mc.astype(np.int32) - np.array([[[x0, y0]]])
+                cv2.drawContours(filled_crop, [shifted], -1, 255, thickness=-1)
+
+                equiv_r = math.sqrt(mc_area / math.pi)
+                ring_thickness = max(2, int(round(equiv_r * 0.90)))
+                # Cap kernel to crop size so erode doesn't exceed the image
+                ring_thickness = min(ring_thickness, min(crop_h, crop_w) // 2 - 1)
+                k = max(3, ring_thickness * 2 + 1)
+                ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+                interior_crop = cv2.erode(filled_crop, ek, iterations=1)
+                ring_crop = cv2.subtract(filled_crop, interior_crop)
+                ring_crop = cv2.dilate(ring_crop, None, iterations=2)
+
+                ring_map[y0:y1, x0:x1] = cv2.bitwise_or(
+                    ring_map[y0:y1, x0:x1], ring_crop
+                )
+
+            motion_search = ring_map if cv2.countNonZero(ring_map) > 0 else \
+                cv2.dilate(motion_mask, None, iterations=4)  # fallback for tiny blobs
 
     for color_name, profile in color_profiles.items():
         prev = prev_state.get(color_name, {})
         prev_xy: Optional[Tuple[float, float]] = prev.get("last_xy")
 
+        # ── HOLDING: no motion → hold last known position ──────────────────
+        if not any_motion:
+            if prev_xy is not None:
+                px, py = prev_xy
+                half = grid_px * 0.5
+                synth = BandDetection(
+                    color_name=color_name,
+                    cx=px, cy=py,
+                    contour_area=expected_area,
+                    circularity=1.0,
+                    ellipse_eccentricity=0.0,
+                    score=1.0,
+                    bbox=(int(px - half), int(py - half), int(half * 2), int(half * 2)),
+                )
+                detections[color_name] = synth
+                new_state[color_name] = {"last_xy": prev_xy, "last_score": 1.0}
+            else:
+                detections[color_name] = None
+                new_state[color_name] = {"last_xy": None, "last_score": 0.0}
+            continue
+
+        # ── SEARCHING: restrict HSV detection to motion region ─────────────
         color_mask = _mask_for_profile(hsv, profile)
         color_mask = _cleanup_mask(color_mask, grid_px)
+        search_mask = cv2.bitwise_and(color_mask, motion_search)
 
-        cnts_info = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts_info = cv2.findContours(search_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cnts = cnts_info[0] if len(cnts_info) == 2 else cnts_info[1]
 
         best: Optional[BandDetection] = None
@@ -263,30 +346,32 @@ def detect_bands(
         if best is not None:
             new_state[color_name] = {"last_xy": (best.cx, best.cy), "last_score": float(best.score)}
         else:
+            # Motion exists but this color wasn't in it — hold last position
             new_state[color_name] = {"last_xy": prev_xy, "last_score": 0.0}
 
-    # ── Spatial exclusivity: if two colors land on the same spot, higher score wins ──
-    color_names = list(detections.keys())
-    conflict_threshold = grid_px * 1.0
-    nulled: set = set()
-    for i in range(len(color_names)):
-        for j in range(i + 1, len(color_names)):
-            a_name, b_name = color_names[i], color_names[j]
-            if a_name in nulled or b_name in nulled:
-                continue
-            a_det = detections[a_name]
-            b_det = detections[b_name]
-            if a_det is None or b_det is None:
-                continue
-            if math.hypot(a_det.cx - b_det.cx, a_det.cy - b_det.cy) < conflict_threshold:
-                if a_det.score >= b_det.score:
-                    detections[b_name] = None
-                    new_state[b_name]["last_xy"] = prev_state.get(b_name, {}).get("last_xy")
-                    nulled.add(b_name)
-                else:
-                    detections[a_name] = None
-                    new_state[a_name]["last_xy"] = prev_state.get(a_name, {}).get("last_xy")
-                    nulled.add(a_name)
+    # ── Spatial exclusivity (only during SEARCHING) ─────────────────────────
+    if any_motion:
+        color_names = list(detections.keys())
+        conflict_threshold = grid_px * 1.0
+        nulled: set = set()
+        for i in range(len(color_names)):
+            for j in range(i + 1, len(color_names)):
+                a_name, b_name = color_names[i], color_names[j]
+                if a_name in nulled or b_name in nulled:
+                    continue
+                a_det = detections[a_name]
+                b_det = detections[b_name]
+                if a_det is None or b_det is None:
+                    continue
+                if math.hypot(a_det.cx - b_det.cx, a_det.cy - b_det.cy) < conflict_threshold:
+                    if a_det.score >= b_det.score:
+                        detections[b_name] = None
+                        new_state[b_name]["last_xy"] = prev_state.get(b_name, {}).get("last_xy")
+                        nulled.add(b_name)
+                    else:
+                        detections[a_name] = None
+                        new_state[a_name]["last_xy"] = prev_state.get(a_name, {}).get("last_xy")
+                        nulled.add(a_name)
 
     return detections, new_state
 
@@ -458,13 +543,13 @@ def _profiles_to_jsonable(profiles: Dict[str, ColorProfile]) -> Dict[str, dict]:
 
 
 def save_profiles(path: Path, profiles: Dict[str, ColorProfile]) -> None:
-    path.write_text(json.dumps(_profiles_to_jsonable(profiles), indent=2), encoding="utf-8")
+    atomic_write_json(path, _profiles_to_jsonable(profiles))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Profiles loading
 # ──────────────────────────────────────────────────────────────────────────────
 
-_PROFILES_PATH = Path(__file__).with_name("band_profiles.json")
+_PROFILES_PATH = data_path("band_profiles.json")
 
 def _load_profiles(path: Path = _PROFILES_PATH) -> Dict[str, ColorProfile]:
     if not path.exists():
@@ -727,6 +812,7 @@ def begin_session(
     Band-tracking session runner. Uses cv_core for lock/warp/masks.
     Emits mini_id=color_name.
     """
+    initialize_user_data()
     sel = s.load_last_selection() or {}
     mode = (sel.get("mode") or "self_hosted").strip().lower()
 
@@ -886,6 +972,7 @@ def begin_session(
                     missing_ids=list(bundle.last_missing_ids),
                 )
                 if bundle.locked and not _ever_locked:
+                    # Brief pause so the user sees the "✅ lock acquired" message
                     import time as _t; _t.sleep(0.6)
                     cam_preview.close()
                     cam_preview = None

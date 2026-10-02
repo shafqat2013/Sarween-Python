@@ -6,21 +6,22 @@ import json
 import math
 import re
 import threading
+import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
 import websockets
 from guided_capture import GuidedCapture, regression_case
+from foundry_delivery import MoveOutbox
+from app_paths import atomic_write_json, data_path, initialize_user_data
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Foundry configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
-# SCENE_ID is not hardcoded — it is populated when Foundry sends sceneInfo on
-# connect (see recv_loop / set_scene_params). Moves queued before sceneInfo
-# arrives will use whatever value is set here at that point; in practice the
-# module.js sends sceneInfo proactively on open so the window is very small.
+# Scene-scoped intentions are only accepted after geometry is known. Reconnects
+# retain them, but a scene/grid change discards them before tracking re-emits.
 SCENE_ID = ""
 
 # Default token (used if we can't resolve a specific mapping)
@@ -33,7 +34,7 @@ MINI_TO_TOKEN = {}
 SCENE_TOKEN_NAMES = {}
 
 # Persist mappings across runs
-MAP_PATH = Path(__file__).with_name("mini_token_map.json")
+MAP_PATH = data_path("mini_token_map.json")
 
 # Foundry scene size (fallback defaults; can be overridden by sceneInfo)
 SCENE_W = 1656   # dnd1.jpg width
@@ -51,7 +52,11 @@ _grid_cols = 23
 _grid_rows = 16
 
 # Async bits
-_move_queue: asyncio.Queue | None = None
+_delivery = MoveOutbox()
+_active_socket = None
+_connection_ready = False
+_protocol_ready = False
+_connection_error = ""
 _assign_queue: asyncio.Queue | None = None
 _ctrl_queue: asyncio.Queue | None = None  # NEW: control messages (getSceneInfo, etc.)
 _loop: asyncio.AbstractEventLoop | None = None
@@ -99,7 +104,7 @@ def _load_mapping() -> None:
 
 def _save_mapping() -> None:
     try:
-        MAP_PATH.write_text(json.dumps(MINI_TO_TOKEN, indent=2), encoding="utf-8")
+        atomic_write_json(MAP_PATH, MINI_TO_TOKEN)
         print(f"FoundryOutput | Saved mini→token mappings to {MAP_PATH}")
     except Exception as e:
         print("FoundryOutput | Failed to save mapping:", e)
@@ -148,7 +153,8 @@ def set_scene_params(scene_id=None, scene_w=None, scene_h=None, grid_px=None, sh
         new_h        != SCENE_H  or
         new_grid_px  != GRID_PX  or
         new_shift_x  != SHIFT_X  or
-        new_shift_y  != SHIFT_Y
+        new_shift_y  != SHIFT_Y or
+        (grid_type is not None and int(grid_type) != GRID_TYPE)
     )
 
     SCENE_ID = new_scene_id
@@ -174,12 +180,46 @@ def set_scene_params(scene_id=None, scene_w=None, scene_h=None, grid_px=None, sh
                 _capture_commands.append({"action": "stop", "reason": "sceneChanged"})
 
     if changed:
+        _delivery.set_context(_scene_context())
         print(
             "FoundryOutput | Scene params updated: "
             f"sceneId={SCENE_ID} size={SCENE_W}x{SCENE_H} "
             f"gridPx={GRID_PX} shift=({SHIFT_X},{SHIFT_Y})"
             + (f" gridType={grid_type}" if grid_type is not None else "")
         )
+
+
+def _scene_context():
+    return (SCENE_ID, SCENE_W, SCENE_H, GRID_PX, SHIFT_X, SHIFT_Y, GRID_TYPE)
+
+
+def get_delivery_status() -> dict:
+    moves = _delivery.snapshot()
+    failed = [name for name, move in moves.items() if move["state"] == "failed"]
+    assignments = [name for name, move in moves.items() if move["state"] == "assignment"]
+    pending = [name for name, move in moves.items() if move["state"] != "confirmed"]
+    if tracking_output_paused():
+        message = "Tracking paused"
+    elif _connection_error:
+        message = _connection_error
+    elif _active_socket is None:
+        message = f"Disconnected; {len(pending)} pending" if pending else "Disconnected"
+    elif not _connection_ready:
+        message = "Waiting for scene and module handshake"
+    elif failed:
+        message = "Move failed: " + ", ".join(failed)
+    elif assignments:
+        message = "Assignment needed: " + ", ".join(assignments)
+    elif pending:
+        message = f"{len(pending)} move(s) awaiting confirmation"
+    else:
+        message = "Moves confirmed" if moves else "Ready"
+    return {"connected": _active_socket is not None, "message": message,
+            "retryAvailable": bool(failed or assignments), "moves": moves}
+
+
+def retry_failed_moves():
+    _delivery.retry()
 
 def get_scene_params() -> dict:
     return {
@@ -330,6 +370,11 @@ def get_view_transform_revision() -> int:
         return _view_transform_revision
 
 
+def get_tracking_view_snapshot() -> tuple[int, dict | None]:
+    with _view_transform_lock:
+        return _view_transform_revision, dict(_view_transform) if _view_transform is not None else None
+
+
 def mark_scene_visual_changed(reason: str = "unknown") -> int:
     global _scene_visual_revision, _scene_visual_reason
     with _view_transform_lock:
@@ -408,9 +453,11 @@ def get_recording_state_snapshot() -> dict:
         "sceneInfo": get_scene_info_payload(),
         "viewTransform": get_view_transform_payload(),
         "sceneVisualRevision": visual_revision,
+        "viewTransformRevision": get_view_transform_revision(),
         "sceneVisualReason": visual_reason,
         "testSequence": test_sequence,
         "cameraLock": dict(_camera_lock_state),
+        "trackingControls": {"selectedMini": get_selected_mini(), "paused": tracking_output_paused()},
     }
 
 
@@ -477,7 +524,7 @@ def start_timeline_recording(
         _timeline_path = path
         _timeline_last_signature = signature
         _timeline_recording = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "video": Path(video_path).name,
             "createdAt": datetime.now(timezone.utc).isoformat(),
             "markerMode": str(marker_mode),
@@ -491,6 +538,10 @@ def start_timeline_recording(
             "gridRows": int(grid_rows),
             "framesRecorded": 0,
             "trackingEvents": [],
+            "frameClocks": [],
+            "checkpoints": [],
+            "profileChanges": [],
+            "deliveryEvents": [],
             "groundTruth": [],
             "referenceFrames": [],
             "events": [{"frame": 0, **snapshot}],
@@ -501,7 +552,7 @@ def start_timeline_recording(
     return path
 
 
-def record_timeline_frame() -> None:
+def record_timeline_frame(*, capture_time=None, core_frame=None, motion_thresh=None) -> None:
     global _timeline_last_signature
     snapshot = get_recording_state_snapshot()
     signature = json.dumps(snapshot, sort_keys=True)
@@ -515,8 +566,66 @@ def record_timeline_frame() -> None:
             _timeline_last_signature = signature
             should_write = True
         _timeline_recording["framesRecorded"] = frame + 1
+        _timeline_recording["frameClocks"].append({
+            "frame": frame, "captureTime": capture_time,
+            "coreFrame": core_frame, "trackingTime": None, "tracked": False,
+            "motionThreshold": motion_thresh,
+            "stateEvent": len(_timeline_recording["events"]) - 1,
+        })
     if should_write:
         _write_timeline_file()
+
+
+def record_tracking_input(now, *, tracked=False):
+    state = get_recording_state_snapshot()
+    with _timeline_lock:
+        if _timeline_recording and _timeline_recording["frameClocks"]:
+            item = _timeline_recording["frameClocks"][-1]
+            item.update(trackingTime=float(now), tracked=bool(tracked))
+            before = _timeline_recording["events"][item["stateEvent"]]
+            if all(before.get(key) == value for key, value in state.items()):
+                item.pop("trackingState", None)
+            else:
+                item["trackingState"] = state
+
+
+def record_profile_change(profiles, mini):
+    with _timeline_lock:
+        if _timeline_recording:
+            _timeline_recording["profileChanges"].append({
+                "frame": max(0, _timeline_recording["framesRecorded"] - 1),
+                "mini": str(mini), "profiles": copy.deepcopy(profiles),
+            })
+
+
+def record_checkpoint(session, tracking, kind="initial"):
+    from recording_state import save_checkpoint
+    with _timeline_lock:
+        if _timeline_recording is None or _timeline_path is None:
+            return
+        frame = _timeline_recording["framesRecorded"]
+        folder = _timeline_path.parent / (_timeline_path.stem + "_state")
+        path = folder / f"{frame:08d}-{len(_timeline_recording['checkpoints']):04d}.npz"
+        digest = save_checkpoint(path, session, tracking)
+        _timeline_recording["checkpoints"].append({"frame": frame, "kind": kind,
+                                                  "path": str(path.relative_to(_timeline_path.parent)),
+                                                  "sha256": digest})
+        if tracking.get("profiles") is not None:
+            _timeline_recording.setdefault("profiles", copy.deepcopy(tracking["profiles"]))
+            profile_path = _timeline_path.with_name(_timeline_path.name.replace(".tracking.json", ".profiles.json"))
+            if not profile_path.exists():
+                atomic_write_json(profile_path, tracking["profiles"], backup=False)
+    _write_timeline_file()
+
+
+def record_delivery_event(data):
+    with _timeline_lock:
+        if _timeline_recording:
+            _timeline_recording["deliveryEvents"].append({
+                "frame": max(0, _timeline_recording["framesRecorded"] - 1),
+                "timeMonotonic": time.perf_counter(),
+                **{key: data.get(key) for key in ("type", "miniId", "cell", "sceneId", "commandId", "error")},
+            })
 
 
 def record_rendered_reference(payload: dict) -> bool:
@@ -587,6 +696,11 @@ def stop_timeline_recording() -> Path | None:
             return None
         path = _timeline_path
     _write_timeline_file()
+    try:
+        from movement_transcript import export_recording
+        export_recording(path)
+    except Exception as exc:
+        print(f"FoundryOutput | Transcript export failed: {exc}", flush=True)
     with _timeline_lock:
         _timeline_recording = None
         _timeline_path = None
@@ -637,6 +751,7 @@ def handle_capture_control(payload: dict) -> None:
                     raise ValueError("A capture is already active")
                 _capture_session = GuidedCapture(payload, SCENE_ID)
                 _tracking_output_paused = True
+                _delivery.clear()
                 _capture_commands.append({"action": "start"})
                 return
             if action == "resume":
@@ -799,10 +914,13 @@ def warp_grid_segments(
 
 def warp_to_grid_cell(cx: float, cy: float, warp_w: int, warp_h: int) -> tuple[int, int] | None:
     """Map a point in the camera's marker warp to a Foundry (column, row)."""
-    view = _view_transform_snapshot()
+    return warp_to_grid_cell_from_snapshot(_view_transform_snapshot(), get_scene_params(), cx, cy, warp_w, warp_h)
+
+
+def warp_to_grid_cell_from_snapshot(view, scene, cx, cy, warp_w, warp_h):
     if view is None or warp_w <= 1 or warp_h <= 1:
         return None
-    if view["sceneId"] and SCENE_ID and view["sceneId"] != SCENE_ID:
+    if view["sceneId"] and scene["sceneId"] and view["sceneId"] != scene["sceneId"]:
         return None
 
     client_x = view["left"] + (float(cx) / float(warp_w - 1)) * (view["right"] - view["left"])
@@ -821,8 +939,8 @@ def warp_to_grid_cell(cx: float, cy: float, warp_w: int, warp_h: int) -> tuple[i
 
     col = math.floor((canvas_x - view["gridOriginX"]) / view["gridSize"])
     row = math.floor((canvas_y - view["gridOriginY"]) / view["gridSize"])
-    max_cols = max(1, int(math.ceil(SCENE_W / view["gridSize"])))
-    max_rows = max(1, int(math.ceil(SCENE_H / view["gridSize"])))
+    max_cols = max(1, int(math.ceil(scene["sceneW"] / view["gridSize"])))
+    max_rows = max(1, int(math.ceil(scene["sceneH"] / view["gridSize"])))
     if col < 0 or row < 0 or col >= max_cols or row >= max_rows:
         return None
     return int(col), int(row)
@@ -830,7 +948,10 @@ def warp_to_grid_cell(cx: float, cy: float, warp_w: int, warp_h: int) -> tuple[i
 
 def warp_grid_dimensions(warp_w: int, warp_h: int) -> tuple[float, float] | None:
     """Return the displayed Foundry grid size along the camera warp's axes."""
-    view = _view_transform_snapshot()
+    return warp_grid_dimensions_from_snapshot(_view_transform_snapshot(), warp_w, warp_h)
+
+
+def warp_grid_dimensions_from_snapshot(view, warp_w, warp_h):
     if view is None or warp_w <= 1 or warp_h <= 1:
         return None
 
@@ -905,44 +1026,30 @@ def request_assignment(mini_id: str) -> None:
         return
 
     mini_id = str(mini_id).strip()
+    scene_id = SCENE_ID
 
     def _enqueue():
         try:
-            _assign_queue.put_nowait(mini_id)
+            _assign_queue.put_nowait((mini_id, scene_id))
         except Exception as e:
             print("FoundryOutput | Failed to enqueue assignment request:", e)
 
     _loop.call_soon_threadsafe(_enqueue)
 
-def queue_cell_move(mini_id: str, cell_label: str) -> None:
-    """
-    Called when a mini moves into a new cell.
-    We queue (mini_id, cell_label) so the send loop can pick the correct token.
-    """
-    global _loop, _move_queue
+def queue_cell_move(mini_id: str, cell_label: str, *, source="tracking") -> None:
+    """Retain the latest desired cell independently of connection/assignment."""
     if tracking_output_paused():
         return
-    if _loop is None or _move_queue is None:
-        print("FoundryOutput | Event loop not ready yet; cannot queue move.")
-        return
-
     mini_id = str(mini_id).strip()
     cell_label = cell_label.strip()
-    scene_id = SCENE_ID
+    _grid_to_pixels(cell_label)
+    _delivery.offer(mini_id, cell_label, _scene_context(), source)
 
-    def _enqueue():
-        try:
-            _move_queue.put_nowait((mini_id, cell_label, scene_id))
-        except Exception as e:
-            print("FoundryOutput | Failed to enqueue move:", e)
-
-    _loop.call_soon_threadsafe(_enqueue)
-
-def move_token_to_grid(mini_id: str, cell_label: str) -> None:
+def move_token_to_grid(mini_id: str, cell_label: str, *, source="tracking") -> None:
     """
     API used by main.py:on_mini_moved.
     """
-    queue_cell_move(mini_id, cell_label)
+    queue_cell_move(mini_id, cell_label, source=source)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1028,59 +1135,21 @@ def _grid_to_pixels(cell_str: str) -> tuple[int, int]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 async def send_loop(websocket):
-    """
-    Waits for (mini_id, cell_label) queued by queue_cell_move(), converts to pixels,
-    resolves the correct token, and sends move commands to Foundry.
-    """
-    global _move_queue
-    if _move_queue is None:
-        _move_queue = asyncio.Queue()
-
-    print("FoundryOutput | Ready to send moves to Foundry (queue_cell_move from tracking/main).")
-
+    """Send/retry latest destinations; only acknowledgements complete moves."""
     while True:
-        mini_id, cell_label, queued_scene = await _move_queue.get()
-        if tracking_output_paused() or queued_scene != SCENE_ID:
-            continue
-
-        if not SCENE_ID:
-            print(f"FoundryOutput | sceneInfo not yet received from Foundry; "
-                  f"dropping move for mini {mini_id}. "
-                  f"This should resolve once Foundry connects and sends sceneInfo.")
-            continue
-
-        token_id = _resolve_token_id_for_mini(mini_id)
-        if token_id == DEFAULT_TOKEN_ID:
-            print(f"FoundryOutput | mini {mini_id} has no mapping yet; request assignment and skip move.")
-            request_assignment(mini_id)
-            continue
-
-        try:
-            x, y = _grid_to_pixels(cell_label)
-        except Exception as e:
-            print(f"FoundryOutput | Failed to convert cell '{cell_label}': {e}")
-            continue
-
-        payload = {
-            "type": "moveToken",
-            "sceneId": SCENE_ID,
-            "miniId": mini_id,
-            "cell": cell_label,
-            "tokenId": token_id,
-            "x": x,
-            "y": y,
-        }
-
-        print(
-            f"FoundryOutput | mini={mini_id} cell={cell_label} "
-            f"→ token={token_id} → ({x}, {y}) | Sending move command."
-        )
-
-        try:
-            await websocket.send(json.dumps(payload))
-        except websockets.ConnectionClosed:
-            print("FoundryOutput | Connection closed while sending.")
-            break
+        if _connection_ready and not tracking_output_paused():
+            for mini_id, move in _delivery.snapshot().items():
+                token_id = _resolve_token_id_for_mini(mini_id)
+                if token_id == DEFAULT_TOKEN_ID:
+                    if _delivery.waiting_for_assignment(mini_id):
+                        request_assignment(mini_id)
+                    continue
+                coordinates = _grid_to_pixels(move["cell"])
+                payload = _delivery.prepare(mini_id, move["cell"], token_id, coordinates, time.monotonic())
+                if payload:
+                    print(f"FoundryOutput | mini={mini_id} cell={move['cell']} -> token={token_id} | Awaiting confirmation.", flush=True)
+                    await websocket.send(json.dumps(payload))
+        await asyncio.sleep(0.1)
 
 async def assign_request_loop(websocket):
     global _assign_queue
@@ -1088,10 +1157,10 @@ async def assign_request_loop(websocket):
         _assign_queue = asyncio.Queue()
 
     while True:
-        mini_id = await _assign_queue.get()
-        if tracking_output_paused():
+        mini_id, scene_id = await _assign_queue.get()
+        if tracking_output_paused() or scene_id != SCENE_ID:
             continue
-        msg = {"type": "assignMini", "miniId": str(mini_id)}
+        msg = {"type": "assignMini", "miniId": str(mini_id), "sceneId": scene_id}
         print(f"FoundryOutput | Requesting assignment for mini {mini_id}")
         try:
             await websocket.send(json.dumps(msg))
@@ -1119,7 +1188,7 @@ async def recv_loop(websocket):
     """
     Receives messages from Foundry (assignment results, scene info).
     """
-    global MINI_TO_TOKEN, _selected_mini_id
+    global MINI_TO_TOKEN, _selected_mini_id, _protocol_ready, _connection_ready, _connection_error
     while True:
         try:
             raw = await websocket.recv()
@@ -1136,6 +1205,9 @@ async def recv_loop(websocket):
 
         if msg_type in ("hello", "ping"):
             if msg_type == "hello":
+                _connection_ready = False
+                _protocol_ready = data.get("protocolVersion") == 2
+                _connection_error = "" if _protocol_ready else "Reload Foundry: updated Sarween module required"
                 queue_control(_capture_status)
                 with _timeline_lock:
                     recording = _timeline_recording
@@ -1144,6 +1216,8 @@ async def recv_loop(websocket):
             continue
 
         if msg_type == "assignMiniResult":
+            if data.get("sceneId") != SCENE_ID:
+                continue
             mini_id = str(data.get("miniId", "")).strip()
             token_id = data.get("tokenId")
             cancelled = bool(data.get("cancelled", False))
@@ -1159,6 +1233,20 @@ async def recv_loop(websocket):
             else:
                 print(f"FoundryOutput | Invalid assignMiniResult: {data}")
 
+        elif msg_type in {"tokenMoveApplied", "tokenMoveError"}:
+            with _delivery.lock:
+                accepted = _delivery.reply(data, time.monotonic())
+                state = _delivery.snapshot().get(data.get("miniId"))
+            if accepted:
+                if state is None:
+                    continue
+                record_delivery_event({**data, "cell": state["cell"],
+                    "type": "tokenMoveApplied" if state["state"] == "confirmed" else "tokenMoveError",
+                    "error": state["error"]})
+                print(f"FoundryOutput | Move {state['state']}: {data['miniId']} {state['error']}", flush=True)
+                if data.get("code") == "tokenMissing":
+                    _remove_stale_token_mapping(str(data.get("tokenId") or ""))
+
         elif msg_type == "sceneInfo":
             # Expected from module.js:
             # {type:"sceneInfo", sceneId, width, height, gridSize, shiftX, shiftY, gridType}
@@ -1173,6 +1261,7 @@ async def recv_loop(websocket):
             set_scene_params(scene_id, w, h, grid_size, sx, sy, gt,
                              background=data.get("background"))
             reconcile_scene_bindings(data)
+            _connection_ready = _protocol_ready and bool(SCENE_ID and GRID_PX and not data.get("error"))
 
         elif msg_type == "viewTransform":
             set_view_transform(data)
@@ -1198,6 +1287,8 @@ async def recv_loop(websocket):
             )
 
         elif msg_type == "tokenMissing":
+            if data.get("sceneId") != SCENE_ID:
+                continue
             token_id = str(data.get("tokenId") or "").strip()
             stale_minis = _remove_stale_token_mapping(token_id)
             for mini_id in stale_minis:
@@ -1219,6 +1310,17 @@ async def recv_loop(websocket):
 
 
 async def handler(websocket):
+    global _active_socket, _connection_ready, _protocol_ready, _connection_error
+    global _assign_queue, _ctrl_queue
+    if _active_socket is not None:
+        await websocket.close(code=1013, reason="Another Foundry display is connected; disconnect it first")
+        return
+    _active_socket = websocket
+    _connection_ready = _protocol_ready = False
+    _connection_error = ""
+    _assign_queue = asyncio.Queue()
+    _ctrl_queue = asyncio.Queue()
+    _delivery.retry(reconnect=True)
     print("FoundryOutput | Foundry connected via WebSocket")
 
     tasks = [
@@ -1227,29 +1329,48 @@ async def handler(websocket):
         asyncio.create_task(ctrl_loop(websocket)),   # NEW
         asyncio.create_task(recv_loop(websocket)),
     ]
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    for t in pending:
-        t.cancel()
-    with _capture_lock:
-        if _capture_session is not None:
-            _capture_commands.append({"action": "stop", "reason": "disconnected"})
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            task.cancel()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception) and not isinstance(result, websockets.ConnectionClosed):
+                print(f"FoundryOutput | Connection task stopped: {result}", flush=True)
+        _active_socket = None
+        _connection_ready = _protocol_ready = False
+        with _capture_lock:
+            if _capture_session is not None:
+                _capture_commands.append({"action": "stop", "reason": "disconnected"})
 
     print("FoundryOutput | Handler finished.")
 
 
-async def main():
-    global _loop, _move_queue, _assign_queue, _ctrl_queue
+async def main(*, stop_event=None, ready_event=None):
+    global _loop, _assign_queue, _ctrl_queue
     _loop = asyncio.get_running_loop()
-    _move_queue = asyncio.Queue()
     _assign_queue = asyncio.Queue()
     _ctrl_queue = asyncio.Queue()
 
     _load_mapping()
 
-    async with websockets.serve(handler, "127.0.0.1", 8765):
-        print("FoundryOutput | WebSocket server listening on ws://127.0.0.1:8765")
-        await asyncio.Future()  # run forever
+    try:
+        async with websockets.serve(handler, "127.0.0.1", 8765, close_timeout=1):
+            print("FoundryOutput | WebSocket server listening on ws://127.0.0.1:8765")
+            if ready_event is not None:
+                ready_event.set()
+            if stop_event is None:
+                await asyncio.Future()
+            else:
+                while not stop_event.is_set():
+                    await asyncio.sleep(0.1)
+    finally:
+        _loop = None
+        if ready_event is not None:
+            ready_event.clear()
 
 
 if __name__ == "__main__":
+    initialize_user_data()
     asyncio.run(main())

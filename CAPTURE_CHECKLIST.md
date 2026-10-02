@@ -2,7 +2,7 @@
 
 ## First: a short smoke test
 
-1. Exit Sarween if it is open. Reload the Foundry world to load Sarween 1.3.0.
+1. Exit Sarween if it is open. Reload the Foundry world to load Sarween 1.5.1.
 2. Open a square-grid test scene, preferably your familiar 48x27 scene. Do not
    introduce OBS yet. Put Red, Blue, Yellow, Green, and White tokens on it.
 3. Keep all physical minis off the TV. Start Sarween:
@@ -60,7 +60,9 @@ Placed. If you placed a mini in the wrong cell, correct it before confirming.
 
 ## Saved files and offline work
 
-Every guide produces four files together in the Sarween-Python folder:
+Every guide produces four files together in
+`~/Library/Application Support/Sarween/Recordings/` on macOS. Older recordings
+remain in the Sarween-Python folder and do not need to be moved:
 
 ```text
 sarween_rec_TIMESTAMP.mp4
@@ -79,7 +81,8 @@ all colors have usable profiles. To check one recording later:
 
 ```bash
 conda activate py_arm
-python tracking_regression.py check sarween_rec_TIMESTAMP.case.json
+python tracking_regression.py check \
+  "$HOME/Library/Application Support/Sarween/Recordings/sarween_rec_TIMESTAMP.case.json"
 ```
 
 No TV, Foundry, or iPhone is needed for replay. File playback stops at EOF.

@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import foundryoutput as foundry
 import tracking_regression
@@ -132,6 +133,48 @@ class FoundryTimelineTest(unittest.TestCase):
             self.assertEqual(foundry.warp_to_grid_cell(25, 25, 1001, 801), (0, 0))
             replay.apply_through(1)
             self.assertEqual(foundry.warp_to_grid_cell(25, 25, 1001, 801), (2, 0))
+
+    def test_controls_recording_and_legacy_guided_replay_policies(self):
+        with patch.object(foundry, "_selected_mini_id", "blue"), \
+             patch.object(foundry, "_tracking_output_paused", True):
+            snapshot = foundry.get_recording_state_snapshot()
+        self.assertEqual(snapshot["trackingControls"], {"selectedMini": "blue", "paused": True})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session.tracking.json"
+            for guided in (False, True):
+                data = {"schemaVersion": 1, "events": [{"frame": 0, **snapshot}]}
+                if guided:
+                    data["capture"] = {"sessionId": "test-session"}
+                path.write_text(json.dumps(data))
+                timeline = tracking_regression.FoundryTimelineReplay(path)
+                timeline.apply_through(0)
+                self.assertEqual(timeline.selected_mini, "blue")
+                self.assertTrue(timeline.has_controls)
+                self.assertEqual(timeline.prediction_paused, not guided)
+            path.write_text(json.dumps({"schemaVersion": 1, "events": [{"frame": 0}]}))
+            timeline = tracking_regression.FoundryTimelineReplay(path)
+            timeline.apply_through(0)
+            self.assertFalse(timeline.has_controls)
+            self.assertIsNone(timeline.selected_mini)
+            self.assertFalse(timeline.prediction_paused)
+
+    def test_capture_and_tracking_phases_store_only_changed_state(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(foundry, "_selected_mini_id", None):
+            sidecar = foundry.start_timeline_recording(Path(directory) / "session.mp4", fps=10,
+                frame_width=640, frame_height=480, marker_mode="legacy", warp_width=640,
+                warp_height=480, grid_cols=20, grid_rows=15)
+            foundry.record_timeline_frame(capture_time=100, core_frame=10)
+            foundry.record_tracking_input(100.1, tracked=True)
+            foundry._selected_mini_id = "Red"
+            foundry.record_tracking_input(100.2, tracked=True)
+            foundry._selected_mini_id = None
+            foundry.record_timeline_frame(capture_time=100.3, core_frame=11)
+            foundry.record_tracking_input(100.4, tracked=True)
+            foundry.stop_timeline_recording()
+            data = json.loads(sidecar.read_text())
+            self.assertEqual(data["frameClocks"][0]["trackingState"]["trackingControls"]["selectedMini"], "Red")
+            self.assertNotIn("trackingState", data["frameClocks"][1])
+            self.assertEqual([row["stateEvent"] for row in data["frameClocks"]], [0, 0])
 
 
 if __name__ == "__main__":
