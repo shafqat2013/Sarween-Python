@@ -39,6 +39,7 @@ class ReplayWindow:
         import cv2
         self.cv2 = cv2
         self.review = ReviewSession(video)
+        timeline = self.review.timeline
         self.cap = cv2.VideoCapture(str(video))
         self.count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = float(self.cap.get(cv2.CAP_PROP_FPS)) or 30
@@ -50,6 +51,8 @@ class ReplayWindow:
         self.playing = False
         self.demo = demo
         self.demo_ready = False
+        self.preparing = False
+        self.analysis_visible = bool(self.review.data.get("analysis"))
         self._demo_start_id = None
         self.closed = False
         self.job = None
@@ -58,9 +61,11 @@ class ReplayWindow:
         self.last_pixels = None
         self._seek_updating = False
         self.root = tk.Toplevel(parent)
-        self.root.title("Sarween - Synthetic demo" if demo else "Sarween - " + Path(video).name)
-        self.root.geometry(f"1100x{min(640 if demo else 820, parent.winfo_screenheight()-80)}")
-        self.root.minsize(780, 460 if demo else 580)
+        title = (timeline.get("title") or ("Synthetic test fixture" if timeline.get("synthetic")
+                 else "Real tabletop example")) if demo else Path(video).name
+        self.root.title("Sarween - " + title)
+        self.root.geometry(f"1100x{min(640, parent.winfo_screenheight()-80)}")
+        self.root.minsize(780, 460)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         outer = ttk.Frame(self.root, padding=10)
         outer.pack(fill="both", expand=True)
@@ -68,10 +73,9 @@ class ReplayWindow:
         outer.rowconfigure(3, weight=1, minsize=80)
         header = ttk.Frame(outer)
         header.grid(row=0, column=0, sticky="ew")
-        ttk.Label(header, text="Synthetic five-mini demo" if demo else Path(video).name,
+        ttk.Label(header, text=title,
                   font=("Helvetica", 13, "bold")).pack(side="left")
-        ttk.Label(header, text="No camera or Foundry connection needed" if demo else
-                  "Offline / Foundry output disabled").pack(side="right")
+        ttk.Label(header, text="Processed on this Mac").pack(side="right")
         settings = ttk.Frame(outer)
         settings.grid(row=1, column=0, sticky="ew", pady=8)
         timeline = self.review.timeline
@@ -91,6 +95,13 @@ class ReplayWindow:
         profiles = Path(video).with_suffix(".profiles.json")
         saved_options = self.review.data.get("options", {})
         self.profiles = Path(saved_options.get("profiles_path") or (profiles if profiles.exists() else data_path("combo_profiles.json")))
+        # Opening a reviewed recording is read-only. Only explicit reanalysis
+        # may reset its run-specific decisions and completion flag.
+        self.auto_analyze = demo or bool(not self.analysis_visible and timeline.get("events") and self.profiles.is_file())
+        self.needs_setup = not (self.auto_analyze or self.analysis_visible)
+        self.preparing = self.auto_analyze
+        if self.auto_analyze:
+            self.analysis_visible = False
         profile_bar = ttk.Frame(outer)
         profile_bar.grid(row=2, column=0, sticky="ew", pady=(0, 6))
         ttk.Button(profile_bar, text="Choose profiles", command=self.choose_profiles).pack(side="left")
@@ -98,29 +109,24 @@ class ReplayWindow:
         self.profile_label.pack(side="left", padx=8)
         self.restore_profiles = tk.BooleanVar(value=True)
         ttk.Checkbutton(profile_bar, text="Recorded profile changes", variable=self.restore_profiles).pack(side="right")
-        if demo:
-            self.views = ttk.Frame(outer)
-            self.views.columnconfigure((0, 1), weight=1, uniform="demo")
-            self.views.rowconfigure(1, weight=1)
-            ttk.Label(self.views, text="Video", font=("Helvetica", 13, "bold")).grid(
-                row=0, column=0, sticky="w", pady=(12, 8))
-            ttk.Label(self.views, text="Tracking", font=("Helvetica", 13, "bold")).grid(
-                row=0, column=1, sticky="w", padx=(8, 0), pady=(12, 8))
-            video_view = ttk.Frame(self.views)
-            video_view.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
-            self.video_canvas = tk.Canvas(video_view, background="#171d20", highlightthickness=0,
-                                          width=500, height=260)
-            self.video_canvas.pack(fill="both", expand=True)
-            ttk.Label(video_view, text="Synthetic footage processed by Sarween", wraplength=350).pack(fill="x", pady=4)
-            self.map = MapView(self.views)
-            self.map.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
-        else:
-            self.views = ttk.Notebook(outer)
-            self.video_canvas = tk.Canvas(self.views, background="#171d20", highlightthickness=0, height=260)
-            self.map = MapView(self.views)
-            self.views.add(self.video_canvas, text="Video")
-            self.views.add(self.map, text="Map state")
-            self.views.bind("<<NotebookTabChanged>>", lambda _event: self.render())
+        self.views = ttk.Frame(outer)
+        self.views.columnconfigure((0, 1), weight=1, uniform="video")
+        self.views.rowconfigure(1, weight=1)
+        ttk.Label(self.views, text="What the camera sees", font=("Helvetica", 13, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(12, 8))
+        ttk.Label(self.views, text="What the software sees", font=("Helvetica", 13, "bold")).grid(
+            row=0, column=1, sticky="w", padx=(8, 0), pady=(12, 8))
+        video_view = ttk.Frame(self.views)
+        video_view.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        self.video_canvas = tk.Canvas(video_view, background="#171d20", highlightthickness=0,
+                                      width=500, height=260)
+        caption = ttk.Label(video_view, text=timeline.get("description") or
+                            ("Synthetic test footage" if timeline.get("synthetic") else "Your video stays on this Mac"), wraplength=460)
+        caption.pack(side="bottom", fill="x", pady=4)
+        caption.bind("<Configure>", lambda e: caption.configure(wraplength=max(100, e.width)))
+        self.video_canvas.pack(fill="both", expand=True)
+        self.map = MapView(self.views)
+        self.map.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
         self.views.grid(row=3, column=0, sticky="nsew")
         self.video_canvas.bind("<Configure>", lambda _event: self.render())
         transport = ttk.Frame(outer)
@@ -137,9 +143,9 @@ class ReplayWindow:
         speed_box = ttk.Combobox(transport, textvariable=self.speed, values=("0.25x", "0.5x", "1x", "2x"), width=5, state="readonly")
         speed_box.pack(side="left")
         speed_box.bind("<<ComboboxSelected>>", self.change_speed)
-        if demo:
-            self.tools_button = ttk.Button(transport, text="Show review tools", command=self.toggle_review_tools)
-            self.tools_button.pack(side="left", padx=(8, 0))
+        self.tools_button = ttk.Button(transport, text="Hide settings" if self.needs_setup else "Show settings",
+                                       command=self.toggle_review_tools)
+        self.tools_button.pack(side="left", padx=(8, 0))
         review_bar = ttk.Frame(outer)
         review_bar.grid(row=5, column=0, sticky="ew", pady=4)
         self.track = tk.StringVar(value="Detected")
@@ -172,28 +178,33 @@ class ReplayWindow:
         ttk.Button(actions, text="Export regression case", command=self.export_case).pack(side="left", padx=4)
         ttk.Button(actions, text="Score", command=self.score).pack(side="left")
         ttk.Button(actions, text="Diagnostics", command=self.diagnostics).pack(side="right")
-        self.status = tk.StringVar(value="Ready" if timeline else "No recording metadata. Check grid, marker mode and mini profiles.")
+        self.status = tk.StringVar(value="Saved tracking results. Press Play to compare both views." if self.analysis_visible else
+                                  "Set the grid and marker mode, choose mini profiles, then click Analyze. "
+                                  "Tracking needs visible ArUco markers and colored mini rings.")
         label = ttk.Label(outer, textvariable=self.status, wraplength=1000)
         label.grid(row=8, column=0, sticky="ew")
         label.bind("<Configure>", lambda event: label.configure(wraplength=max(100, event.width)))
         self.review_tools = (settings, profile_bar, review_bar, table, actions)
-        self.tools_visible = not demo
-        if demo:
+        self.tools_visible = self.needs_setup
+        if not self.needs_setup:
             for widget in self.review_tools:
                 widget.grid_remove()
+        if self.auto_analyze:
             self.play_button.state(["disabled"])
-            self.status.set("Preparing tracking for the demo…")
+            self.status.set("Reading the video and tracking its minis…")
+        elif self.needs_setup:
+            self.root.minsize(780, 580)
         self.refresh_rows()
         self.seek(0)
         self._tick_id = self.root.after(30, self.tick)
-        if demo:
+        if self.auto_analyze:
             self._demo_start_id = self.root.after(100, self.analyze)
 
     def toggle_review_tools(self):
         self.tools_visible = not self.tools_visible
         for widget in self.review_tools:
             widget.grid() if self.tools_visible else widget.grid_remove()
-        self.tools_button.configure(text="Hide review tools" if self.tools_visible else "Show review tools")
+        self.tools_button.configure(text="Hide settings" if self.tools_visible else "Show settings")
         minimum = 580 if self.tools_visible else 460
         self.root.minsize(780, minimum)
         if self.root.winfo_height() < minimum:
@@ -227,15 +238,16 @@ class ReplayWindow:
         try:
             self.run_options = self.options()
             self.job = ReplayJob(self.review.video, self.run_options, timeout=float(self.limit.get()))
-            if self.demo:
-                self.demo_ready = False
-                self.play_button.state(["disabled"])
-                self.seek(0)
-                self.map.set_state({"grid": [int(self.cols.get()), int(self.rows.get())], "positions": {}})
+            self.preparing = True
+            self.demo_ready = self.analysis_visible = False
+            self.play_button.state(["disabled"])
+            self.seek(0)
             self.analyze_button.state(["disabled"])
             self.cancel_button.state(["!disabled"])
             self.status.set("Analyzing saved pixels - one worker")
         except Exception as exc:
+            self.preparing = False
+            self.play_button.state(["!disabled"])
             self.error(exc)
 
     def cancel(self):
@@ -248,6 +260,8 @@ class ReplayWindow:
         if self.job and not getattr(self.job, "delivered", False):
             if self.job.poll():
                 self.job.delivered = True
+                self.preparing = False
+                self.play_button.state(["!disabled"])
                 self.analyze_button.state(["!disabled"])
                 self.cancel_button.state(["disabled"])
                 if self.job.error:
@@ -258,16 +272,18 @@ class ReplayWindow:
                         d = self.job.result["diagnostics"]
                         self.complete.set(False)
                         self.refresh_rows()
+                        self.analysis_visible = bool(d.get("locked_frames") and d.get("tracked_frames") and d.get("map_states"))
+                        self.demo_ready = self.analysis_visible
                         self.render_map()
                         warning = "No marker lock; results are not valid." if not d["locked_frames"] else (
                             "No tracking frames; results are not valid." if not d["tracked_frames"] else "Analysis complete")
                         self.status.set(f"{warning} | {len(self.job.result['events'])} detections | "
                                         f"{d['processed_frames']} frames | {len(d['replay_limitations'])} fidelity notes")
-                        if self.demo and d["locked_frames"] and d["tracked_frames"] and d.get("map_states"):
-                            self.demo_ready = True
-                            self.play_button.state(["!disabled"])
+                        if self.auto_analyze and self.analysis_visible:
                             self.seek(0)
-                            self.status.set("Watch each ring move. Its tracked position follows on the right.")
+                            self.status.set("Tracking calculated from this video. Move through the timeline to compare both views."
+                                            if self.job.result["events"] else
+                                            "No minis detected. Check the selected mini profiles and ring visibility.")
                             self.toggle_play()
                     except Exception as exc:
                         self.error(exc)
@@ -287,7 +303,7 @@ class ReplayWindow:
         self._tick_id = self.root.after(30, self.tick)
 
     def toggle_play(self):
-        if self.closed or self.demo and not self.demo_ready:
+        if self.closed or self.preparing:
             return
         self.playing = not self.playing
         if self.playing and self.frame == self.count - 1:
@@ -332,7 +348,7 @@ class ReplayWindow:
         self.video_canvas.create_image(w/2, h/2, image=self.image)
 
     def render_map(self):
-        result = (self.review.data.get("analysis") or {}) if not self.demo or self.demo_ready else {}
+        result = (self.review.data.get("analysis") or {}) if self.analysis_visible else {}
         states = result.get("diagnostics", {}).get("map_states", [])
         times = [item["time_seconds"] for item in states]
         index = bisect.bisect_right(times, self.frame/self.fps) - 1

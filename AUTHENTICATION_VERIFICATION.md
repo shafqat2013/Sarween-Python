@@ -191,3 +191,67 @@ startup was signed out; authenticated demo playback was verified in the native
 source tests, not bypassed in the packaged app. This does not establish physical
 camera/TV or live Foundry play accuracy. No installed app was replaced, no build
 was published/distributed, and the website/recruitment form were not edited.
+
+## October 2: real-video correction
+
+The owner clarified that the product example must show real camera footage.
+The synthetic test clip was unsuitable for that purpose. **Watch real example**
+now opens about 15 seconds of the owner's approved clips 10 and 11, retaining
+reflection blur and hiding the room around the table. The camera angle is
+restored from those approved exports, with only the original physical marker
+borders copied from the source so registration remains possible. No markers or
+mini movements are generated. Provenance and source hashes are in
+`demo/tabletop.provenance.json`.
+
+The two views are labeled **What the camera sees** and **What the software sees**.
+The second view is recomputed by the normal tracking worker from the bundled
+video. Its sidecar contains scene geometry but no tracking events, synthetic
+positions or scripted movement. The synthetic five-mini fixture remains in the
+repository for developer tests and is excluded from both application specs.
+
+**Open your video** uses the same layout and processes files locally. Recordings
+with metadata and profiles start analysis automatically if they have no saved
+analysis. Existing analyses, review decisions and completion status survive
+reopening without a new worker run. Other files open for
+playback with explicit setup instructions and an empty tracking view. Users must
+provide the supported marker layout, grid and mini profiles; this does not claim
+automatic tracking of arbitrary footage.
+
+- Full discovery: 229 tests, 216 passed, 13 opt-in UI tests skipped.
+- Native replay suite: 10/10 passed, including the real example, synchronized
+  seeking forward/backward, unconfigured own-video import, saved-review
+  preservation and worker cleanup. This final run includes the added regression
+  test after the full discovery run above.
+- Real recording case: all five recorded placement labels matched, zero extras.
+  Labels derive from the approved recording and its log, not independent ground
+  truth. The first detection is acquisition; four later detections change cells.
+- Packaged worker: the bundled MP4 produced J7, Y14, AL20, AK7 and K21; 203 frames
+  processed, 199 locked. Source hashes matched, worker exited cleanly, and no
+  synthetic video was included. `packaged-real-video.json` records this check.
+- Native screenshots reviewed at 1100x640 and 780x460. The MP4 is silent H.264,
+  204 frames, 1164x984, at the original nominal 13.544 fps.
+
+The corrected review build and evidence are under
+`/Users/shafqat/Documents/New project/sarween-real-video-review-20261002/`.
+The final build is `build/Sarween-noaokns2/Sarween.app`. Website and recruitment form
+content remain unchanged; the owner is preparing their own wording.
+
+After the owner closed Sarween, this final build replaced `/Applications/Sarween.app`
+using a reversible directory swap. The previous installed bundle remains at
+`previous-installation/Sarween-before-final-review-fix.app.backup` in the review
+folder. The installer verified the bundle signature and identifier and did not
+change Application Support files or Keychain entries. This was a local installation;
+no release was published or distributed.
+
+## Handoff for October 3
+
+The installed real-video build is the stopping point for October 2. Next session:
+
+1. Revise the website and recruitment form from the owner's rough wording.
+2. Prepare the Reddit announcement in the owner's voice, using the four approved
+   clips (07, 08, 10 and 11) in the October 6 announcement folder's `v4/exports`.
+3. Review the finished website/form and post before publishing. The launch goal
+   remains announcing the alpha test by October 6.
+
+No website or form edits, Reddit post, or public app release were made during
+this demo correction. Unrelated working-tree changes remain untouched.

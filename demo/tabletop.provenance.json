@@ -1,0 +1,13 @@
+{
+  "source": "sarween_rec_20260911_165442.mp4",
+  "source_sha256": "6755af357717e9c3807348527ea1e203cc1675dd9cbaadfcf1995936e5302fee",
+  "first_source_frame": 146,
+  "end_source_frame_exclusive": 350,
+  "fps": 13.544,
+  "edits": "Approved clean clip pixels restored to the camera angle; original marker borders retained; surroundings masked; silent; original speed.",
+  "approved_exports": {
+    "10-two-moves-soft-reflection-clean.mp4": "6d16a9fcd983b6c87b34d2bae27cdc6e2d3bbc677248a7c9f10904968ca34782",
+    "11-three-moves-soft-reflection-clean.mp4": "ad21ad0fc31ec825884a9e72db42546f38ec46df0098f58d989691eb33c39289"
+  },
+  "tracking": "Recomputed from tabletop.mp4 by the normal replay worker. No saved positions or synthetic movement."
+}

@@ -96,13 +96,12 @@ def main(*, smoke_report=None):
                     return
                 if replay.job.error:
                     raise RuntimeError(replay.job.error + "\n" + replay.job.log)
-                if len(replay.review.rows("Detected")) != 11:
-                    raise RuntimeError("Packaged demo did not detect all 11 scripted events")
-                replay.seek(220)
-                replay.views.select(1)
-                if len(replay.map.state["positions"]) != 5:
-                    raise RuntimeError("Packaged map did not show five minis")
-                smoke_result.update(replayDemo=True, replayEvents=11, mapMinis=5,
+                if len(replay.review.rows("Detected")) != 5:
+                    raise RuntimeError("Packaged real example did not detect all five placements")
+                replay.seek(180)
+                if replay.map.state["positions"].get("Red mini", {}).get("cell") != "K21":
+                    raise RuntimeError("Packaged real example did not show the tracked mini at K21")
+                smoke_result.update(replayDemo=True, replayEvents=5, mapMinis=1,
                                     replayWorkerReaped=replay.job.process.returncode == 0)
                 root.quit()
             except Exception as exc:
@@ -150,8 +149,7 @@ def main(*, smoke_report=None):
                     return
                 from replay_window import ReplayWindow
                 import time
-                app.replay = ReplayWindow(root, resource_path("demo/five_minis.mp4"))
-                app.replay.analyze()
+                app.replay = ReplayWindow(root, resource_path("demo/tabletop.mp4"), demo=True)
                 root.after(100, lambda: inspect_replay(time.monotonic() + 45))
             except Exception as exc:
                 smoke_result.update(ok=False, error=str(exc))

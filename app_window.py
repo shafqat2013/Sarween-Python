@@ -52,9 +52,9 @@ class AppWindow:
         ttk.Label(header, text="Sarween", font=("Helvetica", 20, "bold")).pack(side="left")
         self.start_button = ttk.Button(header, text="Start live session", command=self.start_session)
         self.start_button.pack(side="right")
-        self.recording_button = ttk.Button(header, text="Open recording", command=self.open_recording)
+        self.recording_button = ttk.Button(header, text="Open your video", command=self.open_recording)
         self.recording_button.pack(side="right", padx=6)
-        self.demo_button = ttk.Button(header, text="Try demo", command=self.open_demo)
+        self.demo_button = ttk.Button(header, text="Watch real example", command=self.open_demo)
         self.demo_button.pack(side="right")
         self.status = tk.StringVar(root, value="Idle - camera off")
         ttk.Label(outer, textvariable=self.status).pack(anchor="w", pady=(0, 12))
@@ -228,7 +228,7 @@ class AppWindow:
         if not self.auth.allowed:
             self.status.set(self.auth.status())
             return
-        path = path or filedialog.askopenfilename(parent=self.root, title="Open recording",
+        path = path or filedialog.askopenfilename(parent=self.root, title="Open your video",
                     filetypes=[("Video", "*.mp4 *.mov *.avi *.mkv"), ("All files", "*")])
         if not path:
             return
@@ -246,7 +246,7 @@ class AppWindow:
         from pathlib import Path
         import sys
         base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-        self.open_recording(base / "demo" / "five_minis.mp4", demo=True)
+        self.open_recording(base / "demo" / "tabletop.mp4", demo=True)
 
     def close(self):
         if self.closed:

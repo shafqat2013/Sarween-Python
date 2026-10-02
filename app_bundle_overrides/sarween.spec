@@ -24,7 +24,11 @@ added_files = [
     ("module.json",             "."),   # Foundry module manifest
     ("tk_camera_preview.py",    "."),   # Tkinter camera preview window
     ("maps/dnd1.jpg",           "maps"),# demo map only; custom maps stay external
-    ("demo",                   "demo"),# synthetic footage, never personal recordings
+    # Only the approved privacy-edited real example ships. Synthetic clips stay in tests.
+    ("demo/tabletop.mp4", "demo"),
+    ("demo/tabletop.tracking.json", "demo"),
+    ("demo/tabletop.profiles.json", "demo"),
+    ("demo/tabletop.provenance.json", "demo"),
 ]
 
 # ── Hidden imports ─────────────────────────────────────────────────────────────

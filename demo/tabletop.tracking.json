@@ -1,0 +1,341 @@
+{
+  "schemaVersion": 1,
+  "markerMode": "viewport",
+  "framesUndistorted": true,
+  "warpWidth": 1280,
+  "warpHeight": 720,
+  "gridCols": 48,
+  "gridRows": 27,
+  "video": "tabletop.mp4",
+  "title": "Real tabletop example",
+  "synthetic": false,
+  "description": "Real recording \u00b7 surroundings masked and reflection blurred",
+  "fps": 13.544,
+  "frameWidth": 1164,
+  "frameHeight": 984,
+  "framesRecorded": 204,
+  "events": [
+    {
+      "frame": 0,
+      "sceneInfo": {
+        "type": "sceneInfo",
+        "sceneId": "tabletop-example",
+        "width": 2400,
+        "height": 1350,
+        "gridSize": 50,
+        "shiftX": 0,
+        "shiftY": 0
+      },
+      "viewTransform": {
+        "type": "viewTransform",
+        "sceneId": "tabletop-example",
+        "viewportMarkerMode": true,
+        "viewportWidth": 1920.0,
+        "viewportHeight": 1080.0,
+        "registration": {
+          "left": 28.0,
+          "top": 28.0,
+          "right": 1892.0,
+          "bottom": 1052.0
+        },
+        "canvasTransform": {
+          "a": 0.8090677242847714,
+          "b": 0.0,
+          "c": 0.0,
+          "d": 0.8090677242847714,
+          "tx": -10.881269141725625,
+          "ty": -6.120713892220692
+        },
+        "clientToCanvasTransform": {
+          "a": 1.2359904739544716,
+          "b": 0.0,
+          "c": 0.0,
+          "d": 1.2359904739544716,
+          "tx": 13.449145003707619,
+          "ty": 7.565144064585571
+        },
+        "gridOriginX": 0.0,
+        "gridOriginY": 0.0,
+        "gridSize": 50.0
+      },
+      "sceneVisualRevision": 21,
+      "sceneVisualReason": "sarweenTokenMove"
+    },
+    {
+      "frame": 22,
+      "sceneInfo": {
+        "type": "sceneInfo",
+        "sceneId": "tabletop-example",
+        "width": 2400,
+        "height": 1350,
+        "gridSize": 50,
+        "shiftX": 0,
+        "shiftY": 0
+      },
+      "viewTransform": {
+        "type": "viewTransform",
+        "sceneId": "tabletop-example",
+        "viewportMarkerMode": true,
+        "viewportWidth": 1920.0,
+        "viewportHeight": 1080.0,
+        "registration": {
+          "left": 28.0,
+          "top": 28.0,
+          "right": 1892.0,
+          "bottom": 1052.0
+        },
+        "canvasTransform": {
+          "a": 0.8090677242847714,
+          "b": 0.0,
+          "c": 0.0,
+          "d": 0.8090677242847714,
+          "tx": -10.881269141725625,
+          "ty": -6.120713892220692
+        },
+        "clientToCanvasTransform": {
+          "a": 1.2359904739544716,
+          "b": 0.0,
+          "c": 0.0,
+          "d": 1.2359904739544716,
+          "tx": 13.449145003707619,
+          "ty": 7.565144064585571
+        },
+        "gridOriginX": 0.0,
+        "gridOriginY": 0.0,
+        "gridSize": 50.0
+      },
+      "sceneVisualRevision": 22,
+      "sceneVisualReason": "sarweenTokenMove"
+    },
+    {
+      "frame": 69,
+      "sceneInfo": {
+        "type": "sceneInfo",
+        "sceneId": "tabletop-example",
+        "width": 2400,
+        "height": 1350,
+        "gridSize": 50,
+        "shiftX": 0,
+        "shiftY": 0
+      },
+      "viewTransform": {
+        "type": "viewTransform",
+        "sceneId": "tabletop-example",
+        "viewportMarkerMode": true,
+        "viewportWidth": 1920.0,
+        "viewportHeight": 1080.0,
+        "registration": {
+          "left": 28.0,
+          "top": 28.0,
+          "right": 1892.0,
+          "bottom": 1052.0
+        },
+        "canvasTransform": {
+          "a": 0.8090677242847714,
+          "b": 0.0,
+          "c": 0.0,
+          "d": 0.8090677242847714,
+          "tx": -10.881269141725625,
+          "ty": -6.120713892220692
+        },
+        "clientToCanvasTransform": {
+          "a": 1.2359904739544716,
+          "b": 0.0,
+          "c": 0.0,
+          "d": 1.2359904739544716,
+          "tx": 13.449145003707619,
+          "ty": 7.565144064585571
+        },
+        "gridOriginX": 0.0,
+        "gridOriginY": 0.0,
+        "gridSize": 50.0
+      },
+      "sceneVisualRevision": 23,
+      "sceneVisualReason": "sarweenTokenMove"
+    },
+    {
+      "frame": 111,
+      "sceneInfo": {
+        "type": "sceneInfo",
+        "sceneId": "tabletop-example",
+        "width": 2400,
+        "height": 1350,
+        "gridSize": 50,
+        "shiftX": 0,
+        "shiftY": 0
+      },
+      "viewTransform": {
+        "type": "viewTransform",
+        "sceneId": "tabletop-example",
+        "viewportMarkerMode": true,
+        "viewportWidth": 1920.0,
+        "viewportHeight": 1080.0,
+        "registration": {
+          "left": 28.0,
+          "top": 28.0,
+          "right": 1892.0,
+          "bottom": 1052.0
+        },
+        "canvasTransform": {
+          "a": 0.8090677242847714,
+          "b": 0.0,
+          "c": 0.0,
+          "d": 0.8090677242847714,
+          "tx": -10.881269141725625,
+          "ty": -6.120713892220692
+        },
+        "clientToCanvasTransform": {
+          "a": 1.2359904739544716,
+          "b": 0.0,
+          "c": 0.0,
+          "d": 1.2359904739544716,
+          "tx": 13.449145003707619,
+          "ty": 7.565144064585571
+        },
+        "gridOriginX": 0.0,
+        "gridOriginY": 0.0,
+        "gridSize": 50.0
+      },
+      "sceneVisualRevision": 24,
+      "sceneVisualReason": "sarweenTokenMove"
+    },
+    {
+      "frame": 143,
+      "sceneInfo": {
+        "type": "sceneInfo",
+        "sceneId": "tabletop-example",
+        "width": 2400,
+        "height": 1350,
+        "gridSize": 50,
+        "shiftX": 0,
+        "shiftY": 0
+      },
+      "viewTransform": {
+        "type": "viewTransform",
+        "sceneId": "tabletop-example",
+        "viewportMarkerMode": true,
+        "viewportWidth": 1920.0,
+        "viewportHeight": 1080.0,
+        "registration": {
+          "left": 28.0,
+          "top": 28.0,
+          "right": 1892.0,
+          "bottom": 1052.0
+        },
+        "canvasTransform": {
+          "a": 0.8090677242847714,
+          "b": 0.0,
+          "c": 0.0,
+          "d": 0.8090677242847714,
+          "tx": -10.881269141725625,
+          "ty": -6.120713892220692
+        },
+        "clientToCanvasTransform": {
+          "a": 1.2359904739544716,
+          "b": 0.0,
+          "c": 0.0,
+          "d": 1.2359904739544716,
+          "tx": 13.449145003707619,
+          "ty": 7.565144064585571
+        },
+        "gridOriginX": 0.0,
+        "gridOriginY": 0.0,
+        "gridSize": 50.0
+      },
+      "sceneVisualRevision": 25,
+      "sceneVisualReason": "sarweenTokenMove"
+    },
+    {
+      "frame": 149,
+      "sceneInfo": {
+        "type": "sceneInfo",
+        "sceneId": "tabletop-example",
+        "width": 2400,
+        "height": 1350,
+        "gridSize": 50,
+        "shiftX": 0,
+        "shiftY": 0
+      },
+      "viewTransform": {
+        "type": "viewTransform",
+        "sceneId": "tabletop-example",
+        "viewportMarkerMode": true,
+        "viewportWidth": 1920.0,
+        "viewportHeight": 1080.0,
+        "registration": {
+          "left": 28.0,
+          "top": 28.0,
+          "right": 1892.0,
+          "bottom": 1052.0
+        },
+        "canvasTransform": {
+          "a": 0.8090677242847714,
+          "b": 0.0,
+          "c": 0.0,
+          "d": 0.8090677242847714,
+          "tx": -10.881269141725625,
+          "ty": -6.120713892220692
+        },
+        "clientToCanvasTransform": {
+          "a": 1.2359904739544716,
+          "b": 0.0,
+          "c": 0.0,
+          "d": 1.2359904739544716,
+          "tx": 13.449145003707619,
+          "ty": 7.565144064585571
+        },
+        "gridOriginX": 0.0,
+        "gridOriginY": 0.0,
+        "gridSize": 50.0
+      },
+      "sceneVisualRevision": 26,
+      "sceneVisualReason": "sarweenTokenMove"
+    },
+    {
+      "frame": 175,
+      "sceneInfo": {
+        "type": "sceneInfo",
+        "sceneId": "tabletop-example",
+        "width": 2400,
+        "height": 1350,
+        "gridSize": 50,
+        "shiftX": 0,
+        "shiftY": 0
+      },
+      "viewTransform": {
+        "type": "viewTransform",
+        "sceneId": "tabletop-example",
+        "viewportMarkerMode": true,
+        "viewportWidth": 1920.0,
+        "viewportHeight": 1080.0,
+        "registration": {
+          "left": 28.0,
+          "top": 28.0,
+          "right": 1892.0,
+          "bottom": 1052.0
+        },
+        "canvasTransform": {
+          "a": 0.8090677242847714,
+          "b": 0.0,
+          "c": 0.0,
+          "d": 0.8090677242847714,
+          "tx": -10.881269141725625,
+          "ty": -6.120713892220692
+        },
+        "clientToCanvasTransform": {
+          "a": 1.2359904739544716,
+          "b": 0.0,
+          "c": 0.0,
+          "d": 1.2359904739544716,
+          "tx": 13.449145003707619,
+          "ty": 7.565144064585571
+        },
+        "gridOriginX": 0.0,
+        "gridOriginY": 0.0,
+        "gridSize": 50.0
+      },
+      "sceneVisualRevision": 27,
+      "sceneVisualReason": "sarweenTokenMove"
+    }
+  ]
+}
