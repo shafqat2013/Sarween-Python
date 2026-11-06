@@ -1,0 +1,18 @@
+{
+  "diagonalInches": 54.0,
+  "viewportWidth": 1920,
+  "viewportHeight": 1080,
+  "markerSizePx": 120.0,
+  "markerInsetPx": 8.0,
+  "plateMm": 74.71581292000198,
+  "blackSquareMm": 49.81054194666799,
+  "whiteBorderMm": 12.452635486666997,
+  "screenInsetMm": 4.9810541946667986,
+  "pages": 1,
+  "markerIds": [
+    20,
+    21,
+    22,
+    23
+  ]
+}

@@ -11,7 +11,8 @@ import math
 import re
 import time
 from collections import Counter
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -27,6 +28,8 @@ from ring_calibration import profile_with_sample, sample_ring_patch, save_profil
 from control_panel import ControlPanel, rc_to_a1
 from mini_calibration import load_profiles_with_curves, min_lab_dist_to_profile
 from app_paths import data_path, initialize_user_data, recordings_dir
+from tk_tracking_windows import create_tracking_windows
+from base_geometry import estimate_base_circle
 
 ensure_window = core.ensure_window
 
@@ -63,6 +66,9 @@ PRESENCE_SETTLE_FRAMES = 4
 PRESENCE_MAX_CHANGE_RANGE = 0.0025
 PRESENCE_LAB_BIN_SHIFT = 2
 PRESENCE_PROCESS_SCALE = 0.50
+# A candidate must have useful combined color, shape and size evidence, even
+# when no stronger candidate exists elsewhere on the board.
+PRESENCE_MIN_SCORE = 0.35
 
 _presence_lut_cache: Dict[Tuple[Any, ...], np.ndarray] = {}
 
@@ -283,6 +289,40 @@ def _profile_lab_points(profile: Dict[str, Any]) -> List[Tuple[float, float, flo
     return []
 
 
+def _base_appearance_profile(profile):
+    """Validate the optional localization cue independently of mini identity."""
+    base = profile.get("base_appearance")
+    if not isinstance(base, dict):
+        return None
+    try:
+        points = _profile_lab_points(base)
+        distance = base.get("presence_lab_dist", 18.0)
+        if isinstance(distance, bool):
+            return None
+        distance = float(distance)
+        if (not points or not math.isfinite(distance) or not 1 <= distance <= 40
+                or any(len(point) != 3 or not all(math.isfinite(value) for value in point)
+                       or not 0 <= point[0] <= 100
+                       or not all(-128 <= value <= 127 for value in point[1:])
+                       for point in points)):
+            return None
+        diameter = base.get("diameter_squares")
+        if "diameter_squares" in base:
+            if isinstance(diameter, bool):
+                return None
+            diameter = float(diameter)
+            if not math.isfinite(diameter) or not 0 < diameter <= 6:
+                return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    # Only appearance is learned here. Shape, area and confidence safeguards
+    # remain the same as for the existing ring detector.
+    result = {"lab_curve": points, "presence_lab_dist": distance}
+    if diameter is not None:
+        result["diameter_squares"] = diameter
+    return result
+
+
 def _presence_profile_lut(profile: Dict[str, Any]) -> np.ndarray:
     """Build a cached quantized Lab lookup table for one ring profile."""
     points = _profile_lab_points(profile)
@@ -328,6 +368,10 @@ def _find_presence_candidates(
     verbose: bool = False,
 ) -> List[ComboDetection]:
     """Find ring-shaped regions matching one mini's calibrated Lab color."""
+    if "base_appearance" in profile:
+        return _find_base_presence_candidates(lab_cv, color_index, profile_name, profile,
+                                              grid_px, mask_warp=mask_warp,
+                                              verbose=verbose)
     points = _profile_lab_points(profile)
     if not points:
         return []
@@ -437,6 +481,49 @@ def _find_presence_candidates(
     return candidates
 
 
+def _find_base_presence_candidates(lab_cv, color_index, profile_name, profile, grid_px,
+                                   *, mask_warp=None, verbose=False):
+    """Locate the support base and require the mini's identity nearby.
+
+    A partially hidden ring can look desaturated while the raised miniature
+    remains red. Merging those colors lets its body pull the tracking point.
+    Identity proposals may be small; the location must still meet the existing
+    full-base size, shape and confidence requirements.
+    """
+    base = _base_appearance_profile(profile)
+    if base is None:
+        return []
+    for name in ("presence_min_area_frac", "presence_max_area_frac"):
+        if name in profile:
+            base[name] = profile[name]
+    bases = _find_presence_candidates(lab_cv, color_index, profile_name, base, grid_px,
+        mask_warp=mask_warp, use_enclosing_center=True, verbose=verbose)
+    bases = [candidate for candidate in bases
+             if math.isfinite(candidate.score) and candidate.score >= _presence_min_score(profile)]
+    if "diameter_squares" in base:
+        diameter_px = base["diameter_squares"] * grid_px
+        # A sampled body/weapon patch can share the base color. Require the
+        # visible component to fit the measured maximum footprint. Occlusion
+        # can hide part of the ring, so its visible span has no new lower bound.
+        bases = [candidate for candidate in bases
+                 if max(candidate.bbox[2:]) <= 1.35 * diameter_px]
+    identity = {key: value for key, value in profile.items() if key != "base_appearance"}
+    identity["presence_min_area_frac"] = .01
+    seeds = _find_presence_candidates(lab_cv, color_index, profile_name, identity, grid_px,
+        mask_warp=mask_warp, use_enclosing_center=True, verbose=False)
+    seeds = [seed for seed in seeds
+             if math.isfinite(seed.score) and seed.score >= _presence_min_score(profile)]
+    supported, ambiguous = set(), set()
+    for seed in seeds:
+        nearby = [index for index, base in enumerate(bases)
+                  if math.hypot(base.cx - seed.cx, base.cy - seed.cy) <= grid_px]
+        # One identity cannot establish ownership of two separate bases.
+        distinct = any(math.hypot(bases[a].cx - bases[b].cx, bases[a].cy - bases[b].cy)
+                       > grid_px * .4 for a in nearby for b in nearby)
+        (ambiguous if distinct else supported).update(nearby)
+    return [base for index, base in enumerate(bases) if index in supported - ambiguous]
+
+
 def _rescale_detection(
     detection: ComboDetection,
     inverse_scale: float,
@@ -492,6 +579,106 @@ def _select_presence_candidate(
     return candidates[0]
 
 
+def _presence_min_score(profile: Dict[str, Any]) -> float:
+    value = profile.get("presence_min_score", PRESENCE_MIN_SCORE)
+    try:
+        if isinstance(value, bool):
+            return PRESENCE_MIN_SCORE
+        value = float(value)
+    except (TypeError, ValueError):
+        return PRESENCE_MIN_SCORE
+    return value if math.isfinite(value) and 0.0 <= value <= 1.0 else PRESENCE_MIN_SCORE
+
+
+def _watermark_obscures_candidate(candidate, watermark_mask, grid_px):
+    """Treat caption-covered ring pixels as unavailable, without modifying them."""
+    if watermark_mask is None:
+        return False
+    # A caption can leave a crescent whose colored contour stops short of the
+    # covered portion. Check a full base-sized footprint, not only that contour.
+    radius = max(2.0, float(grid_px) * .75,
+                 max(candidate.bbox[2:]) * .5)
+    height, width = watermark_mask.shape
+    left = max(0, int(math.floor(candidate.cx - radius)))
+    right = min(width, int(math.ceil(candidate.cx + radius)) + 1)
+    top = max(0, int(math.floor(candidate.cy - radius)))
+    bottom = min(height, int(math.ceil(candidate.cy + radius)) + 1)
+    if right <= left or bottom <= top:
+        return False
+    region = watermark_mask[top:bottom, left:right]
+    if not np.any(region):
+        return False
+    ys, xs = np.ogrid[top:bottom, left:right]
+    footprint = ((xs - candidate.cx) ** 2 + (ys - candidate.cy) ** 2) <= radius * radius
+    return bool(np.any((region != 0) & footprint))
+
+
+def _base_color_component_mask(color_index, profile, candidate, process_scale, output_shape,
+                               process_mask=None):
+    """Reconstruct only the accepted color component around one candidate.
+
+    Use the same quantized Lab lookup and morphology as detection. A local
+    padded ROI avoids another full-frame color pass and unrelated red objects.
+    """
+    x, y, width, height = (int(round(value * process_scale)) for value in candidate.bbox)
+    pad = PRESENCE_OPEN_PX + PRESENCE_CLOSE_PX
+    left, top = max(0, x - pad), max(0, y - pad)
+    right = min(color_index.shape[1], x + width + pad)
+    bottom = min(color_index.shape[0], y + height + pad)
+    if right <= left or bottom <= top:
+        return None
+    local = np.where(_presence_profile_lut(profile)[color_index[top:bottom, left:right]],
+                     255, 0).astype(np.uint8)
+    if process_mask is not None:
+        local = cv2.bitwise_and(local, process_mask[top:bottom, left:right])
+    for operation, size in ((cv2.MORPH_OPEN, PRESENCE_OPEN_PX), (cv2.MORPH_CLOSE, PRESENCE_CLOSE_PX)):
+        local = cv2.morphologyEx(local, operation,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)))
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(local)
+    best, best_overlap = None, .75
+    for index in range(1, count):
+        sx, sy, sw, sh, _area = stats[index]
+        sx, sy = int(sx) + left, int(sy) + top
+        intersection = max(0, min(x + width, sx + sw) - max(x, sx)) * max(
+            0, min(y + height, sy + sh) - max(y, sy))
+        overlap = intersection / max(1, width * height + int(sw) * int(sh) - intersection)
+        if overlap > best_overlap:
+            best, best_overlap = index, overlap
+    if best is None:
+        return None
+    selected = np.where(labels == best, 255, 0).astype(np.uint8)
+    inverse = 1.0 / process_scale
+    selected = cv2.resize(selected, (int(round(selected.shape[1] * inverse)),
+                                    int(round(selected.shape[0] * inverse))), interpolation=cv2.INTER_NEAREST)
+    full = np.zeros(output_shape, np.uint8)
+    full_left, full_top = int(round(left * inverse)), int(round(top * inverse))
+    rows = min(selected.shape[0], output_shape[0] - full_top)
+    cols = min(selected.shape[1], output_shape[1] - full_left)
+    if rows <= 0 or cols <= 0:
+        return None
+    full[full_top:full_top + rows, full_left:full_left + cols] = selected[:rows, :cols]
+    return full
+
+
+def _camera_preview(bundle):
+    """Annotate a display copy, leaving tracking and recording pixels untouched."""
+    preview = bundle.cam_bgr.copy()
+    if not _fresh_camera_frame(bundle):
+        cv2.putText(preview, "iPhone feed paused - cached preview only", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    elif not bundle.locked:
+        cv2.putText(preview,
+                    f"Waiting for ArUco lock ({bundle.last_marker_count}/4)",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+    watermark = getattr(bundle, "watermark_mask_cam", None)
+    if (isinstance(watermark, np.ndarray) and watermark.ndim == 2
+            and watermark.shape == preview.shape[:2] and np.any(watermark)):
+        cv2.putText(preview, "OBS watermark masked", (20, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2, cv2.LINE_AA)
+    return preview
+
+
 def _updated_change_history(previous: Dict[str, Any], ratio: float) -> List[float]:
     history = list(previous.get("change_hist") or [])
     history.append(float(ratio))
@@ -539,9 +726,16 @@ def detect_minis(
         name: _updated_change_history(prev_state.get(name, {}), raw_change)
         for name in profiles
     }
-    if bundle.warp_bgr is None or _has_large_obstruction(bundle):
+    watermark_mask = getattr(bundle, "watermark_mask_warp", None)
+    invalid_watermark = (watermark_mask is not None and
+                         (not isinstance(watermark_mask, np.ndarray)
+                          or watermark_mask.ndim != 2
+                          or bundle.warp_bgr is None
+                          or watermark_mask.shape != bundle.warp_bgr.shape[:2]))
+    if bundle.warp_bgr is None or invalid_watermark or _has_large_obstruction(bundle):
         if verbose and bundle.warp_bgr is not None:
-            print("  RING | hand/arm obstruction; ignoring this frame")
+            print("  RING | invalid caption mask; ignoring this frame" if invalid_watermark else
+                  "  RING | hand/arm obstruction; ignoring this frame")
         for name in profiles:
             previous = prev_state.get(name, {})
             detections[name] = None
@@ -625,6 +819,32 @@ def detect_minis(
                 _rescale_detection(candidate, 1.0 / process_scale)
                 for candidate in candidates
             ]
+        minimum_score = _presence_min_score(profile)
+        accepted = []
+        for candidate in candidates:
+            if not math.isfinite(candidate.score) or candidate.score < minimum_score:
+                if verbose:
+                    print(f"  RING | {name}: weak candidate score {candidate.score:.3f} < {minimum_score:.3f}")
+                continue
+            # Body projections can extend beyond a circular support base.
+            # Refine only a strong color detection with unambiguous local
+            # geometry; covered or uncertain regions retain the original point.
+            if ("base_appearance" not in profile
+                    and not _watermark_obscures_candidate(candidate, watermark_mask, grid_px)):
+                associated_color = _base_color_component_mask(color_index, profile, candidate,
+                    process_scale, bundle.warp_bgr.shape[:2], process_mask)
+                base = estimate_base_circle(bundle.warp_bgr, (candidate.cx, candidate.cy),
+                                            candidate.bbox, grid_px,
+                                            color_mask=associated_color,
+                                            excluded_mask=watermark_mask)
+                if base is not None:
+                    candidate = replace(candidate, cx=base.cx, cy=base.cy)
+            if _watermark_obscures_candidate(candidate, watermark_mask, grid_px):
+                if verbose:
+                    print(f"  RING | {name}: caption covers candidate; waiting for a clear view")
+                continue
+            accepted.append(candidate)
+        candidates = accepted
         selected = _select_presence_candidate(candidates, previous, grid_px)
         detections[name] = selected
         if selected is None:
@@ -776,6 +996,9 @@ def tracking_context(bundle, *, now, selected_mini=None, paused=False):
     geometry = (marker_mode, bundle.warp_w, bundle.warp_h, bundle.grid_w, bundle.grid_h)
     geometry += tuple(scene[key] for key in
                       ("sceneId", "sceneW", "sceneH", "gridPx", "gridType", "shiftX", "shiftY", "background"))
+    registration = getattr(bundle, "registration_metadata", None)
+    if registration is not None:
+        geometry += ("markerRegistration", json.dumps(registration, sort_keys=True, allow_nan=False))
     if marker_mode == "viewport":
         dimensions = fo.warp_grid_dimensions_from_snapshot(view, bundle.warp_w, bundle.warp_h)
         valid = (view is not None and view["sceneId"] == scene["sceneId"]
@@ -788,6 +1011,12 @@ def tracking_context(bundle, *, now, selected_mini=None, paused=False):
         grid_px = _grid_px_for_bundle(bundle)
         to_cell = lambda x, y: _warp_to_cell(x, y, bundle.grid_w, bundle.grid_h, bundle.warp_w, bundle.warp_h)
     return TrackingContext(now, geometry, revision, grid_px, to_cell, selected_mini, paused)
+
+
+def _fresh_camera_frame(bundle):
+    """Native/legacy bundles default fresh; USB diagnostic holds never do."""
+    metadata = getattr(bundle, "camera_source_metadata", None)
+    return not isinstance(metadata, dict) or metadata.get("freshFrame") is not False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -910,7 +1139,8 @@ def close_pending_recording():
             fo.stop_timeline_recording()
 
 
-def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access=None):
+def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access=None, foundry_service=None,
+                  observation_only=False, control_parent=None, control_started=None, camera_capture=None):
     if access is not None:
         access.require()
     initialize_user_data()
@@ -921,7 +1151,7 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
     profiles = load_profiles_with_curves(_PROFILES_PATH)
     mini_library = ml.load_synced_library(profiles)
 
-    sess = core.CVCoreSession(camera_index=camera_index)
+    sess = core.CVCoreSession(camera_index=camera_index, camera_capture=camera_capture)
 
     # Re-attach recorder if it was carried over from a previous session
     global _pending_recorder, _pending_record_path
@@ -936,8 +1166,15 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
     except Exception:
         _shared_root = None
 
-    panel = ControlPanel(mode=mode, tk_root=_shared_root)
+    panel_options = {"mode": mode, "tk_root": _shared_root, "access": access,
+                     "foundry_service": foundry_service}
+    if control_parent is not None:
+        panel_options["parent"] = control_parent
+    panel = ControlPanel(**panel_options)
     panel.show()
+    if control_started is not None:
+        control_started(panel)
+    display_backend = create_tracking_windows(panel._tk_root, enabled=show_windows)
 
     def update_library_panel(detections=None, positions=None):
         mappings, token_names = fo.get_mini_assignments()
@@ -964,7 +1201,14 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
         pass
 
     engine = TrackingEngine(detect_minis, consensus_n=CONSENSUS_N, consensus_k=CONSENSUS_K)
-    sess.recording_state_provider = lambda: {"engine": engine.snapshot(), "profiles": profiles}
+    observer = None
+    observer_mode = bool(observation_only)
+    observer_requested = bool(observation_only)
+    if observer_mode:
+        fo.set_observation_only(True)
+    sess.recording_state_provider = lambda: (
+        {"observer": observer.snapshot(), "profiles": profiles} if observer_mode and observer is not None
+        else {"engine": engine.snapshot(), "profiles": profiles})
     prev_state, cell_hist = engine.prev_state, engine.cell_hist
     last_emitted, last_physical_xy = engine.last_emitted, engine.last_physical_xy
     _last_seen = engine.last_seen
@@ -1000,19 +1244,46 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
                 if hasattr(access, "usage_state"):
                     access.usage_state("tracking", True)
 
+            panel.set_camera_calibration_status(sess.camera_calibration_metadata())
+
             _now = time.perf_counter()
-            if sess.is_recording:
+            fresh_camera_frame = _fresh_camera_frame(bundle)
+            if sess.is_recording and fresh_camera_frame:
                 fo.record_tracking_input(_now)
             _do_display = show_windows and (_now - _last_display >= _display_interval)
             if _do_display:
                 _last_display = _now
 
             actions = panel.pop_actions()
-            if actions.get("retry_moves"):
+            if observer_requested:
+                actions["open_observer"] = True
+                observer_requested = False
+            if actions.get("open_observer"):
+                # Latch before constructing UI; an observer error must never
+                # fall through into the old tracker and issue token commands.
+                observer_mode = True
+                fo.set_observation_only(True)
+                if observer is None or observer.closed:
+                    try:
+                        from observer_session import LiveObserverController
+                        observer = LiveObserverController(panel._tk_root, recordings_dir() / "Observer")
+                        fo.queue_control({"type": "referenceCapture", "enabled": True})
+                        display_backend.destroyAllWindows()
+                    except Exception as exc:
+                        panel.set_hint(f"Observer could not open: {exc}. Foundry movement remains off.")
+                else:
+                    observer.window.window.deiconify()
+                    observer.window.window.lift()
+            if actions.get("retry_moves") and not observer_mode and fresh_camera_frame:
                 fo.retry_failed_moves()
             if actions.get("scan_mini"):
                 actions["calibrate_band"] = {"name": str(actions["scan_mini"])}
-            fo.update_camera_lock(bundle.locked, bundle.last_missing_ids)
+            if not fresh_camera_frame:
+                blocked = [name for name in ("calibrate_band", "calibrate_minis", "recapture_bg") if actions.pop(name, None)]
+                if blocked:
+                    panel.set_hint("Wait for a fresh iPhone camera frame before capturing camera samples")
+            fo.update_camera_lock(bundle.locked, bundle.last_missing_ids,
+                                  marker_registration=getattr(bundle, "registration_metadata", None))
             scene = fo.get_scene_params()
             engine.synchronize(tracking_context(bundle, now=_now, selected_mini=fo.get_selected_mini(),
                                                 paused=fo.tracking_output_paused()))
@@ -1066,13 +1337,17 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
                         panel.set_hint("Calibrate: wait for ArUco lock")
                     continue
                 lab = tuple(req["sample_lab"])
-                rejection = _calibration_rejection_reason(name, lab)
+                sample_kind = req.get("sample_kind", "identity")
+                rejection = (_calibration_rejection_reason(name, lab)
+                             if sample_kind == "identity" else None)
                 if rejection:
                     panel.set_hint(f"Calibration rejected for {name}: {rejection}")
                     continue
                 try:
                     prof = profile_with_sample(profiles.get(name), lab,
-                                               replace_colors=bool(req.get("replace_colors")))
+                                               replace_colors=bool(req.get("replace_colors")),
+                                               sample_kind=sample_kind,
+                                               base_diameter_squares=req.get("base_diameter_squares"))
                     updated = {**profiles, name: prof}
                     _save_profiles(updated)
                     profiles = updated
@@ -1080,10 +1355,12 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
                     if sess.is_recording:
                         fo.record_profile_change(profiles, name)
                     try:
-                        ml.add_verified_sample(name, lab, source="manual-ring-sample",
-                                               conditions={"fog": "unknown", "roomLighting": "current"})
+                        if sample_kind == "identity":
+                            ml.add_verified_sample(name, lab, source="manual-ring-sample",
+                                                   conditions={"fog": "unknown", "roomLighting": "current"})
                         mini_library = ml.load_synced_library(profiles)
-                        panel.set_hint(f"Ring sample saved: {name}")
+                        label = "Base appearance saved" if sample_kind == "base_appearance" else "Ring sample saved"
+                        panel.set_hint(f"{label}: {name}")
                     except Exception as e:
                         panel.set_hint(f"Profile saved; portfolio update failed: {e}")
                     update_library_panel()
@@ -1100,6 +1377,8 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
                     bg_warp = core.warp_gray_blur(cam, sess.H_saved, sess.warp_w, sess.warp_h)
                     sess.BG_warp_f32 = bg_warp.astype(np.float32)
                     sess._bg_seeded = True
+                    if hasattr(sess, "reset_watermark_background"):
+                        sess.reset_watermark_background()
                     if sess.is_recording:
                         sess._checkpoint_kind = "background"
                     panel.set_hint("Background recaptured ✅")
@@ -1135,7 +1414,7 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
                           f"({_pending_record_path})", flush=True)
                 panel.set_hint("Stopping for mini calibration...")
                 sess.close(preserve_recording=True)
-                cv2.destroyAllWindows()
+                display_backend.destroyAllWindows()
                 panel.hide()
                 return "recalibrate"
 
@@ -1184,28 +1463,62 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
             # ── Camera view ──────────────────────────────────────────────────
             if show_windows and show_cam_view:
                 if _do_display:
-                    vis_cam = bundle.cam_bgr.copy()
-                    if not bundle.locked:
-                        cv2.putText(vis_cam,
-                                    f"Waiting for ArUco lock ({bundle.last_marker_count}/4)",
-                                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                                    (255, 255, 255), 2, cv2.LINE_AA)
-                    ensure_window("Camera (combo)", 1280, 720)
-                    cv2.imshow("Camera (combo)", vis_cam)
+                    vis_cam = _camera_preview(bundle)
+                    display_backend.ensure_window("Camera (combo)", 1280, 720)
+                    display_backend.imshow("Camera (combo)", vis_cam)
                 cam_window_open = True
-                cv2.waitKey(1)
+                display_backend.waitKey(1)
             else:
                 if cam_window_open:
                     try:
-                        cv2.waitKey(1)
-                        cv2.destroyWindow("Camera (combo)")
+                        display_backend.waitKey(1)
+                        display_backend.destroyWindow("Camera (combo)")
                     except Exception:
                         pass
                     cam_window_open = False
 
             _do_verbose = verbose_tracking and bundle.locked
             _now_t = time.perf_counter()
-            if sess.is_recording:
+            if observer_mode:
+                if observer is not None and not observer.closed:
+                    try:
+                        view = fo.get_view_transform_payload()
+                        reference_status = (fo.get_rendered_reference_status()
+                                            if hasattr(fo, "get_rendered_reference_status") else {})
+                        if hasattr(fo, "get_latest_rendered_reference"):
+                            observer.ingest_reference(fo.get_latest_rendered_reference())
+                        result = observer.update(bundle.warp_bgr,
+                            getattr(sess, "_watermark_current_exclusion_warp", None),
+                            sess.frame_time, view=view,
+                            locked=bool(bundle.locked and not sess.lock_miss_streak),
+                            frame_index=bundle.frame_idx, calibration=sess.camera_calibration_metadata(),
+                            registration=getattr(bundle, "registration_metadata", None),
+                            metadata={"reference_status": reference_status,
+                                      "camera_source": deepcopy(getattr(bundle, "camera_source_metadata", None)),
+                                      "scene_visual_revision": fo.get_scene_visual_revision()})
+                        if result:
+                            positions = {}
+                            for name, value in result["current_cells"].items():
+                                label = value["cell"] or ("/".join(value["cells"]) + " (?)"
+                                                         if value["cells"] else "unknown")
+                                if name in result.get("held", []):
+                                    label += " (held)"
+                                positions[name] = label
+                            panel.update_positions(positions)
+                            panel.set_hint("Observer: " + result["state"]["reason"].replace("_", " ")
+                                           + " · Foundry movement off")
+                    except Exception as exc:
+                        panel.set_hint(f"Observer held: {exc}. Foundry movement remains off.")
+                else:
+                    panel.set_hint("Observer closed. Reopen it to continue; Foundry movement remains off.")
+                # The old detector, physical taps and movement emission below
+                # are unreachable throughout this observation-only session.
+                continue
+            if not fresh_camera_frame:
+                source = getattr(bundle, "camera_source_metadata", {}) or {}
+                panel.set_hint(source.get("message") or "Waiting for a fresh iPhone camera frame")
+                continue
+            if sess.is_recording and fresh_camera_frame:
                 fo.record_tracking_input(_now_t, tracked=True)
             context = tracking_context(bundle, now=_now_t, selected_mini=fo.get_selected_mini(),
                                        paused=fo.tracking_output_paused())
@@ -1227,7 +1540,8 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
                                               bundle.warp_w, bundle.warp_h,
                                               bundle.grid_w, bundle.grid_h,
                                               marker_mode=bundle.marker_mode,
-                                              corner_ids=sess.corner_ids)
+                                              corner_ids=sess.corner_ids,
+                                              display_backend=display_backend)
                 continue
             if step.reason == "unmapped":
                 panel.set_hint("Foundry tracking requires a square grid" if scene.get("gridType") not in (None, 1)
@@ -1264,14 +1578,14 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,0), 2, cv2.LINE_AA)
                         cv2.putText(vis_warp, label, (x, max(18, y-6)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1, cv2.LINE_AA)
-                    ensure_window("Warp (combo)", 1280, 720)
-                    cv2.imshow("Warp (combo)", vis_warp)
+                    display_backend.ensure_window("Warp (combo)", 1280, 720)
+                    display_backend.imshow("Warp (combo)", vis_warp)
                 any_cv_window_open = True
                 warp_window_open = True
             else:
                 if warp_window_open:
                     try:
-                        cv2.waitKey(1); cv2.destroyWindow("Warp (combo)")
+                        display_backend.waitKey(1); display_backend.destroyWindow("Warp (combo)")
                     except Exception:
                         pass
                     warp_window_open = False
@@ -1279,15 +1593,15 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
             # ── Calibration preview ──────────────────────────────────────────
             if show_windows and show_calib_preview and bundle.locked:
                 if _do_display:
-                    cv2.imshow("Combo Calibration Preview",
+                    display_backend.imshow("Combo Calibration Preview",
                                render_calibration_preview(bundle))
-                    ensure_window("Combo Calibration Preview", 1280, 720)
+                    display_backend.ensure_window("Combo Calibration Preview", 1280, 720)
                 any_cv_window_open = True
                 calib_preview_window_open = True
             else:
                 if calib_preview_window_open:
                     try:
-                        cv2.waitKey(1); cv2.destroyWindow("Combo Calibration Preview")
+                        display_backend.waitKey(1); display_backend.destroyWindow("Combo Calibration Preview")
                     except Exception:
                         pass
                     calib_preview_window_open = False
@@ -1295,14 +1609,14 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
             # ── Motion warp ──────────────────────────────────────────────────
             if show_windows and show_motion_warp_view and bundle.motion_warp is not None:
                 if _do_display:
-                    ensure_window("Motion (warp)", 1280, 720)
-                    cv2.imshow("Motion (warp)", bundle.motion_warp)
+                    display_backend.ensure_window("Motion (warp)", 1280, 720)
+                    display_backend.imshow("Motion (warp)", bundle.motion_warp)
                 any_cv_window_open = True
                 motion_warp_window_open = True
             else:
                 if motion_warp_window_open:
                     try:
-                        cv2.waitKey(1); cv2.destroyWindow("Motion (warp)")
+                        display_backend.waitKey(1); display_backend.destroyWindow("Motion (warp)")
                     except Exception:
                         pass
                     motion_warp_window_open = False
@@ -1310,14 +1624,14 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
             # ── Motion camera ────────────────────────────────────────────────
             if show_windows and show_motion_cam_view and bundle.motion_cam is not None:
                 if _do_display:
-                    ensure_window("Motion (camera)", 1280, 720)
-                    cv2.imshow("Motion (camera)", bundle.motion_cam)
+                    display_backend.ensure_window("Motion (camera)", 1280, 720)
+                    display_backend.imshow("Motion (camera)", bundle.motion_cam)
                 any_cv_window_open = True
                 motion_cam_window_open = True
             else:
                 if motion_cam_window_open:
                     try:
-                        cv2.waitKey(1); cv2.destroyWindow("Motion (camera)")
+                        display_backend.waitKey(1); display_backend.destroyWindow("Motion (camera)")
                     except Exception:
                         pass
                     motion_cam_window_open = False
@@ -1325,14 +1639,14 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
             # ── Shadow-free mask ─────────────────────────────────────────────
             if show_windows and show_shadowfree_view and bundle.shadowfree_cam is not None:
                 if _do_display:
-                    ensure_window("Shadow-free mask", 1280, 720)
-                    cv2.imshow("Shadow-free mask", bundle.shadowfree_cam)
+                    display_backend.ensure_window("Shadow-free mask", 1280, 720)
+                    display_backend.imshow("Shadow-free mask", bundle.shadowfree_cam)
                 any_cv_window_open = True
                 shadowfree_window_open = True
             else:
                 if shadowfree_window_open:
                     try:
-                        cv2.waitKey(1); cv2.destroyWindow("Shadow-free mask")
+                        display_backend.waitKey(1); display_backend.destroyWindow("Shadow-free mask")
                     except Exception:
                         pass
                     shadowfree_window_open = False
@@ -1340,14 +1654,14 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
             # ── Final mask ───────────────────────────────────────────────────
             if show_windows and show_final_mask_view and bundle.final_mask_cam is not None:
                 if _do_display:
-                    ensure_window("Final mask", 1280, 720)
-                    cv2.imshow("Final mask", bundle.final_mask_cam)
+                    display_backend.ensure_window("Final mask", 1280, 720)
+                    display_backend.imshow("Final mask", bundle.final_mask_cam)
                 any_cv_window_open = True
                 final_mask_window_open = True
             else:
                 if final_mask_window_open:
                     try:
-                        cv2.waitKey(1); cv2.destroyWindow("Final mask")
+                        display_backend.waitKey(1); display_backend.destroyWindow("Final mask")
                     except Exception:
                         pass
                     final_mask_window_open = False
@@ -1358,13 +1672,14 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
                                           bundle.warp_w, bundle.warp_h,
                                           bundle.grid_w, bundle.grid_h,
                                           marker_mode=bundle.marker_mode,
-                                          corner_ids=sess.corner_ids)
+                                          corner_ids=sess.corner_ids,
+                                              display_backend=display_backend)
                 homography_window_open = True
                 any_cv_window_open = True
             else:
                 if homography_window_open:
                     try:
-                        cv2.destroyWindow("Homography view (debug)")
+                        display_backend.destroyWindow("Homography view (debug)")
                     except Exception:
                         pass
                     homography_window_open = False
@@ -1397,11 +1712,16 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
                 _last_library_update = _now_t
 
             if show_windows and any_cv_window_open:
-                k = cv2.waitKey(1) & 0xFF
+                k = display_backend.waitKey(1) & 0xFF
                 if k == ord('q'):
                     break
 
     finally:
+        if observer is not None:
+            try:
+                observer.close()
+            except Exception:
+                pass
         if access is not None and hasattr(access, "usage_state"):
             access.usage_state("tracking", False)
         if fo.guided_capture_active():
@@ -1411,8 +1731,11 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
             sess.close()
         except Exception:
             pass
+        if observer_mode:
+            fo.queue_control({"type": "referenceCapture", "enabled": False})
+            fo.set_observation_only(False)
         try:
-            cv2.destroyAllWindows()
+            display_backend.destroyAllWindows()
         except Exception:
             pass
         try:

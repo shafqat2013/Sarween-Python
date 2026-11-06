@@ -42,12 +42,23 @@ class TrackingStep:
 
 class TrackingEngine:
     def __init__(self, detector, *, consensus_n=6, consensus_k=4,
-                 lost_timeout=2.0, selected_lost_timeout=0.75):
+                 lost_timeout=2.0, selected_lost_timeout=0.75,
+                 physical_taps_enabled=False, cell_margin_fraction=0.12):
         if not 1 <= consensus_k <= consensus_n:
             raise ValueError("Consensus requires 1 <= k <= n")
         if not all(math.isfinite(value) and value > 0 for value in (lost_timeout, selected_lost_timeout)):
             raise ValueError("Lost-mini timeouts must be finite and positive")
+        if not isinstance(physical_taps_enabled, bool):
+            raise ValueError("Physical taps must be explicitly enabled or disabled")
+        try:
+            margin = float(cell_margin_fraction)
+        except (TypeError, ValueError):
+            raise ValueError("Cell interior margin must be finite and between 0 and 0.5") from None
+        if isinstance(cell_margin_fraction, bool) or not math.isfinite(margin) or not 0 <= margin < .5:
+            raise ValueError("Cell interior margin must be finite and between 0 and 0.5")
         self.detector = detector
+        self.physical_taps_enabled = physical_taps_enabled
+        self.cell_margin_fraction = margin
         self.consensus_n, self.consensus_k = consensus_n, consensus_k
         self.lost_timeout, self.selected_lost_timeout = lost_timeout, selected_lost_timeout
         self.prev_state: dict[str, Any] = {}
@@ -123,6 +134,25 @@ class TrackingEngine:
         return ((col + .5) * bundle.warp_w / bundle.grid_w,
                 (row + .5) * bundle.warp_h / bundle.grid_h)
 
+    def _interior_cell(self, detection, context):
+        """Abstain near boundaries, including the first placement.
+
+        Sampling the supplied mapping also handles rotated/sheared views. This
+        cannot infer an intended initial cell or correct biased localization.
+        """
+        cell = context.to_cell(detection.cx, detection.cy)
+        if cell is None or self.cell_margin_fraction == 0:
+            return cell
+        margin = context.grid_px * self.cell_margin_fraction
+        if not math.isfinite(margin) or margin <= 0:
+            return None
+        for dx, dy in ((-1, -1), (-1, 0), (-1, 1), (0, -1),
+                       (0, 1), (1, -1), (1, 0), (1, 1)):
+            if context.to_cell(detection.cx + dx * margin,
+                               detection.cy + dy * margin) != cell:
+                return None
+        return cell
+
     def step(self, bundle, profiles, context, *, verbose=False):
         if not math.isfinite(context.now) or (self._last_time is not None and context.now < self._last_time):
             raise ValueError("Tracking clock must be finite and monotonic")
@@ -173,16 +203,22 @@ class TrackingEngine:
             if detection is not None:
                 self.last_seen[mini] = context.now
 
-        contacts = contact_minis(bundle, self.last_physical_xy, context.grid_px)
-        detected_positions = {name: (det.cx, det.cy) for name, det in detections.items() if det is not None}
-        result.tapped_mini = self.tap_detector.update(
-            context.now, contacts, self.last_physical_xy if contacts else detected_positions, context.grid_px)
+        # Experimental tap selection stays off in live sessions and replay.
+        if self.physical_taps_enabled:
+            contacts = contact_minis(bundle, self.last_physical_xy, context.grid_px)
+            detected_positions = {name: (det.cx, det.cy) for name, det in detections.items() if det is not None}
+            result.tapped_mini = self.tap_detector.update(
+                context.now, contacts, self.last_physical_xy if contacts else detected_positions, context.grid_px)
 
+        for mini in tuple(self.cell_hist):
+            if detections.get(mini) is None:
+                self.cell_hist.pop(mini, None)
         for mini, detection in detections.items():
             if detection is None:
                 continue
-            mapped = context.to_cell(detection.cx, detection.cy)
+            mapped = self._interior_cell(detection, context)
             if mapped is None:
+                self.cell_hist.pop(mini, None)
                 continue
             col, row = mapped
             cell = f"r{row}c{col}"

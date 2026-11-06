@@ -21,7 +21,7 @@ import tempfile
 STATE_FILES = (
     "hardware_config.json", "combo_profiles.json", "band_profiles.json",
     "mini_library.json", "mini_token_map.json", "camera_matrix.npy",
-    "dist_coeffs.npy", "mini_database.csv",
+    "dist_coeffs.npy", "mini_database.csv", "hardware_profiles.json",
 )
 MIGRATION_FILE = "migration-v1.json"
 

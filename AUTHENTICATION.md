@@ -41,6 +41,20 @@ or subscription checks are implemented.
 
 ## Tester experience and agreed offline policy
 
+For local hardware testing while the login backend is unavailable, source runs
+have an explicit developer option:
+
+```sh
+conda activate py_arm
+python main.py --dev-no-login
+```
+
+The home window and live controls show `Developer mode — login bypassed`.
+This session does not initialize login, read or write saved login credentials,
+or report account usage. Restart without the flag to use normal sign-in; the
+option is not saved. Packaged apps reject the option, and the developer access
+module is excluded from bundle inputs and PyInstaller analysis.
+
 1. The owner explicitly approves an email with the owner tool below.
 2. The tester enters that email in Sarween, requests a code, and enters the code.
    The official Supabase Auth client handles verification and session refresh.

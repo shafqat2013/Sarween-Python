@@ -41,12 +41,13 @@ def detected_rows(events):
             for index, event in enumerate(events)]
 
 
-def export_rows(rows, base):
+def export_rows(rows, base, *, include_notes=False):
     base = Path(base)
     rows = list(rows)
     stream = io.StringIO(newline="")
     writer = csv.writer(stream)
-    writer.writerow(("Timestamp", "Seconds", "Mini", "From", "To", "Track", "Status", "Cause"))
+    headings = ("Timestamp", "Seconds", "Mini", "From", "To", "Track", "Status", "Cause")
+    writer.writerow(headings + (("Row notes",) if include_notes else ()))
     lines = ["Sarween movement transcript", "Timestamps are positions in the encoded video.",
              "Detected movements are predictions, not an exhaustive record of physical movement.", ""]
     def safe(value):
@@ -56,8 +57,12 @@ def export_rows(rows, base):
         fields = (format_time(row["time_seconds"]), f"{row['time_seconds']:.3f}", row["mini"],
                   row.get("from_cell") or "?", row["to_cell"], row.get("track", "detected"),
                   row.get("decision", "detected"), row.get("source", "detection"))
-        writer.writerow([safe(value) for value in fields])
+        notes = str(row.get("notes") or "")
+        writer.writerow([safe(value) for value in fields + ((notes,) if include_notes else ())])
         lines.append(f"{fields[0]}  {fields[2]}  {fields[3]} -> {fields[4]}  [{fields[5]} / {fields[6]} / {fields[7]}]")
+        if include_notes and notes:
+            lines.extend("    Note: " + line if index == 0 else "          " + line
+                         for index, line in enumerate(notes.splitlines()))
     atomic_write_bytes(str(base) + ".csv", stream.getvalue().encode(), backup=False)
     atomic_write_bytes(str(base) + ".txt", ("\n".join(lines) + "\n").encode(), backup=False)
     atomic_write_json(str(base) + ".json", {"schemaVersion": 1, "movements": rows}, backup=False)

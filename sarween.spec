@@ -23,6 +23,9 @@ added_files = [
     ("movement_logic.mjs",      "."),   # movement budget state machine
     ("module.json",             "."),   # Foundry module manifest
     ("tk_camera_preview.py",    "."),   # Tkinter camera preview window
+    ("assets/watermarks", "assets/watermarks"),  # known camera overlay glyph templates
+    ("assets/printed_markers", "assets/printed_markers"),  # printable physical registration cards
+    ("foundry_startup_login.js", "."),  # fixed-purpose native Foundry login bridge
     ("maps/dnd1.jpg",           "maps"),# demo map only
     # Only the approved privacy-edited real example ships. Synthetic clips stay in tests.
     ("demo/tabletop.mp4", "demo"),
@@ -65,6 +68,7 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
+        "dev_access",                   # source-only local login bypass
         "matplotlib",                   # not used, keeps bundle smaller
         "IPython",
         "jupyter",

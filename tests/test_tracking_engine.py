@@ -142,7 +142,22 @@ class TrackingEngineTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "clock"):
                 self.engine.step(self.frame, {}, replace(self.context, now=now))
 
-    def test_tap_recognition_uses_shared_clock_and_is_cancelled_on_lock_loss(self):
+    def test_physical_taps_default_off_without_affecting_detection_or_moves(self):
+        results = []
+        with patch("tracking_engine.contact_minis", side_effect=AssertionError("Tap detection should stay off")):
+            for _ in range(4):
+                results.append(self.step())
+            self.detections["red"] = detection(125)
+            for _ in range(4):
+                results.append(self.step())
+        self.assertEqual([move.raw_to for result in results for move in result.moves],
+                         ["r0c0", "r0c2"])
+        self.assertTrue(all(result.detections.get("red") is not None for result in results))
+        self.assertTrue(all(result.tapped_mini is None for result in results))
+        self.assertIsNone(self.engine.tap_detector.candidate)
+
+    def test_explicit_tap_opt_in_uses_shared_clock_and_is_cancelled_on_lock_loss(self):
+        self.engine = TrackingEngine(self.detector, physical_taps_enabled=True)
         self.settle()
         with patch("tracking_engine.contact_minis", return_value={"red"}):
             self.assertIsNone(self.step().tapped_mini)
@@ -156,9 +171,126 @@ class TrackingEngineTest(unittest.TestCase):
         self.frame.locked = True
         self.assertIsNone(self.step().tapped_mini)
 
+    def test_restoring_a_legacy_tap_candidate_does_not_enable_physical_taps(self):
+        self.settle()
+        state = self.engine.snapshot()
+        state["tap_candidate"] = {"mini_id": "red", "started_at": self.now - .2,
+                                  "origin": [25, 25], "released_at": None}
+        self.engine.restore(state)
+        with patch("tracking_engine.contact_minis", side_effect=AssertionError("Tap detection should stay off")):
+            self.assertIsNone(self.step().tapped_mini)
+
+    def test_initial_boundary_observation_abstains_without_inventing_a_cell(self):
+        for x in (48, 51, 49, 52, 50) * 2:
+            self.detections["red"] = detection(x)
+            self.assertEqual(self.step().moves, [])
+        self.assertNotIn("red", self.engine.last_emitted)
+        self.assertNotIn("red", self.engine.last_physical_xy)
+        self.detections["red"] = detection(65)
+        move, = self.settle()
+        self.assertEqual((move.raw_from, move.raw_to), (None, "r0c1"))
+
+    def test_adjacent_cell_jitter_holds_command_and_confirmed_physical_anchor(self):
+        self.settle()
+        for x in (48, 51, 49, 52, 50) * 3:
+            self.detections["red"] = detection(x)
+            self.assertEqual(self.step().moves, [])
+        self.assertEqual(self.engine.last_emitted["red"], "r0c0")
+        self.assertEqual(self.engine.last_physical_xy["red"], (25, 25))
+        self.assertNotIn("red", self.engine.cell_hist)
+        self.assertEqual(self.engine.last_seen["red"], self.now)
+
+    def test_slow_crossing_enters_next_cell_without_a_drifting_anchor_freeze(self):
+        self.settle()
+        moves = []
+        for x in range(26, 76):
+            self.detections["red"] = detection(x)
+            for move in self.step().moves:
+                moves.append((x, move.raw_to))
+        self.assertEqual([cell for _, cell in moves], ["r0c1"])
+        self.assertGreaterEqual(moves[0][0], 56)
+        self.assertLess(moves[0][0], 65)
+        self.assertEqual(self.engine.last_physical_xy["red"], (75, 25))
+        self.detections["red"] = detection(125)
+        self.assertEqual([move.raw_to for move in self.settle()], ["r0c2"])
+
+    def test_boundary_votes_do_not_affect_another_mini(self):
+        self.detections["red"] = detection(49)
+        self.detections["blue"] = detection(125)
+        self.assertEqual([(move.mini, move.raw_to) for move in self.settle()],
+                         [("blue", "r0c2")])
+        self.assertNotIn("red", self.engine.last_emitted)
+        self.detections["blue"] = detection(175)
+        self.assertEqual([(move.mini, move.raw_to) for move in self.settle()],
+                         [("blue", "r0c3")])
+
+    def test_boundary_and_occlusion_clear_old_votes_but_retain_last_command(self):
+        self.settle()
+        for unavailable in (None, detection(50)):
+            self.detections["red"] = detection(75)
+            for _ in range(3):
+                self.assertEqual(self.step().moves, [])
+            self.detections["red"] = unavailable
+            self.assertEqual(self.step().moves, [])
+            self.assertEqual(self.engine.last_emitted["red"], "r0c0")
+            self.assertEqual(self.engine.last_physical_xy["red"], (25, 25))
+            self.assertNotIn("red", self.engine.cell_hist)
+        self.detections = {}
+        self.step()
+        self.detections["red"] = detection(75)
+        for _ in range(3):
+            self.assertEqual(self.step().moves, [])
+        self.assertEqual([move.raw_to for move in self.step().moves], ["r0c1"])
+
+    def test_boundary_confidence_uses_rotated_and_sheared_mapping_on_both_axes(self):
+        transforms = (np.eye(2), np.array([[0., -1.], [1., 0.]]),
+                      np.array([[.8, -.6], [.6, .8]]), np.array([[1., .4], [.2, 1.]]))
+        for transform in transforms:
+            inverse = np.linalg.inv(transform)
+            offset = np.array([100., 100.])
+
+            def cell(x, y):
+                point = inverse @ (np.array([x, y]) - offset)
+                return tuple(np.floor(point / 50).astype(int))
+
+            def at(x, y):
+                point = transform @ np.array([x, y]) + offset
+                return detection(*point)
+
+            with self.subTest(transform=transform.tolist()):
+                self.engine = TrackingEngine(self.detector)
+                self.detections["red"] = at(25, 25)
+                self.assertEqual([move.raw_to for move in self.settle(to_cell=cell)], ["r0c0"])
+                for point in ((49, 25), (51, 25), (25, 49), (25, 51), (49, 49), (51, 51)):
+                    self.detections["red"] = at(*point)
+                    self.assertEqual(self.settle(to_cell=cell), [])
+                self.detections["red"] = at(75, 25)
+                self.assertEqual([move.raw_to for move in self.settle(to_cell=cell)], ["r0c1"])
+                self.detections["red"] = at(75, 75)
+                self.assertEqual([move.raw_to for move in self.settle(to_cell=cell)], ["r1c1"])
+
+    def test_pan_remaps_confirmed_anchor_without_using_boundary_observation(self):
+        self.settle()
+        self.detections["red"] = detection(49)
+        self.assertEqual(self.settle(), [])
+        moved = lambda x, y: (int(x // 50) + 1, int(y // 50))
+        move, = self.step(view_revision=2, to_cell=moved).moves
+        self.assertEqual((move.raw_from, move.raw_to, move.source),
+                         ("r0c0", "r0c1", "viewportTransform"))
+        self.assertEqual(self.engine.last_physical_xy["red"], (25, 25))
+        self.assertEqual(self.settle(scene_key=("new-scene",), view_revision=3, to_cell=moved), [])
+        self.assertEqual(self.engine.last_emitted, {})
+
+    def test_zero_margin_explicitly_restores_center_only_cell_mapping(self):
+        self.engine = TrackingEngine(self.detector, cell_margin_fraction=0)
+        self.detections["red"] = detection(50)
+        self.assertEqual([move.raw_to for move in self.settle()], ["r0c1"])
+
     def test_constructor_validates_parameters(self):
         for kwargs in ({"consensus_k": 7}, {"consensus_n": 0}, {"lost_timeout": -1},
-                       {"selected_lost_timeout": float("inf")}):
+                       {"selected_lost_timeout": float("inf")}, {"physical_taps_enabled": "false"},
+                       *({"cell_margin_fraction": value} for value in
+                         (-.1, .5, 1, float("nan"), float("inf"), None, True))):
             with self.assertRaises(ValueError):
                 TrackingEngine(self.detector, **kwargs)
 

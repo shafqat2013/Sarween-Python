@@ -7,6 +7,7 @@ import math
 import re
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from pathlib import Path
 import websockets
 from guided_capture import GuidedCapture, regression_case
 from foundry_delivery import MoveOutbox
+from foundry_service import validated_scene_info
 from app_paths import atomic_write_json, data_path, initialize_user_data
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -57,9 +59,31 @@ _active_socket = None
 _connection_ready = False
 _protocol_ready = False
 _connection_error = ""
+_connection_generation = 0
+_scene_info_generation = None
+_connection_scene_info = None
 _assign_queue: asyncio.Queue | None = None
 _ctrl_queue: asyncio.Queue | None = None  # NEW: control messages (getSceneInfo, etc.)
 _loop: asyncio.AbstractEventLoop | None = None
+
+_physical_grid_lock = threading.RLock()
+_physical_grid_state = {}
+_physical_grid_limits = {
+    "targetGridInches": (0.25, 3.0),
+    "displayDiagonalInches": (10.0, 150.0),
+    "physicalGridCalibration": (0.5, 1.5),
+}
+_physical_grid_timeout = 8.0
+
+_vtt_lock = threading.RLock()
+_vtt_state = {}
+_vtt_command_timeout = 10.0
+_vtt_actions = frozenset({
+    "settings.set", "markers.set", "capture.start", "capture.confirm", "capture.stop",
+    "capture.new", "capture.resume", "movement.select", "movement.undo", "movement.reset",
+    "assignment.save", "assignment.cancel", "ui.setHidden", "lifecycle.reload", "state.sync",
+    "lifecycle.setPaused", "token.create",
+})
 
 # Live Foundry viewport registration. The browser sends this whenever the GM
 # pans or zooms, allowing a fixed physical point on the TV to be mapped back to
@@ -77,11 +101,15 @@ _timeline_lock = threading.Lock()
 _timeline_recording: dict | None = None
 _timeline_path: Path | None = None
 _timeline_last_signature: str | None = None
+_reference_capture_lock = threading.Lock()
+_rendered_reference_status_entry: dict | None = None
+_latest_rendered_reference: dict | None = None
 _capture_lock = threading.Lock()
 _capture_session: GuidedCapture | None = None
 _capture_commands = deque()
 _capture_ready = False
 _tracking_output_paused = False
+_observation_only = False
 _camera_lock_state = {"locked": False, "missingIds": []}
 _capture_status = {"type": "captureStatus", "state": "idle"}
 _selected_mini_id = None
@@ -175,6 +203,12 @@ def set_scene_params(scene_id=None, scene_w=None, scene_h=None, grid_px=None, sh
 
     if previous_scene_id and SCENE_ID != previous_scene_id:
         clear_view_transform()
+        with _physical_grid_lock:
+            _physical_grid_state.update(ready=False, pending=None,
+                                        message="Scene changed. Check the new grid before applying.")
+        with _vtt_lock:
+            _vtt_state.update(data={}, pending=None, lastResult=None,
+                              message="Scene changed. Waiting for VTT controls.")
         with _capture_lock:
             if _capture_session is not None:
                 _capture_commands.append({"action": "stop", "reason": "sceneChanged"})
@@ -198,7 +232,9 @@ def get_delivery_status() -> dict:
     failed = [name for name, move in moves.items() if move["state"] == "failed"]
     assignments = [name for name, move in moves.items() if move["state"] == "assignment"]
     pending = [name for name, move in moves.items() if move["state"] != "confirmed"]
-    if tracking_output_paused():
+    if observation_only():
+        message = "Observer mode — Foundry movement off"
+    elif tracking_output_paused():
         message = "Tracking paused"
     elif _connection_error:
         message = _connection_error
@@ -219,7 +255,295 @@ def get_delivery_status() -> dict:
 
 
 def retry_failed_moves():
-    _delivery.retry()
+    with _capture_lock:
+        if _tracking_output_paused or _observation_only:
+            return
+        _delivery.retry()
+
+
+def _reset_physical_grid(*, supported=False):
+    with _physical_grid_lock:
+        _physical_grid_state.clear()
+        _physical_grid_state.update(supported=supported, settings={}, sceneId="",
+                                    ready=False, pending=None, message="")
+
+
+def _validate_physical_grid_settings(settings, *, complete=False):
+    if not isinstance(settings, dict) or set(settings) - _physical_grid_limits.keys():
+        raise ValueError("Unknown TV grid setting.")
+    if complete and set(settings) != _physical_grid_limits.keys():
+        raise ValueError("Incomplete TV grid settings.")
+    validated = {}
+    for name, value in settings.items():
+        minimum, maximum = _physical_grid_limits[name]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or not minimum <= value <= maximum):
+            raise ValueError(f"{name} must be a number between {minimum:g} and {maximum:g}.")
+        validated[name] = float(value)
+    return validated
+
+
+def get_physical_grid_status() -> dict:
+    connected = bool(_active_socket is not None and _connection_ready)
+    capture_active = guided_capture_active()
+    with _vtt_lock:
+        vtt_pending = bool(_vtt_state.get("pending"))
+    with _physical_grid_lock:
+        pending = _physical_grid_state.get("pending")
+        if pending and time.monotonic() >= pending["deadline"]:
+            _physical_grid_state.update(pending=None,
+                message="Grid resize timed out. Check the TV before applying again.")
+        supported = bool(_physical_grid_state.get("supported"))
+        ready = bool(_physical_grid_state.get("ready")
+                     and _physical_grid_state.get("sceneId") == SCENE_ID)
+        if not connected:
+            message = "Connect Foundry to resize the TV grid."
+        elif not supported:
+            message = "Reload Foundry with the updated Sarween module to resize the TV grid."
+        elif capture_active:
+            message = "Finish guided capture before resizing the TV grid."
+        elif vtt_pending:
+            message = "Waiting for the current Foundry control to finish."
+        elif not ready:
+            message = "Waiting for Foundry's TV grid settings."
+        else:
+            message = _physical_grid_state.get("message") or "Ready. Measure a square on the TV with a ruler."
+        return {"connected": connected, "supported": supported,
+                "pending": bool(_physical_grid_state.get("pending")),
+                "blocked": capture_active or not ready or vtt_pending, "message": message,
+                "settings": dict(_physical_grid_state.get("settings") or {})}
+
+
+def _finish_physical_grid_request(request_id, message):
+    with _physical_grid_lock:
+        pending = _physical_grid_state.get("pending")
+        if pending and pending["requestId"] == request_id:
+            _physical_grid_state.update(pending=None, message=message)
+
+
+def request_physical_grid(settings=None, *, apply=True) -> bool:
+    """Apply display settings only to the currently connected Foundry scene."""
+    settings = _validate_physical_grid_settings({} if settings is None else settings)
+    if not isinstance(apply, bool):
+        raise ValueError("Apply must be true or false.")
+    status = get_physical_grid_status()
+    if not status["connected"] or not status["supported"] or status["blocked"] or status["pending"]:
+        return False
+    socket, queue, loop, scene_id = _active_socket, _ctrl_queue, _loop, SCENE_ID
+    if socket is None or queue is None or loop is None or loop.is_closed():
+        return False
+    request_id = uuid.uuid4().hex
+    payload = {"type": "physicalGridSet", "requestId": request_id,
+               "sceneId": scene_id, "settings": settings, "apply": apply}
+    with _physical_grid_lock:
+        if _physical_grid_state.get("pending"):
+            return False
+        _physical_grid_state.update(pending={"requestId": request_id, "sceneId": scene_id,
+                                             "deadline": time.monotonic() + _physical_grid_timeout},
+                                    message="Applying TV grid size…")
+
+    def enqueue():
+        if (socket is not _active_socket or queue is not _ctrl_queue or scene_id != SCENE_ID
+                or not _connection_ready or guided_capture_active()):
+            _finish_physical_grid_request(request_id, "Connection or scene changed. Apply the grid size again.")
+            return
+        queue.put_nowait(payload)
+
+    try:
+        loop.call_soon_threadsafe(enqueue)
+    except RuntimeError:
+        _finish_physical_grid_request(request_id, "Foundry disconnected. Apply the grid size again after connecting.")
+        return False
+    return True
+
+
+def _receive_physical_grid(data):
+    with _physical_grid_lock:
+        if not _physical_grid_state.get("supported") or not _protocol_ready:
+            return
+        result = data.get("type") == "physicalGridResult"
+        pending = _physical_grid_state.get("pending")
+        if result and (not pending or data.get("requestId") != pending["requestId"]):
+            return
+        if data.get("sceneId") != SCENE_ID:
+            if result:
+                _finish_physical_grid_request(data["requestId"], "Scene changed. Apply the grid size again.")
+            return
+        try:
+            settings = _validate_physical_grid_settings(data.get("settings"), complete=True)
+        except ValueError:
+            if result:
+                _finish_physical_grid_request(data["requestId"], "Foundry returned invalid TV grid settings.")
+            return
+        _physical_grid_state.update(settings=settings, sceneId=data["sceneId"], ready=data.get("ready") is True)
+        if result:
+            message = data.get("message") or ("TV grid size applied." if data.get("success") else "Could not resize the TV grid.")
+            _physical_grid_state.update(pending=None, message=str(message))
+
+
+def _reset_vtt(*, supported=False):
+    with _vtt_lock:
+        _vtt_state.clear()
+        _vtt_state.update(supported=supported, data={}, pending=None, lastResult=None, message="")
+
+
+def get_vtt_status() -> dict:
+    """Snapshot for desktop controls; commands always belong to one connection/scene."""
+    connected = bool(_active_socket is not None and _connection_ready)
+    grid_pending = get_physical_grid_status()["pending"]
+    with _vtt_lock:
+        pending = _vtt_state.get("pending")
+        if pending and time.monotonic() >= pending["deadline"]:
+            _finish_vtt_request(pending["requestId"], "Foundry did not confirm the action. Check the TV before trying again.")
+        data = copy.deepcopy(_vtt_state.get("data") or {})
+        supported = bool(_vtt_state.get("supported"))
+        ready = data.get("ready") is True and data.get("sceneId") == SCENE_ID
+        if not connected:
+            message = "Connect Foundry to use VTT controls."
+        elif not supported:
+            message = "Reload Foundry with the updated Sarween module to use VTT controls."
+        elif not ready:
+            message = "Waiting for Foundry's VTT controls."
+        elif grid_pending:
+            message = "Waiting for TV grid resizing to finish."
+        else:
+            message = _vtt_state.get("message") or "Ready"
+        return {**data, "connected": connected, "supported": supported,
+                "outputPaused": tracking_output_paused(),
+                "pending": bool(_vtt_state.get("pending")), "blocked": not ready or grid_pending,
+                "pendingRequest": ({key: _vtt_state["pending"].get(key)
+                                    for key in ("requestId", "action", "sceneId")}
+                                   if _vtt_state.get("pending") else None),
+                "lastResult": copy.deepcopy(_vtt_state.get("lastResult")),
+                "message": message}
+
+
+def _finish_vtt_request(request_id, message):
+    with _vtt_lock:
+        pending = _vtt_state.get("pending")
+        if pending and pending["requestId"] == request_id:
+            _vtt_state.update(pending=None, message=message, lastResult={
+                "requestId": request_id, "action": pending.get("action"),
+                "sceneId": pending["sceneId"], "success": False, "message": message})
+
+
+def request_vtt_command(action, values=None, *, return_request_id=False) -> bool | str:
+    if not isinstance(action, str) or action not in _vtt_actions:
+        raise ValueError("Unknown VTT control action.")
+    values = {} if values is None else values
+    if not isinstance(values, dict):
+        raise ValueError("VTT control values must be an object.")
+    if action == "lifecycle.setPaused":
+        if set(values) != {"paused"} or type(values["paused"]) is not bool:
+            raise ValueError("Choose an absolute Foundry pause state.")
+    if action == "token.create":
+        from token_creation import validate_token_request
+        values = validate_token_request(values)
+    if action in {"lifecycle.setPaused", "token.create"} and tracking_output_paused():
+        raise ValueError("Stop the mini observer or finish capture before changing Foundry tokens or pause state.")
+    try:
+        # Detach mutable UI values and reject NaN before crossing threads.
+        serialized = json.dumps(values, allow_nan=False)
+        if len(serialized) > 64_000:
+            raise ValueError("VTT control values are too large.")
+        values = json.loads(serialized)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("VTT control values must contain valid JSON data.") from exc
+    status = get_vtt_status()
+    if action in {"lifecycle.setPaused", "token.create"}:
+        capture = status.get("capture") or {}
+        if (capture.get("active") or capture.get("recording")
+                or capture.get("phase") in {"Starting", "Saving", "Restoring"}):
+            raise ValueError("Finish recording before changing Foundry tokens or pause state.")
+    if not status["connected"] or not status["supported"] or status["blocked"] or status["pending"]:
+        return False
+    if action not in (status.get("capabilities") or []):
+        raise ValueError("The connected Foundry module does not support this action.")
+    socket, queue, loop, scene_id = _active_socket, _ctrl_queue, _loop, SCENE_ID
+    if socket is None or queue is None or loop is None or loop.is_closed():
+        return False
+    request_id = uuid.uuid4().hex
+    payload = {"type": "vttCommand", "requestId": request_id, "sceneId": scene_id,
+               "action": action, "values": values}
+    with _vtt_lock:
+        if _vtt_state.get("pending"):
+            return False
+        _vtt_state.update(pending={"requestId": request_id, "sceneId": scene_id, "action": action,
+                                  "deadline": time.monotonic() + _vtt_command_timeout},
+                          message="Applying Foundry control…")
+
+    def enqueue():
+        if (socket is not _active_socket or queue is not _ctrl_queue or scene_id != SCENE_ID
+                or not _connection_ready):
+            _finish_vtt_request(request_id, "Connection or scene changed. Try the action again.")
+            return
+        if action in {"lifecycle.setPaused", "token.create"} and tracking_output_paused():
+            _finish_vtt_request(request_id, "Observer or capture mode blocks this Foundry change.")
+            return
+        queue.put_nowait(payload)
+
+    try:
+        loop.call_soon_threadsafe(enqueue)
+    except RuntimeError:
+        _finish_vtt_request(request_id, "Foundry disconnected. Reconnect before trying again.")
+        return False
+    return request_id if return_request_id else True
+
+
+def _receive_vtt(data):
+    with _vtt_lock:
+        if not _vtt_state.get("supported") or not _protocol_ready:
+            return
+        result = data.get("type") == "vttResult"
+        pending = _vtt_state.get("pending")
+        if result and (not pending or data.get("requestId") != pending["requestId"]):
+            return
+        state = data.get("state") if result else data
+        if not isinstance(state, dict) or state.get("sceneId") != SCENE_ID:
+            if result:
+                _finish_vtt_request(data["requestId"], "Foundry scene changed. Try the action again.")
+            return
+        valid = (isinstance(state.get("ready"), bool)
+                 and isinstance(state.get("settings"), dict)
+                 and isinstance(state.get("capabilities"), list)
+                 and all(isinstance(action, str) for action in state["capabilities"])
+                 and isinstance(state.get("tokens"), list)
+                 and all(isinstance(token, dict) for token in state["tokens"])
+                 and isinstance(state.get("minis"), list)
+                 and isinstance(state.get("capture"), dict))
+        if "actors" in state:
+            valid = valid and isinstance(state["actors"], list) and all(
+                isinstance(actor, dict) and isinstance(actor.get("actorId"), str)
+                and bool(actor["actorId"]) and isinstance(actor.get("actorName"), str)
+                for actor in state["actors"])
+        for field in ("world", "user"):
+            if field in state:
+                identity = state[field]
+                valid = valid and isinstance(identity, dict) and (
+                    identity.get("id") is None or isinstance(identity.get("id"), str))
+                valid = valid and isinstance(identity, dict) and isinstance(identity.get("name"), str)
+        if "user" in state:
+            valid = valid and isinstance(state["user"], dict) and type(state["user"].get("isGM")) is bool
+        if "paused" in state:
+            valid = valid and type(state["paused"]) is bool
+        if not valid:
+            if result:
+                _finish_vtt_request(data["requestId"], "Foundry returned invalid VTT control state.")
+            return
+        _vtt_state["data"] = copy.deepcopy(state)
+        if result:
+            message = data.get("message") or ("Foundry control applied." if data.get("success") else "Foundry could not apply this action.")
+            _vtt_state.update(pending=None, message=str(message), lastResult={
+                "requestId": data["requestId"], "action": pending.get("action"),
+                "sceneId": state["sceneId"], "success": data.get("success") is True,
+                "message": str(message)})
+            if pending.get("action") == "token.create" and isinstance(data.get("result"), dict):
+                result_value = data["result"]
+                if (isinstance(result_value.get("tokenId"), str)
+                        and isinstance(result_value.get("creationId"), str)
+                        and isinstance(result_value.get("name"), str)):
+                    _vtt_state["lastResult"]["result"] = {
+                        key: result_value[key] for key in ("tokenId", "creationId", "name")}
 
 def get_scene_params() -> dict:
     return {
@@ -235,6 +559,24 @@ def get_scene_params() -> dict:
         "background": SCENE_BACKGROUND,
         "viewTransformRevision": get_view_transform_revision(),
     }
+
+
+def get_connection_status() -> dict:
+    """Read-only startup readiness for the current module connection.
+
+    Global scene parameters intentionally survive disconnects for existing
+    tracking behavior. Startup must instead require complete sceneInfo received
+    after this connection's hello, rather than accepting those cached values.
+    """
+    connected = _active_socket is not None
+    scene = (validated_scene_info(_connection_scene_info)
+             if connected and _scene_info_generation == _connection_generation else None)
+    handshake = bool(connected and _protocol_ready)
+    ready = bool(handshake and _connection_ready and scene is not None)
+    return {"connected": connected, "handshake_ready": handshake,
+            "scene_ready": ready, "generation": _connection_generation,
+            "scene_info": scene if ready else None,
+            "error": str(_connection_error) if connected else ""}
 
 
 def reconcile_scene_bindings(payload: dict) -> None:
@@ -456,7 +798,7 @@ def get_recording_state_snapshot() -> dict:
         "viewTransformRevision": get_view_transform_revision(),
         "sceneVisualReason": visual_reason,
         "testSequence": test_sequence,
-        "cameraLock": dict(_camera_lock_state),
+        "cameraLock": copy.deepcopy(_camera_lock_state),
         "trackingControls": {"selectedMini": get_selected_mini(), "paused": tracking_output_paused()},
     }
 
@@ -514,6 +856,8 @@ def start_timeline_recording(
     grid_cols: int,
     grid_rows: int,
     frames_undistorted: bool = True,
+    camera_calibration: dict | None = None,
+    marker_registration: dict | None = None,
 ) -> Path:
     global _timeline_recording, _timeline_path, _timeline_last_signature
     stop_timeline_recording()
@@ -532,6 +876,8 @@ def start_timeline_recording(
             "frameWidth": int(frame_width),
             "frameHeight": int(frame_height),
             "framesUndistorted": bool(frames_undistorted),
+            "cameraCalibration": copy.deepcopy(camera_calibration),
+            "markerRegistration": copy.deepcopy(marker_registration),
             "warpWidth": int(warp_width),
             "warpHeight": int(warp_height),
             "gridCols": int(grid_cols),
@@ -628,39 +974,136 @@ def record_delivery_event(data):
             })
 
 
+def get_rendered_reference_status() -> dict:
+    """Read evidence health, including source-clock age and geometry mismatch.
+
+    This does not certify camera/display alignment or authorize token moves.
+    The normal two-second capture interval is diagnostic, so references are
+    deliberately reported stale between samples rather than reused as current.
+    """
+    from reference_health import reference_status
+    with _reference_capture_lock:
+        entry = copy.deepcopy(_rendered_reference_status_entry)
+    return reference_status(entry, current_view=get_view_transform_payload(),
+                            now_monotonic=time.perf_counter())
+
+
+def get_latest_rendered_reference() -> dict | None:
+    """Return the latest bounded JPEG and captured metadata, even without video recording.
+
+    The image is immutable bytes, and metadata is copied. Consumers must use
+    its quality/provenance and capture clocks before comparing it to a camera
+    frame; merely being the latest received image does not make it current.
+    """
+    with _reference_capture_lock:
+        if _latest_rendered_reference is None:
+            return None
+        return {"image": _latest_rendered_reference["image"],
+                "entry": copy.deepcopy(_latest_rendered_reference["entry"])}
+
+
+def record_rendered_reference_status(payload: dict) -> None:
+    """Expose renderer errors instead of silently continuing with old evidence."""
+    global _rendered_reference_status_entry
+    message = str(payload.get("message") or "Foundry could not capture its rendered viewport.")[:500]
+    with _reference_capture_lock:
+        _rendered_reference_status_entry = {"error": message,
+            "receivedAtMonotonic": time.perf_counter(), "stopped": payload.get("stopped") is True}
+
+
 def record_rendered_reference(payload: dict) -> bool:
-    """Persist a low-rate, clean Foundry canvas image beside the video."""
+    """Persist source geometry/clocks and image quality beside the camera video.
+
+    Frame association is the most recently received camera frame, not a claim
+    that the asynchronous Foundry and camera captures are synchronized.
+    """
+    global _rendered_reference_status_entry, _latest_rendered_reference
+    import io
+    import cv2
+    import numpy as np
+    from PIL import Image
+    from reference_health import capture_provenance, image_quality, matching_view, validated_view
+
+    received_monotonic, received_epoch_ms = time.perf_counter(), time.time() * 1000
+    if str(payload.get("sceneId")) != str(SCENE_ID):
+        return False
+
+    def reject(message):
+        record_rendered_reference_status({"message": message})
+        return False
+
     encoded = payload.get("image")
     if not isinstance(encoded, str) or not encoded.startswith("data:image/jpeg;base64,"):
-        return False
+        return reject("Foundry reference is not a JPEG image.")
     if len(encoded) > 500_000:
-        return False
+        return reject("Foundry reference exceeded the image size limit.")
     try:
         image = base64.b64decode(encoded.split(",", 1)[1], validate=True)
     except (ValueError, binascii.Error):
-        return False
+        return reject("Foundry reference has invalid image encoding.")
     if len(image) > 350_000 or not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"):
+        return reject("Foundry reference has invalid JPEG packaging or exceeds the size limit.")
+    try:
+        # Read dimensions before decoding pixel data. A small compressed JPEG
+        # must not be able to allocate an unbounded image in the relay process.
+        with Image.open(io.BytesIO(image)) as header:
+            if header.format != "JPEG" or header.size != (640, 360):
+                raise ValueError("Rendered reference must be a 640 × 360 JPEG image")
+        decoded = cv2.imdecode(np.frombuffer(image, dtype=np.uint8), cv2.IMREAD_COLOR)
+    except (OSError, ValueError, Image.DecompressionBombError, cv2.error) as exc:
+        return reject(f"Foundry reference could not be decoded: {exc}")
+    try:
+        quality = image_quality(decoded)
+    except ValueError as exc:
+        record_rendered_reference_status({"message": str(exc)})
         return False
+    try:
+        view = validated_view(payload.get("viewTransform"), payload["sceneId"])
+        geometry_valid = True
+    except (KeyError, ValueError):
+        view, geometry_valid = None, False
+    provenance = capture_provenance(payload.get("capture"), received_epoch_ms=received_epoch_ms)
+    current_view = get_view_transform_payload()
+    entry = {
+        "sceneId": str(payload["sceneId"]),
+        "viewTransform": view,
+        "geometryValid": geometry_valid,
+        "viewRevision": get_view_transform_revision() if matching_view(view, current_view) else None,
+        "viewRevisionAtReceipt": get_view_transform_revision(),
+        "capture": copy.deepcopy(payload.get("capture")),
+        "provenance": provenance,
+        "quality": quality,
+        "receivedAtMonotonic": received_monotonic,
+        "receivedAtEpochMs": received_epoch_ms,
+        "displayAlignmentVerified": False,
+    }
+    # Health is useful during observer sessions even when standard video
+    # recording is off. It never changes the live Foundry view transform.
+    with _reference_capture_lock:
+        _rendered_reference_status_entry = copy.deepcopy(entry)
+        _latest_rendered_reference = {"image": image, "entry": copy.deepcopy(entry)}
 
     with _timeline_lock:
         if _timeline_recording is None or _timeline_path is None:
             return False
         if str(payload.get("sceneId")) != str(SCENE_ID):
             return False
-        frame = int(_timeline_recording["framesRecorded"])
+        count = int(_timeline_recording["framesRecorded"])
+        frame = max(0, count - 1)
         references = _timeline_recording["referenceFrames"]
-        min_interval = max(1, int(float(_timeline_recording["fps"])))
-        if references and frame - int(references[-1]["frame"]) < min_interval:
+        if references and (frame == int(references[-1]["frame"])
+                or received_monotonic - references[-1].get("receivedAtMonotonic", 0) < 0.2):
             return False
         folder = _timeline_path.parent / (_timeline_path.stem.removesuffix(".tracking") + "_references")
         folder.mkdir(exist_ok=True)
         path = folder / f"frame_{frame:06d}.jpg"
         path.write_bytes(image)
-        references.append({
+        references.append({**entry,
             "frame": frame,
-            "sceneId": SCENE_ID,
-            "viewRevision": get_view_transform_revision(),
-            "viewTransform": get_view_transform_payload(),
+            "receivedBeforeFrame": count,
+            "frameAssociation": "latest-camera-frame-at-receipt-not-synchronized",
+            "latestCameraCaptureTime": (_timeline_recording["frameClocks"][-1].get("captureTime")
+                                        if _timeline_recording["frameClocks"] else None),
             "path": str(path.relative_to(_timeline_path.parent)),
         })
     _write_timeline_file()
@@ -715,9 +1158,26 @@ def queue_control(payload: dict) -> None:
         _loop.call_soon_threadsafe(_ctrl_queue.put_nowait, payload)
 
 
+def set_observation_only(enabled: bool) -> None:
+    """Inhibit tracking output independently of guided-capture lifecycle.
+
+    Discard old desired destinations on either transition so ending a camera
+    session cannot release a queued pre-observer move into Foundry.
+    """
+    global _observation_only
+    with _capture_lock:
+        _observation_only = bool(enabled)
+        _delivery.clear()
+
+
+def observation_only() -> bool:
+    with _capture_lock:
+        return _observation_only
+
+
 def tracking_output_paused() -> bool:
     with _capture_lock:
-        return _tracking_output_paused
+        return _tracking_output_paused or _observation_only
 
 
 def guided_capture_active() -> bool:
@@ -725,9 +1185,11 @@ def guided_capture_active() -> bool:
         return _capture_session is not None
 
 
-def update_camera_lock(locked: bool, missing_ids: list) -> None:
+def update_camera_lock(locked: bool, missing_ids: list, *, marker_registration=None) -> None:
     global _camera_lock_state
     _camera_lock_state = {"locked": bool(locked), "missingIds": list(missing_ids)}
+    if marker_registration is not None:
+        _camera_lock_state["markerRegistration"] = copy.deepcopy(marker_registration)
 
 
 def send_capture_status(state: str, **values) -> None:
@@ -1038,12 +1500,13 @@ def request_assignment(mini_id: str) -> None:
 
 def queue_cell_move(mini_id: str, cell_label: str, *, source="tracking") -> None:
     """Retain the latest desired cell independently of connection/assignment."""
-    if tracking_output_paused():
-        return
-    mini_id = str(mini_id).strip()
-    cell_label = cell_label.strip()
-    _grid_to_pixels(cell_label)
-    _delivery.offer(mini_id, cell_label, _scene_context(), source)
+    with _capture_lock:
+        if _tracking_output_paused or _observation_only:
+            return
+        mini_id = str(mini_id).strip()
+        cell_label = cell_label.strip()
+        _grid_to_pixels(cell_label)
+        _delivery.offer(mini_id, cell_label, _scene_context(), source)
 
 def move_token_to_grid(mini_id: str, cell_label: str, *, source="tracking") -> None:
     """
@@ -1146,7 +1609,7 @@ async def send_loop(websocket):
                     continue
                 coordinates = _grid_to_pixels(move["cell"])
                 payload = _delivery.prepare(mini_id, move["cell"], token_id, coordinates, time.monotonic())
-                if payload:
+                if payload and not tracking_output_paused():
                     print(f"FoundryOutput | mini={mini_id} cell={move['cell']} -> token={token_id} | Awaiting confirmation.", flush=True)
                     await websocket.send(json.dumps(payload))
         await asyncio.sleep(0.1)
@@ -1178,6 +1641,33 @@ async def ctrl_loop(websocket):
 
     while True:
         msg = await _ctrl_queue.get()
+        if msg.get("type") == "miniTap" and observation_only():
+            continue
+        if msg.get("type") == "vttCommand":
+            with _vtt_lock:
+                pending = _vtt_state.get("pending")
+                current = (pending and pending["requestId"] == msg.get("requestId")
+                           and time.monotonic() < pending["deadline"])
+            if not current:
+                continue
+            if msg.get("action") in {"lifecycle.setPaused", "token.create"} and tracking_output_paused():
+                _finish_vtt_request(msg["requestId"], "Observer or capture mode blocks this Foundry change.")
+                continue
+            if (websocket is not _active_socket or msg.get("sceneId") != SCENE_ID
+                    or not _connection_ready):
+                _finish_vtt_request(msg["requestId"], "Connection or scene changed. Try the action again.")
+                continue
+        if msg.get("type") == "physicalGridSet":
+            with _physical_grid_lock:
+                pending = _physical_grid_state.get("pending")
+                current = (pending and pending["requestId"] == msg.get("requestId")
+                           and time.monotonic() < pending["deadline"])
+            if not current:
+                continue
+            if (websocket is not _active_socket or msg.get("sceneId") != SCENE_ID
+                    or not _connection_ready or guided_capture_active()):
+                _finish_physical_grid_request(msg["requestId"], "Connection or scene changed. Apply the grid size again.")
+                continue
         try:
             await websocket.send(json.dumps(msg))
         except websockets.ConnectionClosed:
@@ -1189,6 +1679,7 @@ async def recv_loop(websocket):
     Receives messages from Foundry (assignment results, scene info).
     """
     global MINI_TO_TOKEN, _selected_mini_id, _protocol_ready, _connection_ready, _connection_error
+    global _scene_info_generation, _connection_scene_info
     while True:
         try:
             raw = await websocket.recv()
@@ -1206,8 +1697,16 @@ async def recv_loop(websocket):
         if msg_type in ("hello", "ping"):
             if msg_type == "hello":
                 _connection_ready = False
+                _scene_info_generation = None
+                _connection_scene_info = None
                 _protocol_ready = data.get("protocolVersion") == 2
                 _connection_error = "" if _protocol_ready else "Reload Foundry: updated Sarween module required"
+                _reset_physical_grid(supported=_protocol_ready and data.get("physicalGridControls") is True)
+                _reset_vtt(supported=_protocol_ready and data.get("vttControls") is True)
+                if _physical_grid_state["supported"]:
+                    queue_control({"type": "physicalGridGet"})
+                if _vtt_state["supported"]:
+                    queue_control({"type": "vttGet"})
                 queue_control(_capture_status)
                 with _timeline_lock:
                     recording = _timeline_recording
@@ -1250,6 +1749,8 @@ async def recv_loop(websocket):
         elif msg_type == "sceneInfo":
             # Expected from module.js:
             # {type:"sceneInfo", sceneId, width, height, gridSize, shiftX, shiftY, gridType}
+            _scene_info_generation = None
+            _connection_scene_info = None
             scene_id = data.get("sceneId") or SCENE_ID
             w = data.get("width")
             h = data.get("height")
@@ -1262,17 +1763,34 @@ async def recv_loop(websocket):
                              background=data.get("background"))
             reconcile_scene_bindings(data)
             _connection_ready = _protocol_ready and bool(SCENE_ID and GRID_PX and not data.get("error"))
+            # Startup freshness is separate from the established move/output
+            # guards: an incomplete message cannot borrow cached dimensions.
+            _connection_scene_info = validated_scene_info(data)
+            _scene_info_generation = (_connection_generation
+                                      if _connection_scene_info is not None else None)
+            if _connection_ready and _physical_grid_state.get("supported"):
+                queue_control({"type": "physicalGridGet"})
+            if _connection_ready and _vtt_state.get("supported"):
+                queue_control({"type": "vttGet"})
+
+        elif msg_type in {"physicalGridState", "physicalGridResult"}:
+            _receive_physical_grid(data)
+
+        elif msg_type in {"vttState", "vttResult"}:
+            _receive_vtt(data)
 
         elif msg_type == "viewTransform":
             set_view_transform(data)
 
         elif msg_type == "renderedReference":
-            if data.get("viewTransform"):
-                set_view_transform(data["viewTransform"])
             try:
                 record_rendered_reference(data)
             except OSError as exc:
+                record_rendered_reference_status({"message": f"Reference snapshot save error: {exc}"})
                 print(f"FoundryOutput | Reference snapshot save error: {exc}", flush=True)
+
+        elif msg_type == "renderedReferenceStatus":
+            record_rendered_reference_status(data)
 
         elif msg_type == "sceneVisualChanged":
             mark_scene_visual_changed(str(data.get("reason") or "foundry"))
@@ -1312,12 +1830,18 @@ async def recv_loop(websocket):
 async def handler(websocket):
     global _active_socket, _connection_ready, _protocol_ready, _connection_error
     global _assign_queue, _ctrl_queue
+    global _connection_generation, _scene_info_generation, _connection_scene_info
     if _active_socket is not None:
         await websocket.close(code=1013, reason="Another Foundry display is connected; disconnect it first")
         return
     _active_socket = websocket
+    _connection_generation += 1
+    _scene_info_generation = None
+    _connection_scene_info = None
     _connection_ready = _protocol_ready = False
     _connection_error = ""
+    _reset_physical_grid()
+    _reset_vtt()
     _assign_queue = asyncio.Queue()
     _ctrl_queue = asyncio.Queue()
     _delivery.retry(reconnect=True)
@@ -1339,7 +1863,11 @@ async def handler(websocket):
             if isinstance(result, Exception) and not isinstance(result, websockets.ConnectionClosed):
                 print(f"FoundryOutput | Connection task stopped: {result}", flush=True)
         _active_socket = None
+        _scene_info_generation = None
+        _connection_scene_info = None
         _connection_ready = _protocol_ready = False
+        _reset_physical_grid()
+        _reset_vtt()
         with _capture_lock:
             if _capture_session is not None:
                 _capture_commands.append({"action": "stop", "reason": "disconnected"})

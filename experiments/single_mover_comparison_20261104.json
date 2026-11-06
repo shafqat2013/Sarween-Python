@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "study": "single-mover-target-comparison",
+  "date": "2026-11-04",
+  "assumptions": {
+    "one_physical_mini_moves_at_a_time": true,
+    "starting_identity_bindings_required": true,
+    "ring_color_not_used_for_identity": true
+  },
+  "capture_mode": "guided-camera-and-independent-placement-labels",
+  "automatic_single_mover_tracker_implemented": false,
+  "automatic_recovery_flash_implemented": false,
+  "first_action": "Test 1 partial pilot through A0-F0, stationary hold, A1 and B1; Stop + save",
+  "comparison": {
+    "common_routes": [
+      "A",
+      "B",
+      "C",
+      "D"
+    ],
+    "extra_routes_report_separately": [
+      "E",
+      "F"
+    ],
+    "latency_labels": "physical-stop/hand-clear times from video, not Placed clicks",
+    "live_delivery_latency_requires_separate_live_test": true
+  },
+  "tests": [
+    {
+      "test": 1,
+      "status": "planned",
+      "mini_count": 6,
+      "base_diameter_mm": 25,
+      "figure_finish": "grey-unpainted",
+      "identity_policy": "initial-position-plus-single-mover-inference",
+      "ring_inner_diameter_mm": 30,
+      "ring_outer_diameter_mm": 38,
+      "ring_colors": "different",
+      "reflective_dot": false,
+      "dot_location": null,
+      "torch_on": false,
+      "polarizing_filter": false,
+      "fog_label": "fog-on",
+      "capture_note": "single-mover-study; test=1; base=25mm; rings=30/38mm; minis=6; grey-unpainted; dot=none; torch=off; filter=none",
+      "nominal_annular_area_mm2": 427.26,
+      "nominal_band_width_mm": 4.0,
+      "max_base_radial_clearance_mm": 2.5
+    },
+    {
+      "test": 2,
+      "status": "planned",
+      "mini_count": 4,
+      "base_diameter_mm": 25,
+      "figure_finish": "grey-unpainted",
+      "identity_policy": "initial-position-plus-single-mover-inference",
+      "ring_inner_diameter_mm": 26,
+      "ring_outer_diameter_mm": 32,
+      "ring_colors": "different",
+      "reflective_dot": false,
+      "dot_location": null,
+      "torch_on": false,
+      "polarizing_filter": false,
+      "fog_label": "fog-on",
+      "capture_note": "single-mover-study; test=2; base=25mm; rings=26/32mm; minis=4; grey-unpainted; dot=none; torch=off; filter=none",
+      "nominal_annular_area_mm2": 273.32,
+      "nominal_band_width_mm": 3.0,
+      "max_base_radial_clearance_mm": 0.5
+    },
+    {
+      "test": 3,
+      "status": "planned",
+      "mini_count": 6,
+      "base_diameter_mm": 25,
+      "figure_finish": "grey-unpainted",
+      "identity_policy": "initial-position-plus-single-mover-inference",
+      "ring_inner_diameter_mm": null,
+      "ring_outer_diameter_mm": null,
+      "ring_colors": null,
+      "reflective_dot": true,
+      "dot_location": "mini-top",
+      "torch_on": true,
+      "polarizing_filter": false,
+      "fog_label": "fog-on",
+      "capture_note": "single-mover-study; test=3; base=25mm; rings=none; minis=6; grey-unpainted; dot=mini-top; torch=on; filter=none"
+    },
+    {
+      "test": 4,
+      "status": "planned",
+      "mini_count": 6,
+      "base_diameter_mm": 25,
+      "figure_finish": "grey-unpainted",
+      "identity_policy": "initial-position-plus-single-mover-inference",
+      "ring_inner_diameter_mm": null,
+      "ring_outer_diameter_mm": null,
+      "ring_colors": null,
+      "reflective_dot": true,
+      "dot_location": "mini-top",
+      "torch_on": false,
+      "polarizing_filter": false,
+      "fog_label": "fog-on",
+      "capture_note": "single-mover-study; test=4; base=25mm; rings=none; minis=6; grey-unpainted; dot=mini-top; torch=off; filter=none"
+    },
+    {
+      "test": 5,
+      "status": "planned",
+      "mini_count": 6,
+      "base_diameter_mm": 25,
+      "figure_finish": "grey-unpainted",
+      "identity_policy": "initial-position-plus-single-mover-inference",
+      "ring_inner_diameter_mm": null,
+      "ring_outer_diameter_mm": null,
+      "ring_colors": null,
+      "reflective_dot": false,
+      "dot_location": null,
+      "torch_on": false,
+      "polarizing_filter": true,
+      "fog_label": "fog-on",
+      "capture_note": "single-mover-study; test=5; base=25mm; rings=none; minis=6; grey-unpainted; dot=none; torch=off; filter=polarizer"
+    },
+    {
+      "test": 6,
+      "status": "planned-not-implemented",
+      "kind": "recovery",
+      "mini_count": null,
+      "target_configuration": "choose-after-tests-1-to-5",
+      "display_phases": [
+        "white",
+        "grey"
+      ],
+      "preserve_registration_markers": true,
+      "optical_phase_confirmation_required": true
+    }
+  ]
+}

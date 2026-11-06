@@ -46,39 +46,94 @@ def on_mini_moved(mini_id, grid_coord, *, source="detection"):
     fo.move_token_to_grid(mini_id, grid_coord, source=source)
 
 
-def run_live_session(service):
+def run_live_session(service, *, observer_only=False, startup=None):
     service.access.require()
-    s.initialize()
+    if startup is None:
+        s.initialize(access=service.access)
+    else:
+        s.initialize(access=service.access, selection=startup.selection_data,
+                     displays=startup.displays, webcams=startup.webcams)
     service.access.require()
     if s.selected_mode == s.MODE_FOUNDRY:
         service.start()
-        # Binding is quick, but errors must surface before a Foundry wait window.
-        import time
-        deadline = time.monotonic() + 3
-        while service.state == "Starting" and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if service.state != "Listening":
-            raise RuntimeError(service.error or "Foundry relay could not start")
-    c.calibrate(access=service.access)
+        if startup is not None:
+            from session_startup import StartupPending
+            state = service.startup_status()
+            if state["phase"] != "ready":
+                raise StartupPending()
+            startup.scene_info = state["scene_info"]
+        # A cold macOS startup can take longer than the socket bind itself.
+        # Let the existing relay finish starting before entering camera setup.
+        else:
+            import time
+            deadline = time.monotonic() + 10
+            while service.state == "Starting" and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if service.state != "Listening":
+                raise RuntimeError(service.error or
+                    f"Foundry relay is {service.state.lower()}. Wait a moment, then retry Start session.")
+    if startup is not None and s.selected_mode == s.MODE_FOUNDRY:
+        c.calibrate(access=service.access, scene_info=startup.scene_info)
+    else:
+        c.calibrate(access=service.access)
     service.access.require()
 
     import v3_tracking as t
     from mini_calibration import run_mini_calibration
 
     try:
-        while t.begin_session(on_mini_moved, access=service.access) == "recalibrate":
+        options = {"access": service.access, "foundry_service": service,
+                   "observation_only": observer_only}
+        if startup is not None:
+            options.update(control_parent=startup.runtime_parent, control_started=startup.runtime_started)
+            from camera_sources import is_phone_camera_index
+            if is_phone_camera_index(startup.selection_data.get("webcam_index")):
+                capture = startup.take_camera_capture()
+                if capture is not None:
+                    options["camera_capture"] = capture
+        while True:
+            result = t.begin_session(on_mini_moved, **options)
+            options.pop("camera_capture", None)
+            if result != "recalibrate":
+                break
             service.access.require()
             run_mini_calibration()
     finally:
+        # Idempotent release also covers constructor failures before ownership
+        # reaches the session's normal cleanup path.
+        if "options" in locals() and options.get("camera_capture") is not None:
+            options["camera_capture"].release()
         t.close_pending_recording()
 
 
-def main(*, smoke_report=None):
+def run_observer_session(service, *, startup=None):
+    # Inhibit output before setup/camera startup, rather than waiting for the
+    # first observer window to be drawn. Cancellation must also clear the guard.
+    fo.set_observation_only(True)
+    try:
+        return (run_live_session(service, observer_only=True) if startup is None else
+                run_live_session(service, observer_only=True, startup=startup))
+    finally:
+        # Inline setup owns the guard across a delayed connection or an
+        # inline retry. AppWindow releases it on cancel/session completion.
+        if startup is None:
+            fo.set_observation_only(False)
+
+
+def main(*, smoke_report=None, dev_no_login=False):
+    if dev_no_login and (getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS")):
+        raise ValueError("Developer login bypass is only available when running from source.")
+    auth_panel_factory = None
+    if dev_no_login:
+        from dev_access import DeveloperAuthPanel
+        auth_panel_factory = DeveloperAuthPanel
+        print("[DEV] Developer mode — login bypassed for this source session.", flush=True)
     initialize_user_data()
     from app_window import AppWindow
     root = s._get_persistent_root()
     service = FoundryService()
-    app = AppWindow(root, service=service, run_session=run_live_session)
+    app = AppWindow(root, service=service, run_session=run_live_session,
+                    auth_panel_factory=auth_panel_factory, run_observer=run_observer_session)
     smoke_result = {}
     if smoke_report is not None:
         # Exercise the packaged UI and lazy imports, then leave no app running.
@@ -173,5 +228,9 @@ if __name__ == "__main__":
     from pathlib import Path
     parser = argparse.ArgumentParser(description="Sarween miniature tracker")
     parser.add_argument("--smoke-test-report", type=Path, help=argparse.SUPPRESS)
+    if not getattr(sys, "frozen", False) and not hasattr(sys, "_MEIPASS"):
+        parser.add_argument("--dev-no-login", action="store_true",
+                            help="Bypass login for this local development session.")
     args = parser.parse_args()
-    main(smoke_report=args.smoke_test_report)
+    main(smoke_report=args.smoke_test_report,
+         dev_no_login=getattr(args, "dev_no_login", False))

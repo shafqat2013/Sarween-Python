@@ -1,1 +1,0 @@
-../Resources/tk_camera_preview.py

@@ -175,13 +175,22 @@ class HomeUITests(unittest.TestCase):
              patch.object(service, "start", side_effect=AssertionError("Home must not bind a port")):
             # These existing tests exercise the home/session lifecycle with an
             # approved identity. Real authentication gates have their own UI tests.
+            # Isolate the legacy synchronous runner; inline startup is tested separately.
             auth = Mock(allowed=True, status=Mock(return_value="Approved"))
             app = app_window.AppWindow(root, service=service, run_session=session,
-                                       auth_panel_factory=lambda *args, **kwargs: auth)
+                                       auth_panel_factory=lambda *args, **kwargs: auth,
+                                       inline_startup=False)
             try:
                 root.update()
                 self.assertFalse(service.running)
                 self.assertEqual(len(app.tree.get_children()), 5)
+                self.assertEqual(app.tabs.tab(app.tabs.select(), "text"), "Session")
+                # Session is the new home default; measure the library only
+                # after selecting its page so the tree is actually visible.
+                library_tab = next(tab for tab in app.tabs.tabs()
+                                   if app.tabs.tab(tab, "text") == "Mini Library")
+                app.tabs.select(library_tab)
+                root.update()
                 self.assertEqual(app.tabs.tab(app.tabs.select(), "text"), "Mini Library")
                 self.assertIn("unverified", app.detail.get())
                 self.assertEqual(list(Path(directory).iterdir()), [])

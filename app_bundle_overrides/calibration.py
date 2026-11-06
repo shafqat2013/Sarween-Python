@@ -1,15 +1,22 @@
 # calibration.py
 import os
+from foundry_service import validated_scene_info
 import cv2
 import numpy as np
 import time
 import setup as s
 import json
 import hashlib
-import io
-from app_paths import atomic_write_bytes, data_path, initialize_user_data
+from app_paths import data_path, initialize_user_data
 
 from screeninfo import get_monitors
+from calibration_capture import CalibrationCaptureGate
+from calibration_diagnostics import CalibrationDiagnostics
+from calibration_visuals import (
+    choose_preview_display, close_calibration_windows, render_board_status,
+    render_calibration_preview, render_charuco_board, show_calibration_preview,
+    show_charuco_board,
+)
 
 try:
     import foundryoutput as fo
@@ -24,6 +31,7 @@ MARKER_LENGTH = 0.015
 LENGTH_PX = 960
 MARGIN_PX = 30
 NUM_FRAMES = 10
+_LAST_CAMERA_CALIBRATION_MESSAGE = ""
 
 aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
 
@@ -229,26 +237,68 @@ def _foundry_wait_for_scene_grid(access=None):
         _t.sleep(0.25)
 
 
-def display_charuco():
-    dictionary = ARUCO_DICT
-    board = cv2.aruco.CharucoBoard(
-        (SQUARES_VERTICALLY, SQUARES_HORIZONTALLY),
-        SQUARE_LENGTH, MARKER_LENGTH, dictionary
-    )
-    size_ratio = SQUARES_HORIZONTALLY / SQUARES_VERTICALLY
-    img = cv2.aruco.CharucoBoard.generateImage(
-        board, (LENGTH_PX, int(LENGTH_PX * size_ratio)), marginSize=MARGIN_PX
-    )
-
-    monitors = get_monitors()
-    if len(monitors) < 2:
-        print("⚠️ Only one display detected. Showing on primary display.")
-    cv2.namedWindow("CharucoBoard", cv2.WINDOW_AUTOSIZE)
-    cv2.imshow("CharucoBoard", img)
-    cv2.waitKey(1)
+def _calibration_displays(display=None, displays=None):
+    available = list(displays) if displays is not None else (
+        [display] if display is not None else s.detect_displays_backup())
+    if not available:
+        raise ValueError("Connect a display for the calibration board.")
+    if display is None:
+        selected = getattr(s, "selected_display", None) or {}
+        display = next((item for item in available if item.get("index") == selected.get("index")), None)
+        display = display or next((item for item in available if not item.get("primary", item.get("index") == 0)), available[0])
+    return dict(display), choose_preview_display(display, available)
 
 
-def calibrate_webcam(camera_index=s.load_last_selection().get("webcam_index", 0)):
+def display_charuco(display=None, *, displays=None, board=None):
+    """Generate and present the same board used by the calibration solver."""
+    if board is None:
+        board = cv2.aruco.CharucoBoard(
+            (SQUARES_VERTICALLY, SQUARES_HORIZONTALLY), SQUARE_LENGTH, MARKER_LENGTH, ARUCO_DICT)
+    target, _preview = _calibration_displays(display, displays)
+    return show_charuco_board(board, target, cv=cv2)
+
+
+def save_camera_calibration_result(profile_id, camera_matrix, dist_coeffs, image_size, *, rms=None, profiles=None,
+                                   expected_binding=None):
+    """Persist one complete result to its named camera profile, never globals."""
+    if profiles is None:
+        from hardware_profiles import HardwareProfiles
+        profiles = HardwareProfiles()
+    if not profile_id:
+        raise ValueError("Choose a named camera profile before calibrating.")
+    return profiles.save_camera_calibration(profile_id, camera_matrix, dist_coeffs, image_size,
+                                            rms=rms, expected_binding=expected_binding)
+
+
+def last_camera_calibration_message():
+    return _LAST_CAMERA_CALIBRATION_MESSAGE
+
+
+def _save_calibration_diagnostics(diagnostics, outcome):
+    global _LAST_CAMERA_CALIBRATION_MESSAGE
+    _LAST_CAMERA_CALIBRATION_MESSAGE = diagnostics.summary()
+    try:
+        path = diagnostics.save(outcome)
+        print(f"Camera calibration | Diagnostics saved to {path}", flush=True)
+    except (OSError, ValueError) as exc:
+        print(f"Camera calibration | Could not save diagnostics: {exc}", flush=True)
+
+
+def calibrate_webcam(camera_index=None, *, profile_id=None, access=None,
+                     display=None, displays=None, auto_capture=True, camera_source=None):
+    global _LAST_CAMERA_CALIBRATION_MESSAGE
+    _LAST_CAMERA_CALIBRATION_MESSAGE = ""
+    if access is not None:
+        access.require()
+    from hardware_profiles import HardwareProfiles
+    profiles = HardwareProfiles()
+    profile = profiles.get_profile("camera", profile_id) if profile_id else profiles.active_profile("camera")
+    if not profile:
+        raise ValueError("Create and choose a camera profile before calibrating.")
+    profile_id = profile["id"]
+    diagnostics = CalibrationDiagnostics(profile_id, profile["name"], total=NUM_FRAMES)
+    if camera_index is None:
+        camera_index = s.load_last_selection().get("webcam_index", 0)
     dictionary = ARUCO_DICT
     board = cv2.aruco.CharucoBoard(
         (SQUARES_VERTICALLY, SQUARES_HORIZONTALLY),
@@ -256,76 +306,171 @@ def calibrate_webcam(camera_index=s.load_last_selection().get("webcam_index", 0)
     )
     params = cv2.aruco.DetectorParameters()
 
-    cap = cv2.VideoCapture(camera_index)
+    from camera_sources import (is_phone_camera_index, source_for_index,
+                                open_camera_capture, profile_compatible_with_source, stable_stream_key)
+    phone_source = is_phone_camera_index(camera_index)
+    source_selection = ({"webcam_index": camera_index, "camera_source": camera_source}
+                        if camera_source is not None else s.load_last_selection())
+    source = source_for_index(camera_index, selection=source_selection)
+    if not profile_compatible_with_source(profile, source):
+        if phone_source:
+            raise ValueError("Create and choose a Sarween Camera USB profile for this iPhone before calibrating.")
+        raise ValueError("Choose a camera profile for this input before calibrating. Direct USB iPhone and native/OBS feeds need separate profiles.")
+    cap = open_camera_capture(camera_index, source=source)
     if not cap.isOpened():
         print("❌ Failed to open webcam.")
+        cap.release()
+        diagnostics.error = "The selected camera could not be opened."
+        _save_calibration_diagnostics(diagnostics, "failed")
         return
 
     all_charuco_corners = []
     all_charuco_ids = []
-    used_frames = []
     captured = 0
+    image_size = None
+    board_window = preview_window = None
+    gate = CalibrationCaptureGate(NUM_FRAMES, automatic=auto_capture,
+                                  board_columns=SQUARES_VERTICALLY - 1,
+                                  board_rows=SQUARES_HORIZONTALLY - 1)
+    last_board_status = None
+    timed_capture = False
+    next_timed_capture = None
+    failed_reads = 0
+    camera_stream = None
+    try:
+        target, preview_display = _calibration_displays(display, displays)
+        board_image = render_charuco_board(board, target["width"], target["height"])
+        board_window = display_charuco(target, displays=displays, board=board)
+        print("Camera calibration | Move or tilt the camera, then hold each new view still.")
+        print("Camera calibration | Starts after five seconds. T: 5-second timer; C/Space: capture now; A: auto/manual; Q/Escape: cancel.")
+        while captured < NUM_FRAMES:
+            if access is not None:
+                access.require()
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                failed_reads += 1
+                if phone_source:
+                    message = cap.status.get("message", "Waiting for the iPhone camera…")
+                    cv2.imshow(board_window, render_board_status(board_image, message + "  Q: cancel",
+                        count=captured, total=NUM_FRAMES, auto_capture=gate.automatic))
+                    if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
+                        return None
+                    continue
+                if failed_reads >= 10:
+                    raise ValueError("The camera feed stopped during calibration. Reconnect it and try again.")
+                time.sleep(0.1)
+                continue
+            failed_reads = 0
+            if phone_source:
+                stream = stable_stream_key(cap.last_frame_metadata)
+                if camera_stream is not None and stream != camera_stream:
+                    raise ValueError("The iPhone stream restarted during calibration. Start a new calibration capture.")
+                camera_stream = stream
+            current_size = (frame.shape[1], frame.shape[0])
+            if image_size is not None and current_size != image_size:
+                raise ValueError("Camera resolution changed during calibration. Fix the feed settings and start again.")
+            image_size = current_size
 
-    print("📸 Press 'c' to capture a frame with a visible ChArUco board.")
-    print("📷 Need 10 captures total. Press 'q' to quit early.")
-
-    while captured < NUM_FRAMES:
-        ret, frame = cap.read()
-        if not ret:
-            continue
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        marker_corners, marker_ids, _ = cv2.aruco.detectMarkers(gray, dictionary, parameters=params)
-
-        if marker_ids is not None:
-            cv2.aruco.drawDetectedMarkers(frame, marker_corners, marker_ids)
-
-        _ensure_window("Capture Preview", 1280, 720)
-        cv2.imshow("Capture Preview", frame)
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord('c'):
-            if marker_ids is not None and len(marker_ids) > 0:
-                charuco_retval, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
-                    marker_corners, marker_ids, gray, board
-                )
-                if charuco_retval:
-                    all_charuco_corners.append(charuco_corners)
-                    all_charuco_ids.append(charuco_ids)
-                    used_frames.append(frame.copy())
-                    captured += 1
-                    print(f"✅ Captured frame {captured}/10")
-                else:
-                    print("⚠️ Not enough ChArUco corners found. Try again.")
-            else:
-                print("⚠️ No ArUco markers detected. Try again.")
-        elif key == ord('q'):
-            cap.release()
-            cv2.destroyAllWindows()
-            return
-
-    cap.release()
-    cv2.destroyAllWindows()
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            marker_corners, marker_ids, _ = cv2.aruco.detectMarkers(gray, dictionary, parameters=params)
+            charuco_corners = charuco_ids = None
+            duplicate_markers = (marker_ids is not None
+                                 and len(np.unique(marker_ids)) != len(marker_ids))
+            if marker_ids is not None and not duplicate_markers:
+                try:
+                    found, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
+                        marker_corners, marker_ids, gray, board)
+                    if not found:
+                        charuco_corners = charuco_ids = None
+                except cv2.error:
+                    charuco_corners = charuco_ids = None
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord('q'), ord('Q'), 27):
+                return None
+            now = time.monotonic()
+            if key in (ord('t'), ord('T')):
+                timed_capture = not timed_capture
+                gate.automatic = not timed_capture
+                next_timed_capture = now + 5.0 if timed_capture else None
+            if key in (ord('a'), ord('A')):
+                timed_capture = False
+                next_timed_capture = None
+                gate.automatic = not gate.automatic
+            timer_due = timed_capture and now >= next_timed_capture
+            state = gate.observe(now, gray, charuco_corners, charuco_ids, current_size,
+                                 manual=key in (ord('c'), ord('C'), 32) or timer_due)
+            state["captureMode"] = "timed" if timed_capture else "auto" if gate.automatic else "manual"
+            if timed_capture and state["reason"] == "manual":
+                state["reason"] = "timed_wait"
+                state["message"] = "Timer running. Move to a new angle; each frame is still checked for clarity."
+            if timed_capture and (timer_due or state["capture"]):
+                next_timed_capture = now + 5.0
+            if state["capture"]:
+                # A planar homography is useful for judging camera motion, but
+                # real lens distortion bends that plane in the image. Retain
+                # every valid detected corner so the solver can estimate it.
+                all_charuco_corners.append(charuco_corners.copy())
+                all_charuco_ids.append(charuco_ids.copy())
+                captured += 1
+                print(f"Camera calibration | Captured {captured}/{NUM_FRAMES}")
+            detected_corners = 0 if charuco_ids is None else len(charuco_ids)
+            diagnostics.observe(state, detected_corners=detected_corners, frame_size=current_size,
+                                automatic=gate.automatic, duplicate_markers=duplicate_markers)
+            message = ("Show only the calibration board; cover other ArUco markers."
+                       if duplicate_markers else state["message"])
+            countdown = None
+            if timed_capture:
+                countdown = max(0.0, next_timed_capture - now)
+            elif state["reason"] == "starting":
+                countdown = gate.start_delay * (1 - state["startProgress"])
+            elif state["reason"] == "holding":
+                countdown = gate.hold_seconds * (1 - state["stableProgress"])
+            board_status = (message, captured, state["captureMode"],
+                            round(countdown, 1) if countdown is not None else None,
+                            detected_corners, state.get("poseCorners", state.get("inlierCorners")), state.get("holdResets"),
+                            round(state.get("motionRatio") or 0.0, 3), state.get("sharedCorners"),
+                            round(state.get("sharpness") or 0.0))
+            if board_status != last_board_status:
+                cv2.imshow(board_window, render_board_status(board_image, message, count=captured,
+                    total=NUM_FRAMES, auto_capture=gate.automatic, countdown=countdown,
+                    diagnostics=state, detected_corners=detected_corners))
+                last_board_status = board_status
+            preview = frame.copy()
+            if marker_ids is not None and not duplicate_markers:
+                cv2.aruco.drawDetectedMarkers(preview, marker_corners, marker_ids)
+            preview = render_calibration_preview(preview, captured=captured, required=NUM_FRAMES,
+                detected_corners=detected_corners, diagnostics=state,
+                auto_capture=gate.automatic, prompt=message, countdown=countdown)
+            if preview_window is None and preview_display is not None:
+                preview_window = show_calibration_preview(preview, preview_display, board_display=target, cv=cv2)
+            elif preview_window is not None:
+                cv2.imshow(preview_window, preview)
+    except BaseException as exc:
+        diagnostics.error = str(exc) or type(exc).__name__
+        raise
+    finally:
+        cap.release()
+        close_calibration_windows(board_window, preview_window, cv=cv2)
+        _save_calibration_diagnostics(diagnostics, "failed" if diagnostics.error else
+                                      "captured" if captured == NUM_FRAMES else "cancelled")
 
     print("🔧 Calibrating camera...")
-    retval, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
-        all_charuco_corners, all_charuco_ids, board, gray.shape[::-1], None, None
-    )
+    try:
+        retval, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
+            all_charuco_corners, all_charuco_ids, board, gray.shape[::-1], None, None)
+        if access is not None:
+            access.require()
+        saved_profile = save_camera_calibration_result(
+            profile_id, camera_matrix, dist_coeffs, image_size, rms=float(retval), profiles=profiles,
+            expected_binding=profile)
+    except BaseException as exc:
+        diagnostics.error = str(exc) or type(exc).__name__
+        _save_calibration_diagnostics(diagnostics, "failed")
+        raise
+    _save_calibration_diagnostics(diagnostics, "saved")
+    print(f"✅ Calibration complete. Saved camera profile: {saved_profile['name']} ({image_size[0]}×{image_size[1]}).")
 
-    for name, array in (("camera_matrix.npy", camera_matrix), ("dist_coeffs.npy", dist_coeffs)):
-        buffer = io.BytesIO()
-        np.save(buffer, array, allow_pickle=False)
-        atomic_write_bytes(data_path(name), buffer.getvalue())
-    print("✅ Calibration complete. Saved camera_matrix.npy and dist_coeffs.npy.")
-
-    for i, frame in enumerate(used_frames):
-        undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs)
-        combined = np.hstack((frame, undistorted))
-        _ensure_window(f"Frame {i+1}: Original (L) | Undistorted (R)", 1280, 720)
-        cv2.imshow(f"Frame {i+1}: Original (L) | Undistorted (R)", combined)
-        cv2.waitKey(0)
-
-    cv2.destroyAllWindows()
+    return saved_profile
 
 
 def add_white_border(img, border_thickness):
@@ -471,11 +616,20 @@ def generate_aruco_marker_tiles(cell_px, border_px):
         cv2.imwrite(os.path.join(MARKERS_DIR, f"marker_{i}.png"), tile)
 
 
-def prepare_map_asset(access=None):
+def prepare_map_asset(access=None, *, scene_info=None):
     mode = _get_mode()
 
     if mode == "foundry":
-        cols, rows, info = _foundry_wait_for_scene_grid(access)
+        if scene_info is None:
+            cols, rows, info = _foundry_wait_for_scene_grid(access)
+        else:
+            if access is not None:
+                access.require()
+            info = validated_scene_info(scene_info)
+            if info is None:
+                raise ValueError("Foundry setup needs a connected scene with valid dimensions and grid size.")
+            cols = max(1, int(round(info["sceneW"] / float(info["gridPx"]))))
+            rows = max(1, int(round(info["sceneH"] / float(info["gridPx"]))))
         s.grid_cols = cols
         s.grid_rows = rows
         return None, None, None, cols, rows, None, None
@@ -614,12 +768,12 @@ def generate_display():
     _BLENDED_WINDOW_OPEN = True
 
 
-def calibrate(access=None):
+def calibrate(access=None, *, scene_info=None):
     initialize_user_data()
     mode = _get_mode()
 
     if mode == "foundry":
-        prepare_map_asset(access)
+        prepare_map_asset(access, scene_info=scene_info)
     else:
         generate_display()
 

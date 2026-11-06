@@ -9,13 +9,41 @@ import tracking_regression as regression
 from guided_capture import GuidedCapture, regression_case
 
 
-def capture_payload():
-    participants = [{"miniId": "red10", "tokenId": "red-token", "route": "A", "ringColor": "red"}]
-    targets = [{**participants[0], "row": 2, "column": index, "cell": f"{chr(65 + index)}3", "step": index, "index": index} for index in range(6)]
+def capture_payload(count=1):
+    names = ["red10", "blue", "yellow", "green", "white", "orange", "seventh"]
+    participants = [{"miniId": name, "tokenId": "red-token" if name == "red10" else f"{name}-token",
+                     "route": chr(65 + index), "ringColor": "red" if name == "red10" else name}
+                    for index, name in enumerate(names[:count])]
+    targets = [{**participant, "row": mini_index + 2, "column": step,
+                "cell": f"{chr(65 + step)}{mini_index + 3}", "step": step,
+                "index": step * count + mini_index}
+               for step in range(6) for mini_index, participant in enumerate(participants)]
     return {"sessionId": "test-capture", "sceneId": "capture-scene", "participants": participants, "targets": targets}
 
 
 class GuidedCaptureTest(unittest.TestCase):
+    def test_six_minis_have_independent_confirmation_labels_without_scans(self):
+        capture = GuidedCapture(capture_payload(6), "capture-scene")
+        confirmations = []
+        for index, target in enumerate(capture.targets):
+            capture.prompt(index, index * 10)
+            event = capture.confirm(index, index * 10 + 5)
+            confirmations.append(event)
+            self.assertEqual(event["mini"], target["miniId"])
+            self.assertEqual(event["cell"], target["cell"])
+            self.assertEqual(event["source"], "userConfirmation")
+        self.assertEqual(capture.next_index, 36)
+        self.assertEqual(len({event["mini"] for event in confirmations}), 6)
+        case = regression_case({"fps": 10, "groundTruth": confirmations}, "six.mp4")["cases"][0]
+        self.assertEqual(len(case["expectations"]), 36)
+        self.assertEqual(case["expectations"][-1]["mini"], "orange")
+        self.assertEqual(case["expectations"][-1]["from"], "E8")
+        self.assertEqual(case["expectations"][-1]["to"], "F8")
+
+    def test_seven_minis_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "one and six"):
+            GuidedCapture(capture_payload(7), "capture-scene")
+
     def test_confirmation_uses_plan_not_detection_output(self):
         capture = GuidedCapture(capture_payload(), "capture-scene")
         capture.prompt(0, 10)

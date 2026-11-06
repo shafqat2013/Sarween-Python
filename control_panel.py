@@ -16,6 +16,63 @@ from app_paths import atomic_write_json, data_path
 CONFIG_FILE = str(data_path("hardware_config.json"))
 
 
+def control_panel_window_bounds(screen_width, screen_height):
+    """Return initial/minimum sizes in Tk's logical screen coordinates."""
+    available_width = max(1, int(screen_width) - 64)
+    available_height = max(1, int(screen_height) - 100)
+    width, height = min(800, available_width), min(760, available_height)
+    return width, height, min(680, width), min(520, height)
+
+
+def _wrap_label(label, initial_width=640):
+    label.configure(wraplength=initial_width, justify="left")
+
+    def resized(event):
+        # Ignore the temporary one-pixel geometry before Tk lays out the page.
+        if event.width > 1:
+            label.configure(wraplength=event.width)
+
+    label.bind("<Configure>", resized)
+    return label
+
+
+def _scrollable_content(parent):
+    """Scroll only a long page, leaving the notebook and footer stationary."""
+    parent.columnconfigure(0, weight=1)
+    parent.rowconfigure(0, weight=1)
+    canvas = tk.Canvas(parent, highlightthickness=0, width=1, height=1)
+    scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+    canvas.grid(row=0, column=0, sticky="nsew")
+    scrollbar.grid(row=0, column=1, sticky="ns")
+    canvas.configure(yscrollcommand=scrollbar.set)
+    content = ttk.Frame(canvas, padding=12)
+    window = canvas.create_window(0, 0, window=content, anchor="nw")
+    content.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=max(1, event.width)))
+    content._scroll_canvas = canvas
+    return content
+
+
+def _bind_page_scroll(content):
+    canvas = content._scroll_canvas
+    tag = f"ControlPanelScroll{id(content)}"
+
+    def scroll(event):
+        direction = -1 if getattr(event, "delta", 0) > 0 or getattr(event, "num", None) == 4 else 1
+        canvas.yview_scroll(direction, "units")
+        return "break"
+
+    for event in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        content.bind_class(tag, event, scroll)
+
+    def include(widget):
+        widget.bindtags((tag, *widget.bindtags()))
+        for child in widget.winfo_children():
+            include(child)
+
+    include(content)
+
+
 def rc_to_a1(row: int, col: int) -> str:
     col_letter = ""
     c = col
@@ -25,6 +82,20 @@ def rc_to_a1(row: int, col: int) -> str:
         if c < 0:
             break
     return f"{col_letter}{row + 1}"
+
+
+def format_camera_calibration_status(status):
+    status = status if isinstance(status, dict) else {}
+    name = status.get("profileName") or "no profile"
+    if status.get("applied"):
+        text = f"Camera: {name} · lens correction on"
+    else:
+        reason = str(status.get("reason") or "no matching calibration")
+        text = f"Camera: {name} · lens correction off: {reason}"
+    size = status.get("frameSize")
+    if isinstance(size, (list, tuple)) and len(size) == 2:
+        text += f" ({size[0]} × {size[1]})"
+    return text
 
 
 def _load_config() -> Dict[str, object]:
@@ -48,16 +119,30 @@ def _save_config_patch(patch: Dict[str, object]) -> None:
 
 
 class ControlPanel:
+    def set_camera_calibration_status(self, status):
+        message = format_camera_calibration_status(status)
+        if message == getattr(self, "_camera_calibration_text", None):
+            return
+        self._camera_calibration_text = message
+        try:
+            self.var_camera_calibration.set(message)
+        except tk.TclError:
+            pass
+
     def set_access_status(self, message):
         if not hasattr(self, "_access_label"):
-            self._access_label = ttk.Label(self.root, wraplength=450)
-            self._access_label.pack(side="bottom", fill="x", padx=8, pady=4)
+            self._access_label = _wrap_label(ttk.Label(self._footer))
+            self._access_label.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         self._access_label.configure(text=message)
 
-    def __init__(self, mode: str = "self_hosted", tk_root: tk.Tk = None):
+    def __init__(self, mode: str = "self_hosted", tk_root: tk.Tk = None, *, access=None, foundry_service=None,
+                 parent=None):
         self.mode = (mode or "self_hosted").strip().lower()
         if self.mode not in ("self_hosted", "foundry"):
             self.mode = "self_hosted"
+        self._access = access
+        self.grid_controls = None
+        self.vtt_controls = None
 
         self._lock = threading.Lock()
 
@@ -85,6 +170,7 @@ class ControlPanel:
             "dump_state": False,
             "scan_mini": None,
             "retry_moves": False,
+            "open_observer": False,
         }
         self._library_rows: List[Dict[str, object]] = []
         self._library_window = None
@@ -92,7 +178,12 @@ class ControlPanel:
         self._ring_scan_window = None
 
         # ── Tk root / window ─────────────────────────────────────────────────
-        if tk_root is not None:
+        self._embedded = parent is not None
+        if self._embedded:
+            self._owns_root = False
+            self._tk_root = parent.winfo_toplevel()
+            self.root = ttk.Frame(parent)
+        elif tk_root is not None:
             self._owns_root = False
             self._tk_root = tk_root
             self.root = tk.Toplevel(tk_root)
@@ -101,14 +192,18 @@ class ControlPanel:
             self._tk_root = tk.Tk()
             self.root = self._tk_root
 
-        self.root.title("Sarween Control Panel")
-        self.root.geometry(f"540x{min(700, self.root.winfo_screenheight() - 100)}")
-        self.root.minsize(500, 420)
-        self.root.resizable(True, True)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if not self._embedded:
+            self.root.title("Sarween Control Panel")
+            width, height, min_width, min_height = control_panel_window_bounds(
+                self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+            self.root.geometry(f"{width}x{height}")
+            self.root.minsize(min_width, min_height)
+            self.root.resizable(True, True)
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # ── Status vars ───────────────────────────────────────────────────────
         self.var_mode    = tk.StringVar(value=f"Mode: {self.mode}")
+        self.var_camera_calibration = tk.StringVar(value=format_camera_calibration_status(None))
         self.var_lock    = tk.StringVar(value="Lock: (waiting)")
         self.var_markers = tk.StringVar(value="Markers: --")
         self.var_missing = tk.StringVar(value="Missing: --")
@@ -132,56 +227,79 @@ class ControlPanel:
         self._var_verbose_tracking   = tk.BooleanVar(value=self._toggles["verbose_tracking"])
 
         # ── Layout ────────────────────────────────────────────────────────────
-        scroll = tk.Canvas(self.root, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=scroll.yview)
-        scrollbar.pack(side="right", fill="y")
-        scroll.pack(side="left", fill="both", expand=True)
-        scroll.configure(yscrollcommand=scrollbar.set)
-        outer = ttk.Frame(scroll, padding=14)
-        content = scroll.create_window(0, 0, window=outer, anchor="nw")
-        outer.bind("<Configure>", lambda _event: scroll.configure(scrollregion=scroll.bbox("all")))
-        scroll.bind("<Configure>", lambda event: scroll.itemconfigure(content, width=event.width))
-        self.root.bind("<MouseWheel>", lambda event: scroll.yview_scroll(-1 if event.delta > 0 else 1, "units"))
+        outer = ttk.Frame(self.root, padding=12)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
 
         ttk.Label(outer, text="Sarween Control Panel",
-                  font=("Helvetica", 16, "bold")).pack(anchor="w", pady=(0, 10))
+                  font=("Helvetica", 16, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 12))
 
         self.tabs = ttk.Notebook(outer)
-        self.tabs.pack(fill="both", expand=True)
-        session_tab = ttk.Frame(self.tabs, padding=10)
-        scans_tab = ttk.Frame(self.tabs, padding=10)
-        diagnostics_tab = ttk.Frame(self.tabs, padding=10)
+        self.tabs.grid(row=1, column=0, sticky="nsew")
+        session_tab = ttk.Frame(self.tabs, padding=12)
+        scans_tab = ttk.Frame(self.tabs, padding=12)
+        diagnostics_page = ttk.Frame(self.tabs)
+        diagnostics_tab = _scrollable_content(diagnostics_page)
         self.tabs.add(session_tab, text="Session")
         self.tabs.add(scans_tab, text="Scans")
-        self.tabs.add(diagnostics_tab, text="Diagnostics")
+        self.tabs.add(diagnostics_page, text="Diagnostics")
+        if self.mode == "foundry":
+            from vtt_controls import VTTControls
+            vtt_tab = ttk.Frame(self.tabs, padding=12)
+            self.tabs.add(vtt_tab, text="VTT Controls")
+            self.vtt_controls = VTTControls(vtt_tab,
+                require_access=access.require if access is not None else None,
+                foundry_service=foundry_service, live_session=True)
+            self.vtt_controls.pack(fill="both", expand=True)
+            self.grid_controls = self.vtt_controls.grid_controls
         from map_view import MapView
         self.map_view = MapView(self.tabs)
         self.tabs.add(self.map_view, text="Map")
 
+        self._footer = ttk.Frame(outer)
+        self._footer.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        self._footer.columnconfigure(0, weight=1)
+        _wrap_label(ttk.Label(self._footer, textvariable=self.var_hint)).grid(
+            row=0, column=0, sticky="ew")
+
         # Calibration row
         cal_box = ttk.Frame(scans_tab)
         cal_box.pack(fill="x", pady=(0, 10))
-        ttk.Label(cal_box, text="Mini name").pack(side="left")
+        cal_box.columnconfigure(1, weight=1)
+        ttk.Label(cal_box, text="Mini name").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self._band_name_var = tk.StringVar(value="")
-        ttk.Entry(cal_box, textvariable=self._band_name_var, width=16).pack(
-            side="left", padx=(8, 8))
+        ttk.Entry(cal_box, textvariable=self._band_name_var, width=16).grid(
+            row=0, column=1, sticky="ew", padx=(0, 8))
         ttk.Button(cal_box, text="Calibrate",
-                   command=self._act_calibrate_band).pack(side="left", padx=(0, 4))
+                   command=self._act_calibrate_band).grid(row=0, column=2, padx=(0, 8))
         ttk.Button(cal_box, text="Auto",
-                   command=self._act_calibrate_band_auto).pack(side="left")
+                   command=self._act_calibrate_band_auto).grid(row=0, column=3)
 
         # Status
         status_box = ttk.Frame(session_tab)
-        status_box.pack(fill="x", pady=(0, 6))
-        for var in (self.var_mode, self.var_lock, self.var_markers,
-                    self.var_missing, self.var_fps, self.var_foundry):
-            ttk.Label(status_box, textvariable=var).pack(anchor="w")
+        status_box.pack(fill="x")
+        for column in (0, 1):
+            status_box.columnconfigure(column, weight=1, uniform="status")
+        for row, variables in enumerate(((self.var_mode, self.var_fps),
+                                         (self.var_lock, self.var_foundry),
+                                         (self.var_markers, self.var_missing))):
+            for column, variable in enumerate(variables):
+                _wrap_label(ttk.Label(status_box, textvariable=variable), 320).grid(
+                    row=row, column=column, sticky="new", padx=(0, 12) if column == 0 else 0, pady=2)
+        _wrap_label(ttk.Label(status_box, textvariable=self.var_camera_calibration)).grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         if self.mode == "foundry":
-            ttk.Label(status_box, textvariable=self.var_delivery, wraplength=420).pack(anchor="w")
-            self._retry_moves_btn = ttk.Button(status_box, text="Retry moves", command=self._act_retry_moves, state="disabled")
-            self._retry_moves_btn.pack(anchor="w")
+            delivery = ttk.Frame(status_box)
+            delivery.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            delivery.columnconfigure(0, weight=1)
+            _wrap_label(ttk.Label(delivery, textvariable=self.var_delivery), 480).grid(
+                row=0, column=0, sticky="ew", padx=(0, 8))
+            self._retry_moves_btn = ttk.Button(delivery, text="Retry moves",
+                command=self._act_retry_moves, state="disabled")
+            self._retry_moves_btn.grid(row=0, column=1, sticky="e")
 
-        ttk.Separator(session_tab, orient="horizontal").pack(fill="x", pady=8)
+        ttk.Separator(session_tab, orient="horizontal").pack(fill="x", pady=12)
 
         # Windows toggles
         ttk.Label(diagnostics_tab, text="Windows").pack(anchor="w")
@@ -213,29 +331,38 @@ class ControlPanel:
 
         # Actions
         btn_row = ttk.Frame(session_tab)
-        btn_row.pack(fill="x", pady=(6, 0))
+        btn_row.pack(fill="x")
+        btn_row.columnconfigure(2, weight=1)
         ttk.Button(btn_row, text="Recapture BG",
-                   command=self._act_recapture_bg).pack(side="left", padx=(0, 6))
+                   command=self._act_recapture_bg).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(scans_tab, text="Calibrate Minis",
                    command=self._act_calibrate_minis).pack(anchor="w", pady=(8, 0))
         ttk.Button(btn_row, text="Stop session",
-                   command=self._act_exit).pack(side="right")
+                   command=self._act_exit).grid(row=0, column=3, sticky="e")
 
         rec_row = ttk.Frame(session_tab)
-        rec_row.pack(fill="x", pady=(4, 0))
+        rec_row.pack(fill="x", pady=(8, 0))
+        rec_row.columnconfigure(1, weight=1)
         self._rec_btn_var = tk.StringVar(value="⏺  Record")
         ttk.Button(rec_row, textvariable=self._rec_btn_var,
-                   command=self._act_toggle_recording).pack(side="left")
+                   command=self._act_toggle_recording).grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.var_recording = tk.StringVar(value="")
-        ttk.Label(rec_row, textvariable=self.var_recording,
-                  foreground="red").pack(side="left", padx=(10, 0))
+        _wrap_label(ttk.Label(rec_row, textvariable=self.var_recording,
+                  foreground="red"), 480).grid(row=0, column=1, sticky="ew")
+
+        observer_row = ttk.Frame(session_tab)
+        observer_row.pack(fill="x", pady=(10, 0))
+        ttk.Button(observer_row, text="Open six-mini observer",
+                   command=self._act_open_observer).pack(side="left", padx=(0, 8))
+        _wrap_label(ttk.Label(observer_row, text="Experimental · Foundry movement off while observing"),
+                    400).pack(side="left", fill="x", expand=True)
 
         debug_row = ttk.Frame(diagnostics_tab)
         debug_row.pack(fill="x", pady=(4, 0))
         ttk.Button(debug_row, text="Dump State",
                    command=self._act_dump_state).pack(side="left")
         ttk.Button(btn_row, text="Mini Library",
-                   command=self._show_mini_library).pack(side="left", padx=(0, 6))
+                   command=self._show_mini_library).grid(row=0, column=1, padx=(0, 8))
 
         # Motion threshold
         thresh_box = ttk.Frame(diagnostics_tab)
@@ -252,16 +379,24 @@ class ControlPanel:
         ).pack(side="left", fill="x", expand=True, padx=(0, 8))
         ttk.Label(thresh_row, textvariable=self._thresh_label_var, width=4).pack(side="left")
 
-        # Hint
-        ttk.Label(outer, textvariable=self.var_hint, wraplength=460).pack(anchor="w", pady=(8, 0))
-
-        ttk.Separator(session_tab, orient="horizontal").pack(fill="x", pady=8)
+        ttk.Separator(session_tab, orient="horizontal").pack(fill="x", pady=12)
 
         # Mini positions
-        ttk.Label(session_tab, text="Mini Positions").pack(anchor="w", pady=(0, 4))
+        ttk.Label(session_tab, text="Mini Positions").pack(anchor="w", pady=(0, 8))
         self._pos_table = ttk.Frame(session_tab)
         self._pos_table.pack(fill="both", expand=True)
+        self._pos_tree = ttk.Treeview(self._pos_table, columns=("mini", "cell"),
+                                      show="headings", height=7, selectmode="browse")
+        self._pos_tree.heading("mini", text="Mini")
+        self._pos_tree.heading("cell", text="Cell")
+        self._pos_tree.column("mini", width=300, minwidth=140, stretch=True, anchor="w")
+        self._pos_tree.column("cell", width=120, minwidth=80, stretch=False, anchor="w")
+        position_scroll = ttk.Scrollbar(self._pos_table, orient="vertical", command=self._pos_tree.yview)
+        position_scroll.pack(side="right", fill="y")
+        self._pos_tree.pack(side="left", fill="both", expand=True)
+        self._pos_tree.configure(yscrollcommand=position_scroll.set)
         self._pos_rows: dict = {}
+        _bind_page_scroll(diagnostics_tab)
 
     # ── UI handlers ───────────────────────────────────────────────────────────
 
@@ -269,7 +404,8 @@ class ControlPanel:
         with self._lock:
             self._actions["exit"] = True
         try:
-            self.root.withdraw()
+            if not self._embedded:
+                self.root.withdraw()
         except Exception:
             pass
 
@@ -318,6 +454,10 @@ class ControlPanel:
     def _act_toggle_recording(self):
         with self._lock:
             self._actions["toggle_recording"] = True
+
+    def _act_open_observer(self):
+        with self._lock:
+            self._actions["open_observer"] = True
 
     def _act_dump_state(self):
         with self._lock:
@@ -453,25 +593,16 @@ class ControlPanel:
     def update_positions(self, positions: dict) -> None:
         def _update():
             try:
+                for mini_id in self._pos_tree.get_children():
+                    if mini_id not in positions:
+                        self._pos_tree.delete(mini_id)
                 for mini_id, coord in positions.items():
-                    if mini_id not in self._pos_rows:
-                        row = len(self._pos_rows)
-                        name_var = tk.StringVar(value=mini_id)
-                        pos_var  = tk.StringVar(value="—")
-                        ttk.Label(
-                            self._pos_table,
-                            textvariable=name_var,
-                            width=12,
-                            anchor="w",
-                        ).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=1)
-                        ttk.Label(
-                            self._pos_table,
-                            textvariable=pos_var,
-                            font=("Courier", 11, "bold"),
-                            anchor="w",
-                        ).grid(row=row, column=1, sticky="w", pady=1)
-                        self._pos_rows[mini_id] = {"name_var": name_var, "pos_var": pos_var}
-                    self._pos_rows[mini_id]["pos_var"].set(coord if coord else "—")
+                    values = (mini_id, coord or "—")
+                    if self._pos_tree.exists(mini_id):
+                        self._pos_tree.item(mini_id, values=values)
+                    else:
+                        self._pos_tree.insert("", "end", iid=mini_id, values=values)
+                self._pos_rows = dict(positions)
             except Exception:
                 pass
         try:
@@ -482,6 +613,8 @@ class ControlPanel:
     def update_mini_library(self, rows: List[Dict[str, object]]) -> None:
         def _update():
             self._library_rows = [dict(row) for row in rows]
+            if self.vtt_controls is not None:
+                self.vtt_controls.set_mini_rows(self._library_rows)
             self._render_mini_library()
 
         try:
@@ -494,14 +627,20 @@ class ControlPanel:
 
     def show(self):
         try:
-            self.root.deiconify()
+            if self._embedded:
+                self.root.pack(fill="both", expand=True)
+            else:
+                self.root.deiconify()
             self.root.lift()
         except Exception:
             pass
 
     def hide(self):
         try:
-            self.root.withdraw()
+            if self._embedded:
+                self.root.pack_forget()
+            else:
+                self.root.withdraw()
         except Exception:
             pass
 
@@ -605,10 +744,14 @@ class ControlPanel:
             self._actions["dump_state"]       = False
             self._actions["scan_mini"]        = None
             self._actions["retry_moves"]      = False
+            self._actions["open_observer"]    = False
         return out
 
     def pump(self) -> bool:
         try:
+            if self.vtt_controls is not None:
+                self.vtt_controls.set_enabled(self._access is None or self._access.allowed)
+                self.vtt_controls.refresh()
             self._tk_root.update_idletasks()
             self._tk_root.update()
         except tk.TclError:
