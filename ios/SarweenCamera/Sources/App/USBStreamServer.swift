@@ -1,12 +1,15 @@
 import Foundation
 import Network
 
-struct CameraStreamFormat {
+struct CameraStreamFormat: Equatable {
     let orientation: CameraOrientation
-    var width: Int { orientation == .portrait ? 1080 : 1920 }
-    var height: Int { orientation == .portrait ? 1920 : 1080 }
+    let preset: CameraCapturePreset
+    let supportedPresets: [CameraCapturePreset]
+    var width: Int { preset.width(for: orientation) }
+    var height: Int { preset.height(for: orientation) }
     var json: [String: Any] {
-        ["width": width, "height": height, "fps": 15, "pixelFormat": "jpeg",
+        ["width": width, "height": height, "fps": preset.framesPerSecond, "pixelFormat": "jpeg",
+         "capturePreset": preset.rawValue,
          "orientation": orientation.rawValue, "rotationDegrees": 0, "mirrored": false,
          "cameraPosition": "back", "lens": "wide", "zoom": 1.0,
          "stabilization": "off", "geometricDistortionCorrection": "off",
@@ -33,10 +36,11 @@ final class USBStreamServer {
     private var sendingControl = false
     private var decoder = CameraPacketDecoder(maximumIncomingPayload: 0)
 
-    init(installationID: String, deviceName: String, orientation: CameraOrientation) {
+    init(installationID: String, deviceName: String, orientation: CameraOrientation,
+         preset: CameraCapturePreset = .standard, supportedPresets: [CameraCapturePreset] = [.standard]) {
         self.installationID = installationID
         self.deviceName = deviceName
-        self.format = CameraStreamFormat(orientation: orientation)
+        self.format = CameraStreamFormat(orientation: orientation, preset: preset, supportedPresets: supportedPresets)
     }
 
     func start() {
@@ -77,10 +81,13 @@ final class USBStreamServer {
         }
     }
 
-    func setOrientation(_ orientation: CameraOrientation) {
+    func setConfiguration(orientation: CameraOrientation, preset: CameraCapturePreset,
+                          supportedPresets: [CameraCapturePreset]) {
         queue.async { [weak self] in
-            guard let self, self.format.orientation != orientation else { return }
-            self.format = CameraStreamFormat(orientation: orientation)
+            guard let self else { return }
+            let proposed = CameraStreamFormat(orientation: orientation, preset: preset, supportedPresets: supportedPresets)
+            guard self.format != proposed else { return }
+            self.format = proposed
             self.disconnect()
         }
     }
@@ -200,8 +207,9 @@ final class USBStreamServer {
     private func sendHello() {
         sendControl([
             "type": "hello", "deviceName": deviceName, "deviceId": installationID,
-            "sourceId": "sarween-iphone:\(installationID):back-wide:\(format.width)x\(format.height):rotation0:mirror0:zoom1:stabilization-off:gdc-off:hdr-off",
+            "sourceId": format.preset.opticalSourceID(installationID: installationID, orientation: format.orientation),
             "captureFormat": format.json, "cameraReady": localEnabled,
+            "availableCapturePresets": format.supportedPresets.map { $0.capabilityJSON(orientation: format.orientation) },
             "capabilities": ["ackFrames", "fixedOrientation", "physicalWideCamera"]
         ])
     }
@@ -244,7 +252,9 @@ final class USBStreamServer {
         sendingControl = false
         previous?.cancel()
         onRequested?(false)
-        if listener != nil { report(localEnabled ? "Connect your iPhone to the Mac and open Sarween." : "Camera paused.") }
+        // Permission prompts and backgrounding also disable local capture. Only the
+        // view model knows whether the user actually paused; do not invent that state.
+        if listener != nil { report("Connect your iPhone to the Mac and open Sarween.") }
     }
 
     private func stopOnQueue() {

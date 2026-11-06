@@ -11,6 +11,8 @@ final class CameraViewModel: ObservableObject {
     @Published var running = false
     @Published var framesSent: UInt64 = 0
     @Published var orientation: CameraOrientation = .portrait
+    @Published var preset: CameraCapturePreset = .standard
+    @Published var supportedPresets: [CameraCapturePreset] = []
     @Published var dimmed = false
     @Published var torchEnabled = false
     let capture = CameraCapture()
@@ -19,11 +21,16 @@ final class CameraViewModel: ObservableObject {
     private var active = false
     private var requested = false
     private var requestingPermission = false
+    private var loadingCapabilities = false
+    private var capabilitiesReady = false
     private var lastFrameUpdate = DispatchTime.now().uptimeNanoseconds
 
     init() {
         if let saved = UserDefaults.standard.string(forKey: "cameraOrientation"), let value = CameraOrientation(rawValue: saved) {
             orientation = value
+        }
+        if let saved = UserDefaults.standard.string(forKey: "cameraCapturePreset"), let value = CameraCapturePreset(rawValue: saved) {
+            preset = value
         }
         let installationID: String
         if let saved = UserDefaults.standard.string(forKey: "cameraInstallationID") { installationID = saved }
@@ -31,7 +38,8 @@ final class CameraViewModel: ObservableObject {
             installationID = UUID().uuidString
             UserDefaults.standard.set(installationID, forKey: "cameraInstallationID")
         }
-        server = USBStreamServer(installationID: installationID, deviceName: UIDevice.current.name, orientation: orientation)
+        server = USBStreamServer(installationID: installationID, deviceName: UIDevice.current.name,
+                                 orientation: orientation, preset: preset)
         server.onStatus = { [weak self] message in
             Task { @MainActor in
                 guard let self, self.active, self.authorized, !self.paused else { return }
@@ -93,7 +101,6 @@ final class CameraViewModel: ObservableObject {
         active = isActive
         if isActive {
             checkAuthorization()
-            server.start()
         } else {
             requested = false
             running = false
@@ -109,8 +116,7 @@ final class CameraViewModel: ObservableObject {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             authorized = true
-            server.setLocalEnabled(active && !paused)
-            refreshCapture()
+            inspectCapabilities()
         case .notDetermined:
             guard !requestingPermission else { return }
             requestingPermission = true
@@ -121,13 +127,63 @@ final class CameraViewModel: ObservableObject {
             authorized = false
             status = "Allow Camera access in Settings to use your iPhone with Sarween."
             server.setLocalEnabled(false)
+            server.stop()
             capture.stop()
         }
     }
 
+    private func inspectCapabilities() {
+        guard !loadingCapabilities else { return }
+        loadingCapabilities = true
+        if !paused { status = "Checking camera modes…" }
+        capture.inspectSupportedPresets { [weak self] result in
+            Task { @MainActor in
+                guard let self else { return }
+                self.loadingCapabilities = false
+                guard self.authorized else { return }
+                switch result {
+                case .success(let supported):
+                    self.supportedPresets = supported
+                    self.capabilitiesReady = true
+                    if !supported.contains(self.preset) {
+                        self.preset = .standard
+                        UserDefaults.standard.set(self.preset.rawValue, forKey: "cameraCapturePreset")
+                    }
+                    guard self.active else { return }
+                    self.updateServerConfiguration()
+                    self.server.setLocalEnabled(!self.paused)
+                    self.server.start()
+                    self.refreshCapture()
+                case .failure(let error):
+                    self.capabilitiesReady = false
+                    self.server.setLocalEnabled(false)
+                    self.server.stop()
+                    self.capture.stop()
+                    if self.active {
+                        self.paused = true
+                        self.status = error.localizedDescription
+                    }
+                }
+            }
+        }
+    }
+
+    var canChangeCaptureMode: Bool {
+        authorized && capabilitiesReady && !running && (!requested || paused)
+    }
+
+    var captureSummary: String {
+        "Rear wide camera · 1× · \(preset == .detail ? "4K" : "1080p") · up to \(preset.framesPerSecond) FPS"
+    }
+
+    private func updateServerConfiguration() {
+        server.setConfiguration(orientation: orientation, preset: preset, supportedPresets: supportedPresets)
+    }
+
     func togglePause() {
         paused.toggle()
-        server.setLocalEnabled(active && authorized && !paused)
+        if !paused && !capabilitiesReady { checkAuthorization() }
+        server.setLocalEnabled(active && authorized && capabilitiesReady && !paused)
         refreshCapture()
         if paused { status = "Camera paused. Tap Resume camera when ready." }
     }
@@ -139,16 +195,24 @@ final class CameraViewModel: ObservableObject {
     }
 
     func changeOrientation(_ value: CameraOrientation) {
-        guard !running else { return }
+        guard canChangeCaptureMode, orientation != value else { return }
         orientation = value
         UserDefaults.standard.set(value.rawValue, forKey: "cameraOrientation")
-        server.setOrientation(value)
+        updateServerConfiguration()
+        refreshCapture()
+    }
+
+    func changePreset(_ value: CameraCapturePreset) {
+        guard canChangeCaptureMode, preset != value, supportedPresets.contains(value) else { return }
+        preset = value
+        UserDefaults.standard.set(value.rawValue, forKey: "cameraCapturePreset")
+        updateServerConfiguration()
         refreshCapture()
     }
 
     private func refreshCapture() {
-        if active && authorized && !paused && requested {
-            capture.start(orientation: orientation)
+        if active && authorized && capabilitiesReady && !paused && requested {
+            capture.start(orientation: orientation, preset: preset)
         } else {
             running = false
             torchEnabled = false

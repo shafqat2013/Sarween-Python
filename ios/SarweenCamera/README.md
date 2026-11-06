@@ -1,6 +1,18 @@
 # Sarween Camera for iPhone
 
-This native iPhone app supplies a direct color-camera feed to Sarween on a Mac over a USB tunnel. It uses the physical rear wide camera at 1×, full 1920×1080 capture at up to 15 FPS, and JPEG quality 0.94. Portrait output contains actual 1080×1920 pixels; landscape contains 1920×1080 pixels. Rotation is applied before transmission, with no letterboxing or mirroring. Video stabilization, geometric distortion correction, HDR and automatic preview downscaling are disabled to keep the capture geometry explicit.
+This native iPhone app supplies a direct color-camera feed to Sarween on a Mac over a USB tunnel. The default Standard preset uses the physical rear wide camera at 1×, full 1920×1080 capture at up to 15 FPS, and JPEG quality 0.94. Portrait output contains actual 1080×1920 pixels; landscape contains 1920×1080 pixels. Rotation is applied before transmission, with no letterboxing or mirroring. Video stabilization, geometric distortion correction, HDR and automatic preview downscaling are disabled to keep the capture geometry explicit.
+
+## Capture presets
+
+| Preset | Native capture | Portrait output | Availability |
+| --- | --- | --- | --- |
+| Standard (default) | 1920×1080, up to 15 FPS | 1080×1920 | Same physical-wide format selection as the original working feed |
+| Smooth | 1920×1080, up to 30 FPS | 1080×1920 | Only when that exact retained Standard format supports 30 FPS |
+| Detail (experimental) | 3840×2160, up to 15 FPS | 2160×3840 | Only when a native physical-wide format supports these dimensions and 15 FPS |
+
+Unsupported choices are disabled. The app does not upscale or switch to another lens to enable a preset. Selecting another mode or orientation is allowed while stopped/paused, closes the old connection, and requires a fresh session/hello before new frames. Capture-mode capabilities are inspected after Camera permission is granted and before the listener becomes ready.
+
+Smooth preserves Standard's exact native format and optical source identity; a frame-rate-only change therefore does not create a new geometric calibration identity. Detail and orientation changes use different dimension-based optical identities and require an appropriate verified calibration profile. Selected nominal FPS and preset are transmitted separately from optical identity. Actual delivered FPS can be lower because JPEG encoding, USB transfer, receiver processing, and thermal limits are bounded rather than queued. Detail has four times as many pixels per frame as 1080p and has not yet been validated in a sustained on-device test.
 
 The app becomes ready when it is foregrounded and camera permission is granted. Capture starts only after the connected Sarween client requests it. **Pause camera** on the phone overrides the Mac. Leaving the app stops capture and closes the connection. **Dim screen** shows a black view while keeping the app active; locking the phone or switching apps is different and can interrupt capture.
 
@@ -64,9 +76,9 @@ Every packet contains:
 2. The JSON object, including `type`, `protocolVersion: 1`, `sessionId` and integer `payloadBytes`.
 3. Exactly `payloadBytes` bytes. Camera frames contain JPEG data; control packets contain zero payload bytes. The payload limit is 16 MiB.
 
-On connection the phone sends `hello`, including `deviceName`, `deviceId` (app-installation identity), `sourceId` (stable capture configuration), and `captureFormat` with `width`, `height`, `fps`, `pixelFormat: "jpeg"`, orientation and camera settings. A new connection has a fresh session UUID; session UUIDs are not calibration identities.
+On connection the phone sends `hello`, including `deviceName`, `deviceId` (app-installation identity), `sourceId` (stable optical configuration), and `captureFormat` with `width`, `height`, `fps`, `pixelFormat: "jpeg"`, `capturePreset`, orientation and camera settings. Optional `availableCapturePresets` contains only supported presets, each with `id`, `label`, output `width`/`height`, `fps`, and `experimental`. A new connection has a fresh session UUID; session UUIDs are not calibration identities.
 
-The Mac sends `start` with the matching session ID and `ackFrames: true`. Each `frame` has a strictly increasing `seq`, actual width/height, `captureTimeNs`, `encodeDurationNs`, `rotationDegrees: 0`, `mirrored: false`, and capture settings. `captureTimeNs` is the camera presentation timestamp expressed in nanoseconds in the phone's monotonic clock domain; it is not directly comparable to the Mac's monotonic or wall clock. Optional exposure/focus/white-balance readouts describe the capture state.
+The Mac sends `start` with the matching session ID and `ackFrames: true`. Each `frame` has a strictly increasing `seq`, actual width/height, `captureTimeNs`, `encodeDurationNs`, `rotationDegrees: 0`, `mirrored: false`, and capture settings. Optional `capturePreset` and `nominalFPS` identify the selected mode, while actual FPS must be measured from advancing frame timestamps. `captureTimeNs` is the camera presentation timestamp expressed in nanoseconds in the phone's monotonic clock domain; it is not directly comparable to the Mac's monotonic or wall clock. Optional exposure/focus/white-balance readouts describe the capture state.
 
 The Mac acknowledges a decoded/published frame using `ack` with the matching session ID and `seq`. The phone permits one frame to be encoded/in transit at a time and drops new arrivals until both the send completion and matching ACK arrive. No queued video accumulates. A missing ACK closes the connection after five seconds so the desktop can reconnect. An explicit `ackFrames: false` mode waits only for send completion and is intended for minimal diagnostic clients.
 

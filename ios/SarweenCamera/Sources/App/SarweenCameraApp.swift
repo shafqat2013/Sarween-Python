@@ -22,7 +22,7 @@ struct CameraScreen: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            VStack(spacing: 20) {
+            VStack(spacing: 16) {
                 HStack {
                     Text("Sarween Camera").font(.title2.bold())
                     Spacer()
@@ -50,11 +50,27 @@ struct CameraScreen: View {
                         ForEach(CameraOrientation.allCases) { Text($0.label).tag($0) }
                     }
                     .pickerStyle(.segmented)
-                    .disabled(model.running)
+                    .disabled(!model.canChangeCaptureMode)
+                    Picker("Capture quality", selection: Binding(get: { model.preset }, set: { model.changePreset($0) })) {
+                        ForEach(CameraCapturePreset.allCases) { preset in
+                            Text(preset.label + (model.supportedPresets.contains(preset) ? "" : " — unavailable"))
+                                .tag(preset)
+                                .disabled(!model.supportedPresets.contains(preset))
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .disabled(!model.canChangeCaptureMode)
                     Toggle("Torch", isOn: Binding(get: { model.torchEnabled }, set: { model.setTorch($0) }))
                         .disabled(!model.running)
-                    Text(model.running ? "Rear wide camera · 1× · 1080p · up to 15 FPS" : "Plug in by USB, open Sarween, and select this iPhone.")
+                    Text(model.running ? model.captureSummary : "Plug in by USB, open Sarween, and select this iPhone.")
                         .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    if model.preset.experimental {
+                        Text("4K is experimental and needs a matching calibration profile. Actual speed depends on your phone and USB connection.")
+                            .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    } else if model.running {
+                        Text("Pause the camera to change capture quality or orientation.")
+                            .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    }
                     HStack(spacing: 16) {
                         Button(model.paused ? "Resume camera" : "Pause camera", action: model.togglePause)
                             .buttonStyle(.borderedProminent)
