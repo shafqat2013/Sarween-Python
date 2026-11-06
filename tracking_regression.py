@@ -269,6 +269,8 @@ def _run_video(
         view_settle_seconds=view_settle_seconds,
     )
     sess.warp_motion_thresh = int(motion_thresh)
+    if timeline and timeline.data.get("markerRegistration") is not None:
+        sess.configure_recorded_registration(timeline.data["markerRegistration"])
     if timeline and timeline.has_checkpoint:
         from recording_state import restore_checkpoint
         sess.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)

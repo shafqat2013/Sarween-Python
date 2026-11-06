@@ -15,9 +15,11 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
+DEVELOPMENT_FILES = {"dev_access.py"}
 PERSONAL_FILES = {"hardware_config.json", "combo_profiles.json", "band_profiles.json",
                   "mini_library.json", "mini_token_map.json", "camera_matrix.npy",
-                  "dist_coeffs.npy", "mini_database.csv", "migration-v1.json"}
+                  "dist_coeffs.npy", "mini_database.csv", "migration-v1.json",
+                  "hardware_profiles.json", "vtt_display.json"}
 
 
 def local_path(root, relative):
@@ -26,6 +28,8 @@ def local_path(root, relative):
         raise ValueError(f"Bundle input must be a relative project path: {relative}")
     if path.parts[0].lower() in {".git", "build", "dist", "auto-wall-main", "deprecated"}:
         raise ValueError(f"Not a bundle input directory: {relative}")
+    if path.name.lower() in DEVELOPMENT_FILES:
+        raise ValueError(f"Development-only code must not be bundled: {relative}")
     if (path.name.startswith(".env") or path.name.endswith((".private.pem", ".key"))
             or path.parts[0] == "supabase"):
         raise ValueError(f"Server credentials/backend files must not be bundled: {relative}")
@@ -47,11 +51,13 @@ def collect_inputs(root):
     """Use the spec's literal data list; do not import or execute app code."""
     root = root.resolve()
     plan = {path.name: local_path(root, path.name) for path in sorted(root.iterdir())
-            if path.is_file() and path.suffix in {".py", ".js", ".mjs"}}
+            if path.is_file() and path.suffix in {".py", ".js", ".mjs"}
+            and path.name.lower() not in DEVELOPMENT_FILES}
     overrides = root / "app_bundle_overrides"
     if overrides.is_dir():
         for path in sorted(overrides.glob("*.py")):
-            plan[path.name] = local_path(root, path.relative_to(root))
+            if path.name.lower() not in DEVELOPMENT_FILES:
+                plan[path.name] = local_path(root, path.relative_to(root))
     spec = overrides / "sarween.spec" if (overrides / "sarween.spec").exists() else root / "sarween.spec"
     plan["sarween.spec"] = local_path(root, spec.relative_to(root))
     tree = ast.parse(spec.read_text(encoding="utf-8"), filename=str(spec))

@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "kind": "declared-initial-bindings",
+  "source": {
+    "video_basename": "sarween_rec_20261104_230811.mp4",
+    "video_sha256": "dd69b5396156580ce1a746cc9eb8122b6f7a6fe5821c259d5c170b76a630e3e7",
+    "timeline_basename": "sarween_rec_20261104_230811.tracking.json",
+    "timeline_sha256": "fbc0723e641f9d41dfa74bb13e2980763bf724920de44f60a4348c2127dff389",
+    "checkpoint": {
+      "path": "sarween_rec_20261104_230811.tracking_state/00000000-0000.npz",
+      "sha256": "0505274788de247650355f74a13e402ef1d1a412d2cb67bbc368b2375a820f8b"
+    }
+  },
+  "initial_frame": 0,
+  "warp_size": [
+    1280,
+    720
+  ],
+  "initialization_source": "assistant-visual-review-of-first-frame",
+  "initial_positions": {
+    "orange": [
+      250.0,
+      188.0
+    ],
+    "yellow": [
+      425.0,
+      188.0
+    ],
+    "green": [
+      587.0,
+      214.0
+    ],
+    "red": [
+      1127.0,
+      334.0
+    ],
+    "purple": [
+      479.0,
+      449.0
+    ],
+    "salmon": [
+      879.0,
+      592.0
+    ]
+  },
+  "labels": {
+    "orange": "Orange/gold",
+    "yellow": "Yellow",
+    "green": "Pale green",
+    "red": "Red",
+    "purple": "Purple/magenta",
+    "salmon": "Pink/salmon"
+  },
+  "initial_cells": {
+    "orange": "K8",
+    "yellow": "Q8",
+    "green": "W9",
+    "red": "AP13",
+    "purple": "S17",
+    "salmon": "AG22"
+  },
+  "assumptions": {
+    "one_mini_moves_at_a_time": true,
+    "identity_from_initial_position": true
+  },
+  "notes": [
+    "Only first-frame identity and position bindings are detector initialization.",
+    "Labels describe approximate appearance under warm lighting; they are not separate detector color profiles.",
+    "The initial K8 and W9 centers are close to a column boundary."
+  ]
+}

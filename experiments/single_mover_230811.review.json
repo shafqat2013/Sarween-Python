@@ -1,0 +1,259 @@
+{
+  "schema_version": 1,
+  "kind": "scoring-only-visual-review",
+  "detector_must_not_load_this_file": true,
+  "source": {
+    "video_basename": "sarween_rec_20261104_230811.mp4",
+    "video_sha256": "dd69b5396156580ce1a746cc9eb8122b6f7a6fe5821c259d5c170b76a630e3e7",
+    "timeline_basename": "sarween_rec_20261104_230811.tracking.json",
+    "timeline_sha256": "fbc0723e641f9d41dfa74bb13e2980763bf724920de44f60a4348c2127dff389",
+    "checkpoint": {
+      "path": "sarween_rec_20261104_230811.tracking_state/00000000-0000.npz",
+      "sha256": "0505274788de247650355f74a13e402ef1d1a412d2cb67bbc368b2375a820f8b"
+    }
+  },
+  "reference_status": "assistant-visual-review-not-independent-user-confirmed-ground-truth",
+  "expected_moves": [
+    {
+      "sequence": 1,
+      "mini": "red",
+      "from_cell": "AP13",
+      "to_cell": "AK6",
+      "destination_boundary_cells": null,
+      "destination_cell_status": "provisional-unambiguous",
+      "observed_movement_frame_window": [
+        48,
+        68
+      ],
+      "observed_movement_capture_seconds_window": [
+        6.597747,
+        9.400066
+      ],
+      "timing_reference_status": "assistant-frame-verified",
+      "reviewed_destination_xy_approx": [
+        986.0,
+        127.0
+      ],
+      "visible_stationary_frame": 69,
+      "visible_stationary_capture_seconds": 9.56476387497969,
+      "visible_stationary_frame_interval": [
+        68,
+        69
+      ],
+      "visible_stationary_capture_seconds_interval": [
+        9.400066333007999,
+        9.56476387497969
+      ],
+      "timing_definition": "First inspected source frame where the destination base is unobscured by the hand and appears at its settled position; the hand may remain elsewhere on the board."
+    },
+    {
+      "sequence": 2,
+      "mini": "salmon",
+      "from_cell": "AG22",
+      "to_cell": "AM20",
+      "destination_boundary_cells": null,
+      "destination_cell_status": "provisional-unambiguous",
+      "observed_movement_frame_window": [
+        145,
+        168
+      ],
+      "observed_movement_capture_seconds_window": [
+        20.097558,
+        23.298021
+      ],
+      "timing_reference_status": "assistant-frame-verified",
+      "reviewed_destination_xy_approx": [
+        1047.0,
+        525.0
+      ],
+      "visible_stationary_frame": 168,
+      "visible_stationary_capture_seconds": 23.298021207971033,
+      "visible_stationary_frame_interval": [
+        167,
+        168
+      ],
+      "visible_stationary_capture_seconds_interval": [
+        23.165453292021994,
+        23.298021207971033
+      ],
+      "timing_definition": "First inspected source frame where the destination base is unobscured by the hand and appears at its settled position; the hand may remain elsewhere on the board."
+    },
+    {
+      "sequence": 3,
+      "mini": "green",
+      "from_cell": "W9",
+      "to_cell": "W17",
+      "destination_boundary_cells": null,
+      "destination_cell_status": "provisional-unambiguous",
+      "observed_movement_frame_window": [
+        270,
+        288
+      ],
+      "observed_movement_capture_seconds_window": [
+        37.365216,
+        39.798139
+      ],
+      "timing_reference_status": "assistant-frame-verified",
+      "reviewed_destination_xy_approx": [
+        587.0,
+        446.0
+      ],
+      "visible_stationary_frame": 288,
+      "visible_stationary_capture_seconds": 39.79813854198437,
+      "visible_stationary_frame_interval": [
+        287,
+        288
+      ],
+      "visible_stationary_capture_seconds_interval": [
+        39.631861292000394,
+        39.79813854198437
+      ],
+      "timing_definition": "First inspected source frame where the destination base is unobscured by the hand and appears at its settled position; the hand may remain elsewhere on the board."
+    },
+    {
+      "sequence": 4,
+      "mini": "yellow",
+      "from_cell": "Q8",
+      "to_cell": null,
+      "destination_boundary_cells": [
+        "AA8",
+        "AB8"
+      ],
+      "destination_cell_status": "ambiguous-boundary",
+      "observed_movement_frame_window": [
+        355,
+        388
+      ],
+      "observed_movement_capture_seconds_window": [
+        48.762982,
+        53.262589
+      ],
+      "timing_reference_status": "assistant-frame-verified",
+      "reviewed_destination_xy_approx": [
+        724.0,
+        188.0
+      ],
+      "visible_stationary_frame": 383,
+      "visible_stationary_capture_seconds": 52.56210666697007,
+      "visible_stationary_frame_interval": [
+        382,
+        383
+      ],
+      "visible_stationary_capture_seconds_interval": [
+        52.42918816697784,
+        52.56210666697007
+      ],
+      "timing_definition": "First inspected source frame where the destination base is unobscured by the hand and appears at its settled position; the hand may remain elsewhere on the board."
+    },
+    {
+      "sequence": 5,
+      "mini": "orange",
+      "from_cell": "K8",
+      "to_cell": "Q13",
+      "destination_boundary_cells": null,
+      "destination_cell_status": "provisional-unambiguous",
+      "observed_movement_frame_window": [
+        455,
+        469
+      ],
+      "observed_movement_capture_seconds_window": [
+        62.13135,
+        63.963385
+      ],
+      "timing_reference_status": "assistant-frame-verified",
+      "reviewed_destination_xy_approx": [
+        420.0,
+        324.0
+      ],
+      "visible_stationary_frame": 465,
+      "visible_stationary_capture_seconds": 63.46270737500163,
+      "visible_stationary_frame_interval": [
+        464,
+        465
+      ],
+      "visible_stationary_capture_seconds_interval": [
+        63.29642958298791,
+        63.46270737500163
+      ],
+      "timing_definition": "First inspected source frame where the destination base is unobscured by the hand and appears at its settled position; the hand may remain elsewhere on the board."
+    },
+    {
+      "sequence": 6,
+      "mini": "green",
+      "from_cell": "W17",
+      "to_cell": null,
+      "destination_boundary_cells": [
+        "AB16",
+        "AC16"
+      ],
+      "destination_cell_status": "ambiguous-boundary",
+      "observed_movement_frame_window": [
+        540,
+        565
+      ],
+      "observed_movement_capture_seconds_window": [
+        73.763373,
+        76.96328
+      ],
+      "timing_reference_status": "assistant-frame-verified",
+      "reviewed_destination_xy_approx": [
+        752.0,
+        416.0
+      ],
+      "visible_stationary_frame": 560,
+      "visible_stationary_capture_seconds": 76.32958387502003,
+      "visible_stationary_frame_interval": [
+        559,
+        560
+      ],
+      "visible_stationary_capture_seconds_interval": [
+        76.20549149997532,
+        76.32958387502003
+      ],
+      "timing_definition": "First inspected source frame where the destination base is unobscured by the hand and appears at its settled position; the hand may remain elsewhere on the board."
+    }
+  ],
+  "stationary_minis": {
+    "purple": "S17"
+  },
+  "timing": {
+    "basis": "frameClocks.captureTime relative to first captured frame",
+    "capture_duration_seconds": 83.19625029200688,
+    "encoded_timeline_fps": 1.9391184670677586,
+    "encoded_playback_duration_seconds": 315.09163074699853,
+    "precision_warning": "Timing labels were visually checked in source-frame arrival crops by an assistant. The preceding-to-first-clear frame interval records capture sampling uncertainty. These are not independently user-annotated timing labels.",
+    "visual_evidence": "/var/folders/dq/2b045dpd59174jkczwqf4d640000gn/T/sarween-poc-timing-review-suqt9nny/move-{sequence}.png"
+  },
+  "scoring_policy": {
+    "ordered_movement_identity_count": 6,
+    "exact_destination_eligible_sequences": [
+      1,
+      2,
+      3,
+      5
+    ],
+    "boundary_sequences": [
+      4,
+      6
+    ],
+    "boundary_outputs_count_as_exact_cell_pass": false,
+    "unexpected_moves_allowed": 0,
+    "expected_labels_are_not_detector_input": true
+  },
+  "notes": [
+    "The sequence was recovered by visual inspection of before/after frames; it is a development reference, not a holdout.",
+    "The two boundary destinations must remain explicit uncertainty cases. Either neighboring cell alone is not automatically an exact pass.",
+    "Approximate base-center pixel estimates support review only and are not calibrated subpixel ground truth."
+  ],
+  "timing_targets": {
+    "median_seconds": 0.5,
+    "maximum_seconds": 1.0,
+    "eligible_sequences": [
+      1,
+      2,
+      3,
+      5
+    ]
+  },
+  "expected_frames": 611
+}

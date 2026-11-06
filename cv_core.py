@@ -27,8 +27,10 @@
 from __future__ import annotations
 
 import os
+import json
 import time
 import traceback
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict, Any, Iterator, Optional, Tuple, List
 
@@ -39,6 +41,8 @@ PRINT_TIMING: bool = False
 import cv2
 import numpy as np
 from app_paths import data_path
+from camera_profile_runtime import CameraCalibrationChanged, CameraCorrection, camera_params, legacy_offline_camera_params
+from camera_sources import is_phone_camera_index, source_for_index, open_camera_capture, profile_compatible_with_source, stable_stream_key
 
 import setup as s
 import mini_tracking as mt
@@ -99,6 +103,7 @@ def show_homography_view(
     grid_h: int,
     marker_mode: str = "legacy",
     corner_ids: Optional[Dict[str, int]] = None,
+    display_backend=None,
 ) -> None:
     """Render a warped debug view with the grid in its true visible position."""
     count = 0
@@ -147,8 +152,12 @@ def show_homography_view(
     cv2.putText(warped_dbg, marker_text, (12, 28),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
 
-    ensure_window("Homography view (debug)", 1280, 720)
-    cv2.imshow("Homography view (debug)", warped_dbg)
+    if display_backend is None:
+        ensure_window("Homography view (debug)", 1280, 720)
+        cv2.imshow("Homography view (debug)", warped_dbg)
+    else:
+        display_backend.ensure_window("Homography view (debug)", 1280, 720)
+        display_backend.imshow("Homography view (debug)", warped_dbg)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -169,22 +178,10 @@ REQUIRED_IDS = set(CORNER_IDS.values())
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Camera undistortion (lazy, copied)
+# Camera calibration profiles
 # ──────────────────────────────────────────────────────────────────────────────
-_camera_params_cache: Optional[Tuple[Optional[np.ndarray], Optional[np.ndarray]]] = None
-
-
-def get_camera_params() -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    global _camera_params_cache
-    if _camera_params_cache is None:
-        if data_path("camera_matrix.npy").exists() and data_path("dist_coeffs.npy").exists():
-            _camera_params_cache = (
-                np.load(data_path("camera_matrix.npy"), allow_pickle=False),
-                np.load(data_path("dist_coeffs.npy"), allow_pickle=False),
-            )
-        else:
-            _camera_params_cache = (None, None)
-    return _camera_params_cache
+def get_camera_params(image_size=None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    return camera_params(image_size)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -382,6 +379,13 @@ class FrameBundle:
     raw_motion_ratio: float = 0.0
     largest_motion_area: float = 0.0
     marker_mode: str = "legacy"
+    watermark_mask_cam: Optional[np.ndarray] = None
+    watermark_mask_warp: Optional[np.ndarray] = None
+    watermark_exclusion_warp: Optional[np.ndarray] = None
+    watermark_coverage: float = 0.0
+    watermark_excluded_fraction: float = 0.0
+    registration_metadata: Optional[dict] = None
+    camera_source_metadata: Optional[dict] = None
 
 
 def _resolve_grid_and_warp_from_setup() -> Tuple[int, int, int, int]:
@@ -430,6 +434,9 @@ class CVCoreSession:
         source_frames_undistorted: bool = False,
         view_settle_seconds: float = VIEW_SETTLE_SECONDS,
         loop_video: bool = False,
+        watermark_detector=None,
+        printed_marker_controller=None,
+        camera_capture=None,
     ):
         sel = s.load_last_selection() or {}
         if camera_index is None:
@@ -456,8 +463,17 @@ class CVCoreSession:
         self._checkpoint_kind = None
         self.replay_frame_clock = None
         self.frame_time = None
+        self._watermark_detector = watermark_detector
+        self.reset_watermark_background()
 
         _src = (source_path or os.environ.get("TRUESIGHT_SOURCE", "")).strip()
+        self._source_is_phone = bool(not _src and is_phone_camera_index(self.camera_index))
+        self._camera_source = (source_for_index(self.camera_index, selection=sel)
+                               if self._source_is_phone else None)
+        self._camera_stream_key = None
+        self._camera_source_metadata = None
+        self._phone_gap_invalidated = False
+        self._camera_profile_rejection = None
         if marker_mode is None:
             is_live_foundry = not _src and str(sel.get("mode", "")).lower() == "foundry"
             marker_mode = "viewport" if is_live_foundry else "legacy"
@@ -469,6 +485,15 @@ class CVCoreSession:
             VIEWPORT_CORNER_IDS if marker_mode == "viewport" else LEGACY_CORNER_IDS
         )
         self.required_ids = set(self.corner_ids.values())
+        self._screen_corner_ids = dict(self.corner_ids)
+        self._printed_marker_controller = printed_marker_controller
+        if printed_marker_controller is None and not _src and marker_mode == "viewport":
+            from printed_marker_runtime import get_printed_marker_controller
+            self._printed_marker_controller = get_printed_marker_controller()
+        self._registration_token = None
+        self._registration_revision = 0
+        self.registration_metadata = {"mode": "screen" if marker_mode == "viewport" else "legacy",
+                                      "revision": 0}
         self._view_transform_revision = 0
         self._scene_visual_revision = 0
         self._view_settle_frames = 0
@@ -502,8 +527,31 @@ class CVCoreSession:
 
         self.frame_idx = 0
 
-        # Camera calibration
-        self.cam_mtx, self.cam_dist = get_camera_params()
+        # Resolve only after reading the actual frame. The selected profile is
+        # frozen for this session; unrelated legacy files are never a fallback.
+        confirmed_profile_id = sel.get("camera_profile_id")
+        if self.camera_index != sel.get("webcam_index"):
+            confirmed_profile_id = None
+        self._camera_correction = (None if self.source_frames_undistorted or _src
+                                   else CameraCorrection(profile_id=confirmed_profile_id))
+        if self._camera_correction is not None:
+            correction = self._camera_correction
+            profile = correction.profiles.get_profile("camera", correction.profile_id) if correction.profile_id else None
+            source = self._camera_source or {"type": "opencv", "index": self.camera_index}
+            if not profile_compatible_with_source(profile, source):
+                self._camera_profile_rejection = (("Choose this iPhone's Sarween Camera USB profile; "
+                    "OBS and other camera calibrations do not match this feed. Lens correction is off.")
+                    if self._source_is_phone else ("The selected Sarween Camera USB profile belongs to the direct iPhone feed; "
+                    "choose a profile for this native/OBS camera. Lens correction is off."))
+                self._camera_correction = CameraCorrection(profiles=correction.profiles, profile_id=None)
+        self._legacy_offline_calibration = bool(_src and not self.source_frames_undistorted)
+        self.cam_mtx, self.cam_dist = (legacy_offline_camera_params()
+                                      if self._legacy_offline_calibration else (None, None))
+        self.camera_calibration_status = ("Historical lens correction for raw legacy replay."
+                                          if self._legacy_offline_calibration else
+                                          "Recorded frames; no additional lens correction." if _src else
+                                          "Waiting for camera frame.")
+        self._legacy_correction_applied = False
 
         # ── TRUESIGHT_SOURCE: optional video file playback (offline debugging) ──
         self._source_is_file = bool(_src)
@@ -517,15 +565,17 @@ class CVCoreSession:
             # No warm-up for file sources
         else:
             # Open camera
-            self.cap = cv2.VideoCapture(self.camera_index)
+            self.cap = (camera_capture if camera_capture is not None else
+                        open_camera_capture(self.camera_index, selection=sel, source=self._camera_source))
             if not self.cap.isOpened():
                 self.cap.release()
                 raise RuntimeError("Failed to open webcam.")
 
             # Warm-up reads — macOS cameras need time to stabilise after open
-            for _ in range(8):
-                self.cap.read()
-            time.sleep(0.3)  # let the camera buffer refill before capturing background
+            if camera_capture is None and not self._source_is_phone:
+                for _ in range(8):
+                    self.cap.read()
+                time.sleep(0.3)  # let the camera buffer refill before capturing background
 
         # ── Video recorder (optional) ─────────────────────────────────────────
         self._recorder: Optional[cv2.VideoWriter] = None
@@ -534,18 +584,41 @@ class CVCoreSession:
         # Background in camera space — retry a few times in case the buffer
         # isn't ready yet (common on macOS with USB cameras).
         frame_bg = None
-        for attempt in range(6):
+        for attempt in range(1 if self._source_is_phone else 6):
             ok_bg, frame_bg = self.cap.read()
             if ok_bg and frame_bg is not None:
                 break
-            time.sleep(0.1)
+            if self._source_is_phone:
+                frame_bg = None
+            if not self._source_is_phone:
+                time.sleep(0.1)
         if frame_bg is None:
+            if self._source_is_phone:
+                # Startup has normally waited for a fresh frame. A cable loss
+                # racing that handoff must still leave a cancellable live UI.
+                width = max(1, min(8192, int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1080)))
+                height = max(1, min(8192, int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1920)))
+                frame_bg = np.zeros((height, width, 3), np.uint8)
+                self._camera_source_metadata = self._phone_frame_metadata(False)
+            else:
+                self.cap.release()
+                raise RuntimeError("Failed to capture camera-space background after retries.")
+        elif self._source_is_phone:
+            self._camera_source_metadata = self._phone_frame_metadata(True)
+            self._camera_stream_key = stable_stream_key(self._camera_source_metadata)
+        self._phone_has_camera_frame = bool(not self._source_is_phone or ok_bg and frame_bg is not None)
+        if self._source_is_phone and self._camera_source_metadata.get("freshFrame") is False:
+            self._phone_has_camera_frame = False
+        try:
+            if not self._source_is_phone or self._phone_has_camera_frame:
+                frame_bg = self._maybe_undistort(frame_bg)
+        except Exception:
             self.cap.release()
-            raise RuntimeError("Failed to capture camera-space background after retries.")
-        frame_bg = self._maybe_undistort(frame_bg)
+            raise
         gray_bg = cv2.cvtColor(frame_bg, cv2.COLOR_BGR2GRAY)
         blur_bg = cv2.GaussianBlur(gray_bg, (21, 21), 0)
         self.BG_cam = {"bgr": frame_bg, "blur": blur_bg}
+        self._last_camera_frame = frame_bg
 
         # Lock state
         self.H_saved = DEFAULT_H.copy()
@@ -600,14 +673,351 @@ class CVCoreSession:
         # Timeline-backed replay marks those frames so they are not corrected twice.
         if self.source_frames_undistorted:
             return cam_bgr
+        if (hasattr(self, "BG_cam") and self.BG_cam["bgr"].shape[:2] != cam_bgr.shape[:2]
+                and (not getattr(self, "_source_is_phone", False) or self._phone_has_camera_frame)):
+            self.camera_calibration_status = "Camera frame size changed. Restart the live session to register the feed again."
+            raise CameraCalibrationChanged(self.camera_calibration_status)
+        correction = self._camera_correction
+        if correction is None:
+            if self._legacy_offline_calibration and self.cam_mtx is not None and self.cam_dist is not None:
+                try:
+                    corrected = cv2.undistort(cam_bgr, self.cam_mtx, self.cam_dist)
+                    self._legacy_correction_applied = True
+                    return corrected
+                except Exception:
+                    pass
+            return cam_bgr
+        previous_matrix, previous_distortion = self.cam_mtx, self.cam_dist
+        self.cam_mtx, self.cam_dist = correction.resolve((cam_bgr.shape[1], cam_bgr.shape[0]))
+        if getattr(self, "_camera_profile_rejection", None):
+            correction.reason = self._camera_profile_rejection
+        if (hasattr(self, "BG_cam")
+                and (not getattr(self, "_source_is_phone", False) or self._phone_has_camera_frame) and
+                (not np.array_equal(previous_matrix, self.cam_mtx)
+                 or not np.array_equal(previous_distortion, self.cam_dist))):
+            self.camera_calibration_status = "Camera calibration changed. Restart the live session to register the feed again."
+            raise CameraCalibrationChanged(self.camera_calibration_status)
+        if self.camera_calibration_status != correction.reason:
+            self.camera_calibration_status = correction.reason
+            print(f"CV_CORE | Camera calibration: {correction.reason}", flush=True)
+        correction.applied = False
         if self.cam_mtx is not None and self.cam_dist is not None:
             try:
-                return cv2.undistort(cam_bgr, self.cam_mtx, self.cam_dist)
-            except Exception:
-                return cam_bgr
+                corrected = cv2.undistort(cam_bgr, self.cam_mtx, self.cam_dist)
+                correction.applied = True
+                return corrected
+            except Exception as exc:
+                correction.reason = self.camera_calibration_status = f"Lens correction failed: {exc}"
+                raise CameraCalibrationChanged(self.camera_calibration_status) from exc
         return cam_bgr
 
+    def camera_calibration_metadata(self):
+        if self._camera_correction is None:
+            return {"profileId": None, "applied": self._legacy_correction_applied,
+                    "legacyOffline": self._legacy_offline_calibration, "reason": self.camera_calibration_status}
+        return self._camera_correction.snapshot()
+
+    def registration_metadata_snapshot(self):
+        metadata = deepcopy(getattr(self, "registration_metadata", {
+            "mode": "screen" if getattr(self, "marker_mode", "legacy") == "viewport" else "legacy",
+            "revision": 0}))
+        if getattr(self, "_source_is_phone", False) and self._camera_stream_key is not None:
+            metadata["cameraStream"] = deepcopy(self._camera_stream_key)
+        return metadata
+
+    def _phone_frame_metadata(self, fresh):
+        """Volatile receive clocks stay out of calibration/geometry keys."""
+        status = getattr(self.cap, "status", {})
+        status = status() if callable(status) else status
+        metadata = deepcopy(status) if isinstance(status, dict) else {}
+        if fresh:
+            last = getattr(self.cap, "last_frame_metadata", None)
+            last = last() if callable(last) else last
+            if isinstance(last, dict):
+                metadata.update(deepcopy(last))
+        metadata["freshFrame"] = bool(fresh)
+        return metadata
+
+    def _sync_phone_stream(self, cam, metadata):
+        key = stable_stream_key(metadata)
+        if key != self._camera_stream_key:
+            self._camera_stream_key = key
+            self._invalidate_registration(cam, "iPhone camera stream changed; acquire marker lock and bind minis again",
+                                          configuration_changed=True)
+            self.last_marker_count = 0
+            self.last_seen_ids = []
+            self.last_missing_ids = sorted(self.required_ids)
+            self.last_aruco_ids = self.last_aruco_corners = None
+        self._phone_gap_invalidated = False
+
+    def _phone_wait_bundle(self):
+        """Cached pixels are only a diagnostic preview, never a measurement."""
+        cam = self._last_camera_frame
+        status = self._phone_frame_metadata(False)
+        reason = status.get("message") or "Waiting for a fresh iPhone camera frame"
+        if not self._phone_gap_invalidated:
+            self._invalidate_registration(cam, reason)
+            self._phone_gap_invalidated = True
+        self.last_marker_count = 0
+        self.last_seen_ids = []
+        self.last_missing_ids = sorted(self.required_ids)
+        self.last_aruco_ids = self.last_aruco_corners = None
+        self.frame_time = time.perf_counter()
+        self._camera_source_metadata = status
+        return FrameBundle(frame_idx=self.frame_idx, cam_bgr=cam,
+            warp_w=self.warp_w, warp_h=self.warp_h, grid_w=self.grid_w, grid_h=self.grid_h,
+            locked=False, H_use=DEFAULT_H.copy(), mask_cam=None, mask_warp=None,
+            last_marker_count=0, last_seen_ids=[], last_missing_ids=list(self.last_missing_ids),
+            last_aruco_ids=None, last_aruco_corners=None,
+            warp_blur=None, warp_bgr=None, bg_warp_u8=None, motion_warp=None, motion_cam=None,
+            shadowfree_cam=None, final_mask_cam=None, marker_mode=self.marker_mode,
+            registration_metadata=self.registration_metadata_snapshot(), camera_source_metadata=status)
+
+    @staticmethod
+    def _printed_registration_token(config, context):
+        view_key = None
+        if config["mode"] == "printed" and context.get("view"):
+            view = context["view"]
+            view_key = {"viewportWidth": view.get("viewportWidth"), "viewportHeight": view.get("viewportHeight"),
+                        "registration": deepcopy(view.get("registration"))}
+        token = json.dumps({"configuration": config["token"], "viewport": view_key,
+                            "pending": config["pending"], "blocked": config["blocked"]}, sort_keys=True)
+        return token, view_key
+
+    def configure_recorded_registration(self, metadata, *, preserve_geometry=False):
+        """Install only recorded layout/view data for a file replay.
+
+        Checkpoint restore passes preserve_geometry after restoring its numeric
+        H/masks/background. A timeline-only configuration starts unacquired.
+        """
+        if not getattr(self, "_source_is_file", False):
+            raise ValueError("Recorded registration is only available for file sources")
+        if not isinstance(metadata, dict):
+            raise ValueError("Invalid recorded marker registration")
+        if metadata.get("mode") == "legacy":
+            self._printed_marker_controller = None
+            self.corner_ids = dict(LEGACY_CORNER_IDS)
+            self.required_ids = set(self.corner_ids.values())
+            self.registration_metadata = deepcopy(metadata)
+            return
+        from printed_marker_runtime import RecordedPrintedMarkerController
+        provider = lambda: fo.get_view_transform_payload() if fo is not None else None
+        controller = RecordedPrintedMarkerController(metadata, view_provider=provider)
+        self._printed_marker_controller = controller
+        self._screen_corner_ids = dict(VIEWPORT_CORNER_IDS)
+        config, context = controller.configuration(), controller.view_context()
+        self._registration_token, _view_key = self._printed_registration_token(config, context)
+        self._registration_revision = int(metadata.get("revision", 0))
+        self.registration_metadata = deepcopy(metadata)
+        from printed_markers import PRINTED_IDS
+        self.corner_ids = dict(PRINTED_IDS if config["mode"] == "printed" else VIEWPORT_CORNER_IDS)
+        self.required_ids = set(self.corner_ids.values())
+        if not preserve_geometry:
+            self.last_marker_count = 0
+            self.last_seen_ids = []
+            self.last_missing_ids = sorted(self.required_ids)
+            self.last_aruco_ids = self.last_aruco_corners = None
+            self.last_mask_cam = self.last_mask_warp = None
+            self.H_saved = DEFAULT_H.copy()
+            self._H_inv = DEFAULT_H.copy()
+            self.BG_warp_f32 = None
+            self._bg_seeded = False
+            self._last_shadowfree_cam = self._last_final_mask_cam = None
+            self.reset_watermark_background()
+
+    def _invalidate_registration(self, cam_bgr, reason, *, configuration_changed=False):
+        """Discard unsafe geometry once per loss or explicit configuration change."""
+        already_invalid = (self.last_mask_cam is None and self.last_mask_warp is None
+            and self.BG_warp_f32 is None and not self._bg_seeded
+            and np.array_equal(self.H_saved, DEFAULT_H)
+            and self._last_shadowfree_cam is None and self._last_final_mask_cam is None)
+        self.lock_miss_streak = 0
+        self.lock_lost_reason = reason
+        if already_invalid and not configuration_changed:
+            return
+        self.last_mask_cam = self.last_mask_warp = None
+        self.H_saved = DEFAULT_H.copy()
+        self._H_inv = DEFAULT_H.copy()
+        self.BG_warp_f32 = None
+        self._bg_seeded = False
+        self._last_shadowfree_cam = self._last_final_mask_cam = None
+        self._heal_acc = np.zeros((self.warp_h, self.warp_w), np.uint16)
+        self.BG_cam = {"bgr": cam_bgr.copy(), "blur": cv2.GaussianBlur(
+            cv2.cvtColor(cam_bgr, cv2.COLOR_BGR2GRAY), (21, 21), 0)}
+        self.reset_watermark_background()
+        if getattr(self, "_recorder", None) is not None:
+            self._checkpoint_kind = "registration"
+
+    def _sync_printed_registration(self, cam_bgr):
+        controller = getattr(self, "_printed_marker_controller", None)
+        if not controller:
+            return None
+        controller.heartbeat(self)
+        config = controller.configuration()
+        context = controller.view_context()
+        self._printed_view_context = context
+        token, view_key = self._printed_registration_token(config, context)
+        changed = token != getattr(self, "_registration_token", None)
+        if changed:
+            self._registration_token = token
+            self._registration_revision = getattr(self, "_registration_revision", 0) + 1
+            self._invalidate_registration(cam_bgr, "Marker configuration changed; acquire lock and bind minis again",
+                                          configuration_changed=True)
+        from printed_markers import PRINTED_IDS
+        self.corner_ids = dict(PRINTED_IDS if config["mode"] == "printed" else self._screen_corner_ids)
+        self.required_ids = set(self.corner_ids.values())
+        if changed:
+            self.last_marker_count = 0
+            self.last_seen_ids = []
+            self.last_missing_ids = sorted(self.required_ids)
+            self.last_aruco_ids = self.last_aruco_corners = None
+        self.registration_metadata = {"mode": config["mode"], "profileId": config["profileId"],
+            "profileName": config["profileName"], "layoutFingerprint": config["token"].get("layoutFingerprint"),
+            "revision": self._registration_revision, "viewport": view_key, "pending": config["pending"],
+            "calibrationMethod": (config["layout"] or {}).get("calibrationMethod"),
+            "printedMarkerLayout": deepcopy(config["layout"]),
+            "controllerRevision": config["token"].get("revision", 0)}
+        return config
+
+    def _update_printed_lock(self, cam_bgr, corners, ids, config):
+        from printed_markers import (PRINTED_IDS, agrees_with_homography, detections,
+                                     roi_masks as printed_roi_masks, solve_homography)
+        self.last_marker_count = 0
+        self.last_seen_ids = []
+        self.last_missing_ids = sorted(self.required_ids)
+        self.last_aruco_corners, self.last_aruco_ids = corners, ids
+        try:
+            found = detections(corners, ids, set(PRINTED_IDS.values()))
+            self.last_seen_ids = sorted(found)
+            self.last_marker_count = len(found)
+            self.last_missing_ids = sorted(self.required_ids - set(found))
+            self.last_aruco_corners, self.last_aruco_ids = corners, ids
+            context = self._printed_view_context
+            if not context.get("ready") or not context.get("view"):
+                raise ValueError("Waiting for the current fullscreen Foundry viewport")
+            layout = config["layout"]
+            view = context["view"]
+            warp_size = (self.warp_w, self.warp_h)
+            H = solve_homography(corners, ids, layout, view, warp_size)
+            if H is not None:
+                self.H_saved = H
+                self._H_inv = np.linalg.inv(H).astype(np.float32)
+                self.last_mask_cam, self.last_mask_warp = printed_roi_masks(cam_bgr.shape, H, warp_size)
+                self.lock_miss_streak = 0
+                self.lock_lost_reason = ""
+                return
+            have_lock = self.last_mask_cam is not None and self.last_mask_warp is not None
+            if have_lock and agrees_with_homography(corners, ids, self.H_saved, layout, view, warp_size):
+                self.lock_miss_streak = 0
+                self.lock_lost_reason = f"Holding verified printed lock ({len(found)}/4 visible)"
+                return
+            raise ValueError(f"Printed registration unverified ({len(found)}/4 visible); need four cards to acquire and three matching cards to hold")
+        except (ValueError, np.linalg.LinAlgError, cv2.error) as exc:
+            # A cached paper transform is not current evidence. Screen/legacy
+            # modes retain their existing grace behavior below.
+            self._invalidate_registration(cam_bgr, str(exc))
+
+    def reset_watermark_background(self):
+        """A new/legacy background needs caption detection before comparisons."""
+        self._watermark_background_known = False
+        self._watermark_background_ref = None
+        for name in ("_watermark_bg_invalid_cam", "_watermark_bg_invalid_warp",
+                     "_watermark_clear_count_cam", "_watermark_clear_count_warp",
+                     "_watermark_prev_blur_cam", "_watermark_prev_blur_warp"):
+            setattr(self, name, None)
+
+    @staticmethod
+    def _watermark_binary(mask, shape):
+        if mask is None or not isinstance(mask, np.ndarray) or mask.shape != shape:
+            return np.zeros(shape, np.uint8)
+        return np.where(mask > 0, 255, 0).astype(np.uint8)
+
+    def _watermark_observation(self, image):
+        if getattr(self, "_watermark_detector", None) is None:
+            from watermark_detection import ObsWatermarkDetector
+            self._watermark_detector = ObsWatermarkDetector()
+        observation = self._watermark_detector.detect(image)
+        glyph = self._watermark_binary(observation.mask, image.shape[:2])
+        exclusion = self._watermark_binary(getattr(observation, "exclusion_mask", None), image.shape[:2])
+        if cv2.countNonZero(glyph) and not cv2.countNonZero(exclusion):
+            exclusion = cv2.dilate(glyph, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (23, 23)))
+        return glyph, cv2.bitwise_or(exclusion, glyph)
+
+    def _watermark_project_exclusion(self, mask):
+        projected = cv2.warpPerspective(mask, self.H_saved, (self.warp_w, self.warp_h), flags=cv2.INTER_NEAREST)
+        # The warp-space motion comparison is blurred with a 21-pixel kernel.
+        return cv2.dilate(projected, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
+
+    def _prepare_watermark_masks(self, image):
+        glyph, exclusion = self._watermark_observation(image)
+        self._watermark_mask_cam = glyph
+        self._watermark_mask_warp = cv2.warpPerspective(glyph, self.H_saved,
+            (self.warp_w, self.warp_h), flags=cv2.INTER_NEAREST)
+        self._watermark_current_exclusion_cam = exclusion
+        self._watermark_current_exclusion_warp = self._watermark_project_exclusion(exclusion)
+        background = self.BG_cam["bgr"]
+        if (not getattr(self, "_watermark_background_known", False)
+                or getattr(self, "_watermark_background_ref", None) != id(background)):
+            _glyph_bg, exclusion_bg = self._watermark_observation(background)
+            self._watermark_bg_invalid_cam = exclusion_bg.copy()
+            self._watermark_bg_invalid_warp = self._watermark_project_exclusion(exclusion_bg)
+            self._watermark_clear_count_cam = np.zeros(image.shape[:2], np.uint8)
+            self._watermark_clear_count_warp = np.zeros((self.warp_h, self.warp_w), np.uint8)
+            self._watermark_prev_blur_cam = None
+            self._watermark_prev_blur_warp = None
+            self._watermark_background_known = True
+            self._watermark_background_ref = id(background)
+
+    def _seed_watermark_masks(self, warp_blur, *, camera=False):
+        self._watermark_bg_invalid_warp = self._watermark_current_exclusion_warp.copy()
+        self._watermark_clear_count_warp = np.zeros_like(warp_blur)
+        self._watermark_prev_blur_warp = warp_blur.copy()
+        if camera:
+            self._watermark_bg_invalid_cam = self._watermark_current_exclusion_cam.copy()
+            self._watermark_clear_count_cam = np.zeros(self.BG_cam["bgr"].shape[:2], np.uint8)
+            self._watermark_prev_blur_cam = self.BG_cam["blur"].copy()
+            self._watermark_background_ref = id(self.BG_cam["bgr"])
+            self._watermark_background_known = True
+
+    def _relearn_watermark_background(self, image, warp_blur):
+        """Learn only observed pixels after two consecutive clear, stable pairs.
+
+        Hidden pixels stay invalid; no image content is synthesized. A moving
+        hand cannot immediately become the replacement background when text
+        uncovers it. Ordinary motion handling remains unchanged elsewhere.
+        """
+        for space, current_exclusion, current in (
+                ("warp", self._watermark_current_exclusion_warp, warp_blur),
+                ("cam", self._watermark_current_exclusion_cam, None)):
+            invalid = getattr(self, "_watermark_bg_invalid_" + space)
+            if invalid is None or not cv2.countNonZero(invalid):
+                continue
+            if current is None:
+                current = cv2.GaussianBlur(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), (21, 21), 0)
+            count = getattr(self, "_watermark_clear_count_" + space)
+            if count is None or count.shape != invalid.shape:
+                count = np.zeros_like(invalid)
+            previous = getattr(self, "_watermark_prev_blur_" + space)
+            clear = (invalid > 0) & (current_exclusion == 0)
+            stable = clear & (cv2.absdiff(previous, current) <= 6) if previous is not None else np.zeros_like(clear)
+            count[~stable] = 0
+            count[stable] = np.minimum(count[stable].astype(np.uint16) + 1, 3).astype(np.uint8)
+            learned = stable & (count >= 2)
+            if np.any(learned):
+                if space == "warp":
+                    self.BG_warp_f32[learned] = current[learned]
+                else:
+                    self.BG_cam["bgr"][learned] = image[learned]
+                    self.BG_cam["blur"][learned] = current[learned]
+                invalid[learned] = 0
+                count[learned] = 0
+            setattr(self, "_watermark_clear_count_" + space, count)
+            setattr(self, "_watermark_prev_blur_" + space, current.copy())
+
     def close(self, preserve_recording: bool = False) -> None:
+        controller = getattr(self, "_printed_marker_controller", None)
+        if controller:
+            controller.camera_stopped(self)
         if not preserve_recording:
             self.stop_recording()
         try:
@@ -671,6 +1081,8 @@ class CVCoreSession:
                         grid_cols=self.grid_w,
                         grid_rows=self.grid_h,
                         frames_undistorted=True,
+                        camera_calibration=self.camera_calibration_metadata(),
+                        marker_registration=self.registration_metadata_snapshot(),
                     )
                 except Exception as exc:
                     print(f"CV_CORE | Foundry timeline start error: {exc}", flush=True)
@@ -701,12 +1113,27 @@ class CVCoreSession:
         return self._recorder is not None
 
     def _update_lock_if_due(self, cam_bgr: np.ndarray) -> None:
+        config = self._sync_printed_registration(cam_bgr)
+        if config is not None and config["blocked"]:
+            self.last_mask_cam = self.last_mask_warp = None
+            self.lock_lost_reason = config.get("message", "Printed marker configuration unavailable")
+            return
         have_lock = (self.last_mask_cam is not None) and (self.last_mask_warp is not None)
-        need_fast = (not have_lock) or (self.last_marker_count < 4)
+        need_fast = (not have_lock) or (self.last_marker_count < 4) or bool(config and config["pending"])
         aruco_interval = self.aruco_every_n_fast if need_fast else self.aruco_every_n
 
         if ((self.frame_idx + self._frame_phase_offset) % aruco_interval) != 0:
             return
+
+        if config is not None and (config["pending"] or config["mode"] == "printed"):
+            det_corners, det_ids, _rejected = detect_markers(cam_bgr)
+            if config["pending"]:
+                self._printed_marker_controller.consume_detections(det_corners, det_ids,
+                    self._printed_view_context, (self.warp_w, self.warp_h))
+                config = self._sync_printed_registration(cam_bgr)
+            if config["mode"] == "printed":
+                self._update_printed_lock(cam_bgr, det_corners, det_ids, config)
+                return
 
         H_view, detected_count, seen_ids, det_corners, det_ids = solve_H_from_markers(
             cam_bgr, self.warp_w, self.warp_h, self.corner_ids
@@ -788,6 +1215,7 @@ class CVCoreSession:
         warp_bgr = cv2.warpPerspective(cam_bgr, H_use, (int(self.warp_w), int(self.warp_h)))
         gray = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2GRAY)
         warp_blur = cv2.GaussianBlur(gray, (21, 21), 0)
+        self._prepare_watermark_masks(cam_bgr)
 
         # A Foundry pan changes the entire displayed map while the physical
         # minis remain still. Once the browser publishes the completed canvas
@@ -839,23 +1267,33 @@ class CVCoreSession:
             self._heal_acc.fill(0)
             self._last_shadowfree_cam = None
             self._last_final_mask_cam = None
+            self._seed_watermark_masks(warp_blur, camera=True)
             self._view_settle_frames -= 1
 
         # Seed background on first locked frame so we always use the real H
         if not self._bg_seeded:
             self.BG_warp_f32 = warp_blur.astype(np.float32)
             self._bg_seeded = True
+            self._seed_watermark_masks(warp_blur)
             print("CV_CORE | Warp background seeded on first locked frame.")
         _t1 = time.perf_counter()
+
+        watermark_exclusion_warp = cv2.bitwise_or(self._watermark_current_exclusion_warp,
+                                                  self._watermark_bg_invalid_warp)
+        watermark_exclusion_cam = cv2.bitwise_or(self._watermark_current_exclusion_cam,
+                                                 self._watermark_bg_invalid_cam)
+        comparison_mask = cv2.bitwise_and(mask_warp, cv2.bitwise_not(watermark_exclusion_warp))
+        camera_comparison_mask = cv2.bitwise_and(mask_cam, cv2.bitwise_not(watermark_exclusion_cam))
 
         bg_u8 = np.clip(self.BG_warp_f32, 0, 255).astype(np.uint8) if self.BG_warp_f32 is not None else warp_blur
         diff_warp = cv2.absdiff(bg_u8, warp_blur)
         _, motion_warp = cv2.threshold(diff_warp, self.warp_motion_thresh, 255, cv2.THRESH_BINARY)
+        motion_warp = cv2.bitwise_and(motion_warp, comparison_mask)
         motion_warp = cv2.erode(motion_warp, None, iterations=1)
         motion_warp = cv2.dilate(motion_warp, None, iterations=1)
-        motion_warp = cv2.bitwise_and(motion_warp, mask_warp)
+        motion_warp = cv2.bitwise_and(motion_warp, comparison_mask)
 
-        roi_area = float(cv2.countNonZero(mask_warp))
+        roi_area = float(cv2.countNonZero(comparison_mask))
         changed = float(cv2.countNonZero(motion_warp))
         change_ratio = (changed / max(1.0, roi_area))
         _t2 = time.perf_counter()
@@ -886,7 +1324,7 @@ class CVCoreSession:
         for mc in cnts_motion:
             if cv2.contourArea(mc) <= max_blob_area:
                 cv2.drawContours(motion_filtered, [mc], -1, 255, thickness=-1)
-        motion_warp = motion_filtered
+        motion_warp = cv2.bitwise_and(motion_filtered, comparison_mask)
 
         _t3 = time.perf_counter()
 
@@ -909,6 +1347,7 @@ class CVCoreSession:
         motion_for_heal = np.zeros_like(motion_warp)
         for mc in cnts_motion:
             cv2.drawContours(motion_for_heal, [mc], -1, 255, thickness=-1)
+        motion_for_heal = cv2.bitwise_and(motion_for_heal, comparison_mask)
         heal_active = (motion_for_heal > 0)
 
         self._heal_acc = np.where(
@@ -922,34 +1361,41 @@ class CVCoreSession:
         # Pixels healing (were motion, now still): fast BG update
         # All other pixels: normal alpha update
         not_motion_u8 = cv2.bitwise_not(motion_for_heal)
-        in_roi        = cv2.bitwise_and(not_motion_u8, mask_warp)
+        in_roi        = cv2.bitwise_and(not_motion_u8, comparison_mask)
         healing_u8    = (healing.astype(np.uint8) * 255)
         healing_mask  = cv2.bitwise_and(in_roi, healing_u8)
         normal_mask   = cv2.bitwise_and(in_roi, cv2.bitwise_not(healing_u8))
 
+        self._relearn_watermark_background(cam_bgr, warp_blur)
         self.BG_warp_f32 = update_bg_ema(self.BG_warp_f32, warp_blur, normal_mask,  alpha_bg)
         self.BG_warp_f32 = update_bg_ema(self.BG_warp_f32, warp_blur, healing_mask, self.bg_alpha_fast)
         _t4 = time.perf_counter()
 
         # Use cached H_inv — recomputed only when H_saved changes (in _update_lock_if_due)
         motion_cam = cv2.warpPerspective(motion_warp, self._H_inv, (cam_bgr.shape[1], cam_bgr.shape[0]), flags=cv2.INTER_NEAREST)
+        motion_cam = cv2.bitwise_and(motion_cam, camera_comparison_mask)
         _t5 = time.perf_counter()
 
         # Throttle the expensive shadow pipeline to every _SHADOW_EVERY_N frames.
         self._shadow_frame_count += 1
         if self._shadow_frame_count % self._SHADOW_EVERY_N == 0:
             shadowfree_cam = mt.shadow_free_mask(self.BG_cam["bgr"], cam_bgr)
+            shadowfree_cam = cv2.bitwise_and(shadowfree_cam, camera_comparison_mask)
             final_mask_cam = mt.combine_masks_componentwise(
                 motion_cam, shadowfree_cam,
                 keep_ratio=0.25,
                 min_comp_area=150
             )
-            final_mask_cam = cv2.bitwise_and(final_mask_cam, mask_cam)
+            final_mask_cam = cv2.bitwise_and(final_mask_cam, camera_comparison_mask)
             self._last_shadowfree_cam = shadowfree_cam
             self._last_final_mask_cam = final_mask_cam
         else:
             shadowfree_cam = self._last_shadowfree_cam
             final_mask_cam = self._last_final_mask_cam
+            if shadowfree_cam is not None:
+                shadowfree_cam = cv2.bitwise_and(shadowfree_cam, camera_comparison_mask)
+            if final_mask_cam is not None:
+                final_mask_cam = cv2.bitwise_and(final_mask_cam, camera_comparison_mask)
         _t6 = time.perf_counter()
 
         # ── Timing report (once per second) ───────────────────────────────
@@ -984,6 +1430,11 @@ class CVCoreSession:
             "final_mask_cam": final_mask_cam,
             "raw_motion_ratio": change_ratio,
             "largest_motion_area": float(largest_motion_area),
+            "watermark_mask_cam": self._watermark_mask_cam,
+            "watermark_mask_warp": self._watermark_mask_warp,
+            "watermark_exclusion_warp": watermark_exclusion_warp,
+            "watermark_coverage": cv2.countNonZero(cv2.bitwise_and(self._watermark_mask_warp, mask_warp)) / max(1, cv2.countNonZero(mask_warp)),
+            "watermark_excluded_fraction": cv2.countNonZero(cv2.bitwise_and(watermark_exclusion_warp, mask_warp)) / max(1, cv2.countNonZero(mask_warp)),
         }
 
     def frames(self) -> Iterator[FrameBundle]:
@@ -992,7 +1443,9 @@ class CVCoreSession:
         Engines can consume these bundles.
         """
         while True:
-            if getattr(self, "_recorder", None) is not None and self._checkpoint_kind and self.recording_state_provider:
+            if (getattr(self, "_recorder", None) is not None and self._checkpoint_kind and self.recording_state_provider
+                    and (not getattr(self, "_source_is_phone", False)
+                         or (self._camera_source_metadata or {}).get("freshFrame") is not False)):
                 fo.record_checkpoint(self, self.recording_state_provider(), self._checkpoint_kind)
                 self._checkpoint_kind = None
             self.frame_idx += 1
@@ -1006,6 +1459,9 @@ class CVCoreSession:
                     self.grid_h = int(scene["gridRows"])
                 ok, cam = self.cap.read()
                 if not ok or cam is None:
+                    if getattr(self, "_source_is_phone", False):
+                        yield self._phone_wait_bundle()
+                        continue
                     if self._source_is_file:
                         if not self.loop_video:
                             print("CV_CORE | TRUESIGHT_SOURCE: end of video — stopping.", flush=True)
@@ -1027,6 +1483,12 @@ class CVCoreSession:
                             break
 
                 cam = self._maybe_undistort(cam)
+                if getattr(self, "_source_is_phone", False):
+                    metadata = self._phone_frame_metadata(True)
+                    self._camera_source_metadata = metadata
+                    self._sync_phone_stream(cam, metadata)
+                    self._phone_has_camera_frame = True
+                    self._last_camera_frame = cam
                 self.frame_time = (float(self.replay_frame_clock) if self.replay_frame_clock is not None
                                    else time.perf_counter())
 
@@ -1093,10 +1555,19 @@ class CVCoreSession:
                     raw_motion_ratio=shared["raw_motion_ratio"],
                     largest_motion_area=shared["largest_motion_area"],
                     marker_mode=self.marker_mode,
+                    watermark_mask_cam=shared.get("watermark_mask_cam"),
+                    watermark_mask_warp=shared.get("watermark_mask_warp"),
+                    watermark_exclusion_warp=shared.get("watermark_exclusion_warp"),
+                    watermark_coverage=shared.get("watermark_coverage", 0.0),
+                    watermark_excluded_fraction=shared.get("watermark_excluded_fraction", 0.0),
+                    registration_metadata=self.registration_metadata_snapshot(),
+                    camera_source_metadata=deepcopy(getattr(self, "_camera_source_metadata", None)),
                 )
 
             except GeneratorExit:
                 break
+            except CameraCalibrationChanged:
+                raise
             except Exception:
                 print(f"CV_CORE | Unhandled error in frames() at frame {self.frame_idx}:", flush=True)
                 traceback.print_exc()

@@ -86,6 +86,8 @@ class FoundryTimelineTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             video = Path(temp_dir) / "session.mp4"
+            camera_status = {"profileId": "iphone-obs", "applied": False,
+                             "message": "No calibration for this feed."}
             sidecar = foundry.start_timeline_recording(
                 video,
                 fps=15,
@@ -96,7 +98,9 @@ class FoundryTimelineTest(unittest.TestCase):
                 warp_height=720,
                 grid_cols=20,
                 grid_rows=16,
+                camera_calibration=camera_status,
             )
+            camera_status["profileId"] = "different-camera"
             foundry.record_timeline_frame()
             foundry.set_view_transform(self.view_payload(tx=100))
             foundry.record_timeline_frame()
@@ -108,6 +112,8 @@ class FoundryTimelineTest(unittest.TestCase):
             data = json.loads(sidecar.read_text(encoding="utf-8"))
             self.assertEqual(data["markerMode"], "viewport")
             self.assertTrue(data["framesUndistorted"])
+            self.assertEqual(data["cameraCalibration"]["profileId"], "iphone-obs")
+            self.assertFalse(data["cameraCalibration"]["applied"])
             self.assertEqual(data["warpWidth"], 1280)
             self.assertEqual(data["framesRecorded"], 3)
             self.assertEqual([event["frame"] for event in data["events"]], [0, 1, 2])

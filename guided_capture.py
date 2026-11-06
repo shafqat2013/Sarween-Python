@@ -3,6 +3,9 @@
 import copy
 
 
+MAX_CAPTURE_MINIS = 6
+
+
 class GuidedCapture:
     def __init__(self, payload, scene_id):
         self.session_id = str(payload.get("sessionId") or "")
@@ -11,8 +14,8 @@ class GuidedCapture:
             raise ValueError("Capture must belong to the active Foundry scene")
         self.participants = copy.deepcopy(payload.get("participants") or [])
         self.targets = copy.deepcopy(payload.get("targets") or [])
-        if not 1 <= len(self.participants) <= 5:
-            raise ValueError("Choose between one and five minis")
+        if not 1 <= len(self.participants) <= MAX_CAPTURE_MINIS:
+            raise ValueError("Choose between one and six minis")
         ids = [str(item.get("miniId") or "") for item in self.participants]
         tokens = [str(item.get("tokenId") or "") for item in self.participants]
         if not all(ids) or len(set(ids)) != len(ids):

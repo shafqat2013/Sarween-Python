@@ -1,0 +1,194 @@
+{
+  "generatedAtUTC": "2026-11-06T11:08:16.933076+00:00",
+  "sourceCommit": "0d7b659efc96056fdfc1b433fff60e28867ea658",
+  "scope": "Software verification and archived development regressions; not physical multi-mini/fog acceptance",
+  "pythonCleanCheckout": {
+    "run": 1040,
+    "passed": 1023,
+    "skipped": 17,
+    "failed": 0,
+    "seconds": 27.654,
+    "isolatedUserData": true,
+    "localArtifactsAbsent": true
+  },
+  "javascript": {
+    "passed": 69,
+    "failed": 0,
+    "command": "node --experimental-vm-modules --test tests/test_*.mjs"
+  },
+  "swift": {
+    "passed": 28,
+    "failed": 0,
+    "deviceBuild": "passed",
+    "simulatorBuild": "passed",
+    "signedDeviceBuild": "passed",
+    "newAppInstalled": true
+  },
+  "syntheticTransport": {
+    "scope": "SYNTHETIC localhost, production Swift server and Python receiver; NOT actual USB/camera",
+    "passed": 9,
+    "checks": [
+      "Swift JPEG decoded with actual portrait pixels and expected synthetic colors",
+      "Production receiver sends valid ACKs and receives strictly advancing frames",
+      "Slow consumer replaces old frames in the latest slot",
+      "Stopped Swift server produces an explicit missing frame, never frozen fresh pixels",
+      "Swift restart reconnects with a new session UUID and receiver generation",
+      "Release cancels the production receiver promptly",
+      "Standard, Smooth, Detail and landscape synthetic JPEGs decode at their declared native dimensions",
+      "Preset and nominal FPS metadata survive the production receiver handshake",
+      "FPS-only Standard/Smooth preserve optical identity; resolution/orientation changes do not"
+    ],
+    "syntheticFormats": [
+      {
+        "preset": "standard",
+        "orientation": "portrait",
+        "width": 1080,
+        "height": 1920,
+        "nominalFPS": 15,
+        "decoded": true
+      },
+      {
+        "preset": "smooth",
+        "orientation": "portrait",
+        "width": 1080,
+        "height": 1920,
+        "nominalFPS": 30,
+        "decoded": true
+      },
+      {
+        "preset": "detail",
+        "orientation": "portrait",
+        "width": 2160,
+        "height": 3840,
+        "nominalFPS": 15,
+        "decoded": true
+      },
+      {
+        "preset": "standard",
+        "orientation": "landscape",
+        "width": 1920,
+        "height": 1080,
+        "nominalFPS": 15,
+        "decoded": true
+      }
+    ],
+    "performanceCaveat": "Nominal producer FPS is configured test input, not measured iPhone or USB performance"
+  },
+  "priorRealUSB": {
+    "mode": "Standard 1080p/15, portrait",
+    "frames": 301,
+    "durationSeconds": 20.477,
+    "observedReceiveFPS": 15.0,
+    "receiverDrops": 0,
+    "additionalSampleFrames": 895,
+    "additionalSampleSeconds": 60.06,
+    "userConfirmedSarweenPreview": true,
+    "newPresetsTestedOnPhone": false,
+    "sensorToDisplayLatencyMeasured": false,
+    "torchOnIndependentlyVerified": false
+  },
+  "archivedDetectorRegressions": {
+    "scope": "Development recordings; labels loaded after inference. Not held-out accuracy evidence.",
+    "frames": 1030,
+    "allSelectedCentersRadiiConfidenceUnchanged": true,
+    "movingClip": {
+      "frames": 611,
+      "orderedMoves": 6,
+      "extraMoves": 0,
+      "identitiesAndOriginsPreserved": true,
+      "eventCentersAndConfirmationFramesUnchanged": true,
+      "requiredExactDestinationsCorrect": 2,
+      "requiredExactDestinations": 4,
+      "strictAcceptancePassed": false,
+      "additionalAbstention": "Salmon AM19/AM20, previously optimistic AM20",
+      "preservedAbstention": "Orange P13/Q13"
+    },
+    "staticClip": {
+      "frames": 419,
+      "basesAcquired": 6,
+      "movementEvents": 0
+    }
+  },
+  "remainingPhysicalWork": [
+    "Printed marker placement and secure CPL mount",
+    "New calibration and useful table image on the direct feed",
+    "Held-out six-mini single-mover test",
+    "Fog and physical-object separation; automatic recovery is not implemented",
+    "Sustained Smooth/Detail throughput, battery and thermal checks"
+  ],
+  "sourceSHA256": {
+    "camera_sources.py": "5a6cb7e950a8fb2e398e54a5ba8d9440538de99b3ee6f181caa3e84da1f1480a",
+    "hybrid_ring_detector.py": "da0d3d320c2053ae785735b639654568088aae9ef6bda61bf25bede7a20f8ed9",
+    "ios/SarweenCamera/Sources/App/CameraCapture.swift": "ee881be0330c64cc9ed8e02f3be95d11a7f1aa78e53bcf778cf5595801ec323c",
+    "ios/SarweenCamera/Sources/App/CameraViewModel.swift": "ed8e842be228f1a2353e2a31ffac137cfa72351fef4ad69e264bfe8d8dbdcf0a",
+    "ios/SarweenCamera/Sources/App/SarweenCameraApp.swift": "3c1a14addd8a9b9218c6ac54eb8b1fc347cd7d4a734015875638bf2f6f6ecf4a",
+    "ios/SarweenCamera/Sources/App/USBStreamServer.swift": "1cbdbf0cd6de7164768d7bd34c6e7eebc9cbd9834d09e38cfde346989b32fc31",
+    "ios/SarweenCamera/Sources/Protocol/CapturePreset.swift": "91dbfad5dad133db69f89b3bf480502b0b7ffed7402ece19e151210e90cfdc74",
+    "ios/SarweenCamera/Sources/Protocol/FrameFlowGate.swift": "86d89de374a5d9a7b79aa0dafb99c49aa6c0c0fe5aef47a21d3f9d7453a04a32",
+    "ios/SarweenCamera/Sources/Protocol/WirePacket.swift": "f3cddabbffec80ac1182096dbbdc5f9b65138838d9b2714ae7df4c94f1bca47b",
+    "observer_engine.py": "c29e4720fa7bf4b456d0f23629c9048384f122299bb2ad50af76cece7a63363c",
+    "observer_event_journal.py": "b18baec6a0f06322330338b6fb13173ece6b4baddab2ad9bb0b2da90a172c7c6",
+    "observer_journal.py": "e94e8fff01b15c97cf34ba28bc21dbea987149a0ccd8f4dc3f724f24a063a37f",
+    "observer_session.py": "b88aa1680863318f65d1e228d7f031e1469745db2ba5ec5022e34e0d7e6c56b3",
+    "phone_camera.py": "9ccb091bc5a8763e091e8bac2823ac0f7c7b03af34d6b85823d0ef9fa3829987",
+    "phone_camera_protocol.py": "a6315ffb4562dfb1a5310deb61b7b9bf98c81b785a5ed34ff8be03824e9bdbde"
+  },
+  "realPresetChecks": {
+    "scope": "Short raw USB camera checks on the iPhone 13 Pro after installing the preset update; not tracking, table calibration, sensor-to-display latency or sustained thermal/battery validation",
+    "modes": [
+      {
+        "preset": "standard",
+        "imageSize": [
+          1080,
+          1920
+        ],
+        "nominalFPS": 15,
+        "observedReceiveFPS": 15.004,
+        "framesReceived": 226,
+        "sampleSeconds": 15.004,
+        "warmupFramesExcluded": 10,
+        "medianHostReceiveIntervalMs": 66.678,
+        "medianPhoneCaptureIntervalMs": 66.67,
+        "medianEncodeMs": 24.28,
+        "receiverDroppedLatestFrames": 0
+      },
+      {
+        "preset": "smooth",
+        "imageSize": [
+          1080,
+          1920
+        ],
+        "nominalFPS": 30,
+        "observedReceiveFPS": 15.005,
+        "framesReceived": 226,
+        "sampleSeconds": 15.007,
+        "warmupFramesExcluded": 10,
+        "medianHostReceiveIntervalMs": 66.609,
+        "medianPhoneCaptureIntervalMs": 66.657,
+        "medianEncodeMs": 24.057,
+        "receiverDroppedLatestFrames": 0
+      },
+      {
+        "preset": "detail",
+        "imageSize": [
+          2160,
+          3840
+        ],
+        "nominalFPS": 15,
+        "observedReceiveFPS": 4.973,
+        "framesReceived": 76,
+        "sampleSeconds": 15.036,
+        "warmupFramesExcluded": 10,
+        "medianHostReceiveIntervalMs": 199.766,
+        "medianPhoneCaptureIntervalMs": 200.01,
+        "medianEncodeMs": 71.711,
+        "receiverDroppedLatestFrames": 0
+      }
+    ],
+    "standardSmoothOpticalIdMatches": true,
+    "detailOpticalIdDiffers": true,
+    "recommendedDefault": "standard",
+    "smooth30FPSTargetAchieved": false,
+    "detail15FPSTargetAchieved": false
+  }
+}

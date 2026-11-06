@@ -7,16 +7,27 @@ import * as movementLogic from "../movement_logic.mjs";
 const participants = CAPTURE_MINIS.map(mini => ({...mini, tokenId: mini.route}));
 const bounds = {firstColumn: 0, lastColumn: 47, firstRow: 0, lastRow: 26};
 const targets = generateCaptureTargets(bounds, participants);
-assert.equal(targets.length, 30);
-assert.equal(new Set(targets.map(target => target.cell)).size, 30);
-assert.deepEqual(targets.slice(0, 5).map(target => target.label), ["A0", "B0", "C0", "D0", "E0"]);
-assert.deepEqual(targets.slice(-5).map(target => target.label), ["A5", "B5", "C5", "D5", "E5"]);
+assert.equal(targets.length, 36);
+assert.equal(new Set(targets.map(target => target.cell)).size, 36);
+assert.deepEqual(targets.slice(0, 6).map(target => target.label), ["A0", "B0", "C0", "D0", "E0", "F0"]);
+assert.deepEqual(targets.slice(-6).map(target => target.label), ["A5", "B5", "C5", "D5", "E5", "F5"]);
+const fourTargets = generateCaptureTargets(bounds, participants.slice(0, 4));
+assert.equal(fourTargets.length, 24);
+assert.deepEqual(fourTargets.map(({miniId, step, row, column, cell}) => ({miniId, step, row, column, cell})),
+  targets.filter(target => ["A", "B", "C", "D"].includes(target.route))
+    .map(({miniId, step, row, column, cell}) => ({miniId, step, row, column, cell})),
+  "The four-mini comparison must preserve the same A-D board positions");
 assert.equal(generateCaptureTargets(bounds, [participants[1]]).length, 6);
+assert.deepEqual(generateCaptureTargets(bounds, [participants[1]]).map(target => target.cell),
+  targets.filter(target => target.route === "B").map(target => target.cell));
+assert.throws(() => generateCaptureTargets(bounds, [...participants, {...participants[0], route: "G"}]), /one and six/);
 assert.throws(() => generateCaptureTargets({firstColumn: 0, lastColumn: 1, firstRow: 0, lastRow: 1}, participants));
 
 const hooks = new Map();
 const sent = [];
+const commandReply = id => sent.find(message => message.commandId === id);
 const snapshotDraws = [];
+const referenceTargets = [];
 const sceneTokens = participants.map((mini, index) => ({
   id: mini.tokenId,
   name: mini.tokenName,
@@ -47,10 +58,16 @@ const context = vm.createContext({
     ? {width: 0, height: 0, getContext() {return {drawImage(...args) {snapshotDraws.push(args);}};}, toDataURL() {return "data:image/jpeg;base64,abc";}}
     : {style: {}, dataset: {}, appendChild() {}, remove() {}};}, body: {appendChild() {}}},
   game: {settings: {get(_module, key) {return {viewportMarkersEnabled: true, viewportMarkerSize: 120, viewportMarkerInset: 8, physicalTapSelection: true, defaultMovementSpeed: 30}[key];}}},
-  canvas: {ready: true, scene, dimensions: {}, app: {renderer: {extract: {canvas() {return {width: 1200, height: 800};}}}}, grid: {measurePath: () => ({distance: 5})}, tokens: {get(id) {return sceneTokens.get(id);}}, stage: {worldTransform: {a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0}}},
+  PIXI: {RenderTexture: {create(options) {const target = {...options, destroy() {this.destroyed = true;}}; referenceTargets.push(target); return target;}}},
+  canvas: {ready: true, scene, dimensions: {}, app: {renderer: {
+    screen: {width: 1200, height: 800}, resolution: 1,
+    render(stage, {renderTexture}) {renderTexture.stage = stage;},
+    extract: {canvas(target) {assert.equal(target.stage, context.canvas.app.stage); return {width: 1200, height: 800};}},
+  }}, grid: {measurePath: () => ({distance: 5})}, tokens: {get(id) {return sceneTokens.get(id);}}, stage: {worldTransform: {a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0}}},
   WebSocket: {OPEN: 1},
   setTimeout(callback) {callback(); return 1;}, clearTimeout() {},
 });
+context.canvas.app.stage = context.canvas.stage;
 const source = fs.readFileSync(new URL("../module.js", import.meta.url), "utf8");
 const module = new vm.SourceTextModule(source + '\n globalThis.moduleTest = {setSocket(value) {ws = value;}, getMovementState() {return movementState;}, captureRenderedReference, handlePythonMessage, dispatchPythonMessage};', {context});
 await module.link(specifier => {
@@ -90,9 +107,12 @@ sent.length = 0;
 context.moduleTest.captureRenderedReference();
 assert.equal(sent[0].type, "renderedReference");
 assert.equal(sent[0].sceneId, "new-scene");
+assert.equal(sent[0].capture.method, "pixi-stage-render-texture-v1");
+assert.equal(sent[0].capture.sequence, 1);
+assert.equal(referenceTargets[0].destroyed, true);
 assert.equal(snapshotDraws.length, 1);
 assert.deepEqual(snapshotDraws[0].slice(1), [28, 28, 1144, 744, 0, 0, 640, 360]);
-console.log("PASS: five-mini routes and scene-switch hooks");
+console.log("PASS: six-mini routes, comparable four-mini subset and scene-switch hooks");
 
 const socket = {readyState: 1, send(raw) {sent.push(JSON.parse(raw));}};
 context.moduleTest.setSocket(socket);
@@ -102,8 +122,8 @@ const command = {type: "moveToken", commandId: "move-1", sceneId: scene.id,
 sent.length = 0;
 await context.moduleTest.handlePythonMessage(command);
 assert.equal(updateCount, 1);
-assert.equal(sent[0].type, "tokenMoveApplied");
-assert.equal(sent[0].commandId, "move-1");
+assert.equal(commandReply("move-1").type, "tokenMoveApplied");
+assert.equal(commandReply("move-1").commandId, "move-1");
 assert.equal(context.moduleTest.getMovementState().usedFeet, 5);
 await context.moduleTest.handlePythonMessage(command);
 assert.equal(updateCount, 1, "Retry must not repeat the update or animation");
@@ -112,20 +132,20 @@ rejectUpdate = true;
 sent.length = 0;
 const second = {...command, commandId: "move-2", x: 200};
 await context.moduleTest.handlePythonMessage(second);
-assert.equal(sent[0].type, "tokenMoveError");
-assert.equal(sent[0].commandId, second.commandId);
+assert.equal(commandReply(second.commandId).type, "tokenMoveError");
+assert.equal(commandReply(second.commandId).commandId, second.commandId);
 rejectUpdate = false;
 sent.length = 0;
 await context.moduleTest.handlePythonMessage(second);
-assert.equal(sent[0].type, "tokenMoveApplied");
+assert.equal(commandReply(second.commandId).type, "tokenMoveApplied");
 assert.equal(sceneTokens[0].x, 200);
 sent.length = 0;
 await context.moduleTest.handlePythonMessage({...command, commandId: "stale-scene", sceneId: "old-scene"});
-assert.equal(sent[0].type, "tokenMoveError");
+assert.equal(commandReply("stale-scene").type, "tokenMoveError");
 assert.equal(sceneTokens[0].x, 200);
 sent.length = 0;
 await context.moduleTest.handlePythonMessage({...command, commandId: "deleted", tokenId: "missing"});
-assert.equal(sent[0].code, "tokenMissing");
+assert.equal(commandReply("deleted").code, "tokenMissing");
 
 let release;
 updateGate = new Promise(resolve => {release = resolve;});

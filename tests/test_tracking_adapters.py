@@ -53,7 +53,8 @@ class TrackingAdaptersTest(unittest.TestCase):
                         stack.enter_context(patch.object(fo, name, copy.deepcopy(getattr(fo, name))))
                     timeline = replay.FoundryTimelineReplay(timeline_path)
                     timeline.apply_through(0)
-                    session = SimpleNamespace(**geometry, is_recording=False, index=0, close=Mock())
+                    session = SimpleNamespace(**geometry, is_recording=False, index=0, close=Mock(),
+                                              camera_calibration_metadata=lambda: {})
                     session.cap = Mock(get=lambda prop: session.index + 1)
                     def iterate(callback):
                         for frame in frames:

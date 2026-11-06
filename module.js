@@ -18,29 +18,48 @@ const DEFAULT_DISPLAY_DIAGONAL_INCHES = 55;
 const DEFAULT_GRID_INCHES = 1;
 const VIEWPORT_MARKER_IDS = [10, 11, 12, 13];
 const MARKER_QUIET_ZONE_FRACTION = 1 / 6;
+const MAX_GRID_LABELS = 3000;
+const VISUAL_REFRESH_DELAY_MS = 100;
+const VISUAL_FALLBACK_MS = 350;
 
 let ws = null;
-let moveMessageChain = Promise.resolve();
+let commandMessageChain = Promise.resolve();
+let physicalGridSettingsBatch = false;
+let physicalGridBatchSettled = Promise.resolve();
 let reconnectAttempts = 0;
 let reconnectTimer = null;
 let heartbeatTimer = null;
 let referenceCaptureTimer = null;
-let manualDisconnect = false;
+let referenceCaptureBusy = false;
+let referenceCaptureErrors = 0;
+let referenceCaptureSequence = 0;
+let referenceCaptureSessionId = null;
 let markerOverlayEl = null;
+let gridLabelOverlayEl = null;
+let gridLabelRenderTimer = null;
 let testTargetOverlayEl = null;
 let testSequenceTargets = [];
 let viewTransformTimer = null;
 let testTargetRenderTimer = null;
 let guidedCapture = null;
-let capturePanelEl = null;
 let captureLastStatus = {state: "idle"};
 let movementState = null;
 let movementOverlayEl = null;
 let miniTokenBindings = new Map();
 const ignoredMovementUpdates = new Set();
+const desktopTokenCreations = new Map();
 
-// UI
-let statusEl = null;
+let connectionStatus = {state: "disconnected", message: ""};
+let assignmentRequests = [];
+let vttControlsRequested = false;
+let lastVttStateSocket = null;
+let lastVttStateSignature = "";
+let pendingSceneVisualChange = null;
+
+Hooks.on("pauseGame", () => sendVttState());
+Hooks.on("createActor", () => sendVttState());
+Hooks.on("updateActor", () => sendVttState());
+Hooks.on("deleteActor", () => sendVttState());
 
 function getSetting(key) {
   return game.settings.get(MODULE_ID, key);
@@ -54,6 +73,556 @@ function warn(...args) {
 }
 function error(...args) {
   console.error("sarween |", ...args);
+}
+
+const PHYSICAL_GRID_LIMITS = {
+  targetGridInches: [0.25, 3],
+  displayDiagonalInches: [10, 150],
+  physicalGridCalibration: [0.5, 1.5],
+};
+
+const VTT_SETTING_RULES = {
+  ...PHYSICAL_GRID_LIMITS,
+  debug: "boolean", physicalGridAutoApply: "boolean",
+  viewportMarkersEnabled: "boolean", viewportMarkerSize: [72, 240], viewportMarkerInset: [0, 80],
+  animateTokenMovement: "boolean", physicalTapSelection: "boolean", defaultMovementSpeed: [0, 120],
+  foundryUIHidden: "boolean", gridLabelsVisible: "boolean",
+};
+const VTT_ACTIONS = [
+  "settings.set", "markers.set", "capture.start", "capture.confirm", "capture.stop", "capture.new",
+  "capture.resume", "movement.select", "movement.undo", "movement.reset", "assignment.save",
+  "assignment.cancel", "ui.setHidden", "lifecycle.reload", "state.sync",
+  "lifecycle.setPaused", "token.create",
+];
+
+function captureIsActive() {
+  return Boolean(guidedCapture?.recording || ["Starting", "Saving", "Restoring"].includes(guidedCapture?.phase));
+}
+
+function vttState() {
+  const scene = canvas?.scene;
+  const tokens = listSceneTokenChoices(scene);
+  const target = guidedCapture?.phase === "placement" ? guidedCapture.targets?.[guidedCapture.index] ?? null : null;
+  return {
+    type: "vttState", supported: true, ready: Boolean(canvas?.ready && scene),
+    sceneId: scene?.id ?? null, capabilities: VTT_ACTIONS,
+    connection: {...connectionStatus},
+    world: {id: game.world?.id ?? null, name: game.world?.title ?? game.world?.name ?? ""},
+    user: {id: game.user?.id ?? null, name: game.user?.name ?? "", isGM: Boolean(game.user?.isGM)},
+    paused: Boolean(game.paused),
+    settings: Object.fromEntries(Object.keys(VTT_SETTING_RULES).map(key => [key, getSetting(key)])),
+    scene: scene ? {id: scene.id, name: scene.name ?? "", gridSize: Number(scene.grid?.size ?? 0),
+      gridType: Number(scene.grid?.type ?? 0), tokenVision: Boolean(scene.tokenVision)} : null,
+    tokens,
+    actors: listWorldActorChoices(),
+    minis: CAPTURE_MINIS.map(mini => {
+      const matches = tokens.filter(token => token.tokenName.toLowerCase() === mini.tokenName.toLowerCase());
+      const assigned = miniTokenBindings.get(mini.miniId);
+      return {...mini, tokenId: tokens.some(token => token.tokenId === assigned) ? assigned
+        : matches.length === 1 ? matches[0].tokenId : null};
+    }),
+    assignment: assignmentRequests.length ? {...assignmentRequests[0], pendingCount: assignmentRequests.length} : null,
+    capture: {
+      state: guidedCapture?.phase === "Starting" ? "starting" : captureLastStatus.state,
+      sessionId: guidedCapture?.sessionId ?? null, recording: Boolean(guidedCapture?.recording), active: captureIsActive(),
+      waiting: Boolean(guidedCapture?.waiting), phase: guidedCapture?.phase ?? "Idle",
+      seconds: Number(guidedCapture?.seconds ?? 0), index: Number(guidedCapture?.index ?? 0),
+      total: guidedCapture?.targets?.length ?? 0, target,
+      message: guidedCapture?.message ?? captureLastStatus.message ?? "",
+      reason: captureLastStatus.reason ?? null,
+    },
+    movement: movementState ? {
+      tokenId: movementState.tokenId, miniId: movementState.miniId, label: movementState.label,
+      budgetFeet: movementState.budgetFeet, usedFeet: movementState.usedFeet,
+      remainingFeet: remainingMovement(movementState), overageFeet: movementOverage(movementState),
+      canUndo: movementState.segments.length > 0,
+    } : null,
+  };
+}
+
+function sendVttState({force = false} = {}) {
+  if (!vttControlsRequested || physicalGridSettingsBatch || ws?.readyState !== WebSocket.OPEN) return;
+  const state = vttState();
+  const signature = JSON.stringify(state);
+  if (!force && ws === lastVttStateSocket && signature === lastVttStateSignature) return;
+  if (sendToPython(state)) {lastVttStateSocket = ws; lastVttStateSignature = signature;}
+}
+
+function registerVttSetting(key, registration) {
+  const onChange = registration.onChange;
+  game.settings.register(MODULE_ID, key, {...registration, onChange: async value => {
+    if (physicalGridSettingsBatch) return;
+    try {await onChange?.(value);}
+    finally {sendVttState();}
+  }});
+}
+
+function applyFoundryUIVisibility() {
+  let style = document.getElementById?.("sarween-hide-foundry-ui");
+  if (!getSetting("foundryUIHidden") || ws?.readyState !== WebSocket.OPEN
+      || connectionStatus.state !== "connected") {style?.remove(); return;}
+  if (style) return;
+  style = document.createElement("style");
+  style.id = "sarween-hide-foundry-ui";
+  style.textContent = `#ui-left,#ui-top,#ui-bottom,#sidebar,#navigation,#players,#hotbar,#controls,#logo {
+    visibility:hidden!important;pointer-events:none!important;
+  }`;
+  document.head.appendChild(style);
+}
+
+function requireKeys(values, allowed) {
+  if (!values || typeof values !== "object" || Array.isArray(values)
+      || Object.keys(values).some(key => !allowed.includes(key))) throw new Error("Invalid VTT command values.");
+}
+
+function requireIdleCapture() {
+  if (captureIsActive()) throw new Error("Finish guided capture before changing the VTT display.");
+}
+
+function validateVttSettings(settings) {
+  requireKeys(settings, Object.keys(VTT_SETTING_RULES));
+  for (const [key, value] of Object.entries(settings)) {
+    const rule = VTT_SETTING_RULES[key];
+    if (Array.isArray(rule)) {
+      if (typeof value !== "number" || !Number.isFinite(value) || value < rule[0] || value > rule[1]) {
+        throw new Error(`Invalid value for ${key}.`);
+      }
+    } else if (rule === "boolean") {
+      if (typeof value !== "boolean") throw new Error(`Invalid value for ${key}.`);
+    }
+  }
+}
+
+async function setVttSettings(settings, requireCurrent) {
+  validateVttSettings(settings);
+  requireIdleCapture();
+  const changed = Object.entries(settings).filter(([key, value]) => getSetting(key) !== value);
+  const previous = Object.fromEntries(changed.map(([key]) => [key, getSetting(key)]));
+  // Applying a saved display profile also restores the physical zoom after a
+  // manual zoom, even when its persisted grid settings have not changed.
+  const geometry = Object.keys(settings).some(key => Object.hasOwn(PHYSICAL_GRID_LIMITS, key));
+  const markers = changed.some(([key]) => key.startsWith("viewportMarker"));
+  const labels = changed.some(([key]) => key === "gridLabelsVisible");
+  const sceneId = canvas?.scene?.id;
+  let attemptedApply = false;
+  let finishBatch;
+  physicalGridBatchSettled = new Promise(resolve => {finishBatch = resolve;});
+  physicalGridSettingsBatch = true;
+  try {
+    for (const [key, value] of changed) {
+      requireCurrent();
+      await game.settings.set(MODULE_ID, key, value);
+    }
+    requireCurrent();
+    if (geometry) {
+      attemptedApply = true;
+      if (!await applyPhysicalGridScale({animate: false})) throw new Error("Open a scene before resizing its grid.");
+      requireCurrent();
+    }
+    if (markers) renderViewportMarkers();
+    if (labels) gridLabelsChanged();
+    else if (geometry) renderGridLabels();
+    applyFoundryUIVisibility();
+    sendSceneAndView();
+  } catch (err) {
+    let restored = true;
+    for (const [key, value] of Object.entries(previous)) {
+      try {await game.settings.set(MODULE_ID, key, value);} catch {restored = false;}
+    }
+    try {
+      if (markers) renderViewportMarkers();
+      if (labels) renderGridLabels();
+      applyFoundryUIVisibility();
+      if (attemptedApply && canvas?.ready && canvas.scene?.id === sceneId) {
+        if (!await applyPhysicalGridScale({animate: false})) restored = false;
+        sendSceneAndView();
+      }
+    } catch {restored = false;}
+    throw new Error(restored ? `${err.message} Previous settings restored.`
+      : "VTT update failed. Check the current Foundry settings.");
+  } finally {
+    physicalGridSettingsBatch = false;
+    finishBatch();
+    sendPhysicalGridState();
+    sendVttState();
+  }
+}
+
+function startGuidedCapture(values) {
+  requireKeys(values, ["participants", "scenario", "notes"]);
+  requireIdleCapture();
+  if (physicalGridSettingsBatch) throw new Error("Wait for physical grid resizing to finish before starting capture.");
+  if (!getSetting("viewportMarkersEnabled")) throw new Error("Turn on the ArUco markers first.");
+  if (Number(canvas.scene.grid?.type) !== 1) throw new Error("Dataset capture requires a square Foundry grid.");
+  if (!Array.isArray(values.participants) || !values.participants.length
+      || values.participants.length > CAPTURE_MINIS.length) throw new Error("Choose at least one mini.");
+  if (!["fog-on", "fog-off"].includes(values.scenario)) throw new Error("Choose a fog / lighting label.");
+  if (values.notes !== undefined && (typeof values.notes !== "string" || values.notes.length > 2000)) throw new Error("Capture notes must be under 2000 characters.");
+  const participants = values.participants.map(value => {
+    requireKeys(value, ["miniId", "tokenId"]);
+    const mini = CAPTURE_MINIS.find(item => item.miniId === value.miniId);
+    const token = canvas.scene.tokens.get(value.tokenId);
+    if (!mini || !token) throw new Error("Choose a current token for every mini.");
+    if (Number(token.width) !== 1 || Number(token.height) !== 1) throw new Error(`${mini.tokenName} must be a one-square token.`);
+    return {...mini, tokenId: token.id, sight: token.sight?.toObject?.() ?? token.sight};
+  });
+  if (new Set(participants.map(mini => mini.tokenId)).size !== participants.length
+      || new Set(participants.map(mini => mini.miniId)).size !== participants.length) throw new Error("Choose a different token and ring for each mini.");
+  if (values.scenario === "fog-on") {
+    if (!canvas.scene.tokenVision) throw new Error("Enable Token Vision in the scene before a fog-on capture.");
+    const blind = participants.find(mini => !mini.sight?.enabled || !mini.sight?.range);
+    if (blind) throw new Error(`Enable vision and a sight range for ${blind.tokenName}.`);
+  }
+  const targets = generateCaptureTargets(visibleGridBounds({safeForCapture: true}), participants);
+  cancelPendingSceneVisualChange();
+  clearMovementSelection();
+  guidedCapture = {
+    sessionId: crypto.randomUUID(), sceneId: canvas.scene.id, participants, targets,
+    index: 0, recording: false, waiting: true, phase: "Starting", seconds: 0, timer: null,
+    viewSignature: JSON.stringify(getClientToCanvasTransform()),
+    originalTokens: participants.map(mini => {const token = canvas.scene.tokens.get(mini.tokenId); return {id: token.id, x: token.x, y: token.y};}),
+    originalControlIds: (canvas.tokens.controlled ?? []).map(token => token.id),
+  };
+  captureLastStatus = {state: "starting"};
+  canvas.tokens.releaseAll();
+  for (const mini of participants) canvas.tokens.get(mini.tokenId)?.control({releaseOthers: false});
+  sendSceneAndView();
+  if (!captureControl("start", {
+    ...guidedCapture, timer: undefined, scenario: values.scenario, notes: values.notes ?? "",
+    moduleVersion: game.modules.get(MODULE_ID)?.version,
+    sceneVision: {tokenVision: canvas.scene.tokenVision, fogExploration: canvas.scene.fog?.exploration},
+    markerSettings: {size: getSetting("viewportMarkerSize"), inset: getSetting("viewportMarkerInset")},
+  })) {guidedCapture = null; throw new Error("Could not start capture: connection lost.");}
+  publishCaptureState();
+}
+
+function assignMiniFromDesktop(values) {
+  requireKeys(values, ["miniId", "tokenId"]);
+  if (typeof values.miniId !== "string" || !values.miniId.trim() || values.miniId.length > 128) throw new Error("Choose a mini to assign.");
+  const chosen = listSceneTokenChoices(canvas.scene).find(token => token.tokenId === values.tokenId);
+  if (!chosen) throw new Error("The selected token is no longer on this scene.");
+  sendToPython({type: "assignMiniResult", sceneId: canvas.scene.id, miniId: values.miniId,
+    tokenId: chosen.tokenId, actorId: chosen.actorId});
+  miniTokenBindings.set(values.miniId, chosen.tokenId);
+  assignmentRequests = assignmentRequests.filter(request => request.miniId !== values.miniId);
+  sendSceneAndView();
+}
+
+function actorCanCreateToken(actor) {
+  return Boolean(game.user?.isGM && actor && typeof actor.getTokenDocument === "function"
+    && game.user.can?.("TOKEN_CREATE") !== false
+    && actor.testUserPermission?.(game.user, "OBSERVER") !== false
+    && canvas.scene?.canUserModify?.(game.user, "update") !== false);
+}
+
+function listWorldActorChoices() {
+  const actors = game.actors?.contents ?? (game.actors?.values ? [...game.actors.values()] : []);
+  return actors.filter(actorCanCreateToken).map(actor => ({actorId: actor.id,
+    actorName: actor.name || `(actor ${actor.id})`, type: actor.type || ""}))
+    .sort((a, b) => a.actorName.localeCompare(b.actorName) || a.actorId.localeCompare(b.actorId));
+}
+
+function validateTokenCreation(values) {
+  requireKeys(values, ["actorId", "name", "placement", "row", "col", "creationId"]);
+  if (typeof values.actorId !== "string" || !values.actorId || values.actorId.length > 128
+      || typeof values.name !== "string" || values.name.length > 100 || /[\x00-\x1f]/.test(values.name)
+      || typeof values.creationId !== "string" || !/^[a-zA-Z0-9_-]{16,64}$/.test(values.creationId)) {
+    throw new Error("Choose an actor and a valid token name.");
+  }
+  if (!["cell", "viewport"].includes(values.placement)) throw new Error("Choose a token placement.");
+  if (values.placement === "cell") {
+    if (![values.row, values.col].every(value => Number.isSafeInteger(value) && value >= 0 && value <= 100000)) {
+      throw new Error("Choose a valid grid cell.");
+    }
+  } else if (values.row !== undefined || values.col !== undefined) throw new Error("Viewport placement has no grid cell.");
+}
+
+function desktopTokenPosition(values, data) {
+  const scene = canvas.scene, grid = Number(scene.grid?.size);
+  const left = Number(canvas.dimensions?.sceneX ?? 0), top = Number(canvas.dimensions?.sceneY ?? 0);
+  const width = Number(scene.width), height = Number(scene.height);
+  const tokenWidth = Number(data.width) * grid, tokenHeight = Number(data.height) * grid;
+  if (![grid, width, height, tokenWidth, tokenHeight].every(value => Number.isFinite(value) && value > 0)
+      || tokenWidth > width || tokenHeight > height) throw new Error("The prototype token does not fit this scene.");
+  const originX = left + Number(scene.grid?.shiftX ?? 0), originY = top + Number(scene.grid?.shiftY ?? 0);
+  let x, y;
+  if (values.placement === "cell") {
+    if (Number(scene.grid?.type) !== 1) throw new Error("Cell placement requires a square grid.");
+    x = originX + values.col * grid; y = originY + values.row * grid;
+  } else {
+    const inverse = getClientToCanvasTransform();
+    if (!inverse) throw new Error("The current viewport is unavailable.");
+    const cx = Number(window.innerWidth) / 2, cy = Number(window.innerHeight) / 2;
+    const centerX = inverse.a * cx + inverse.c * cy + inverse.tx;
+    const centerY = inverse.b * cx + inverse.d * cy + inverse.ty;
+    x = originX + Math.round((centerX - tokenWidth / 2 - originX) / grid) * grid;
+    y = originY + Math.round((centerY - tokenHeight / 2 - originY) / grid) * grid;
+    x = Math.min(left + width - tokenWidth, Math.max(left, x));
+    y = Math.min(top + height - tokenHeight, Math.max(top, y));
+  }
+  if (![x, y].every(Number.isFinite) || x < left || y < top
+      || x + tokenWidth > left + width || y + tokenHeight > top + height) {
+    throw new Error("The token would be outside this scene. Choose another cell.");
+  }
+  return {x, y};
+}
+
+async function createDesktopToken(values, requireCurrent) {
+  validateTokenCreation(values);
+  requireIdleCapture();
+  requireCurrent();
+  const scene = canvas.scene, actor = game.actors?.get?.(values.actorId);
+  if (!actorCanCreateToken(actor)) throw new Error("The actor is unavailable or you cannot create its token.");
+  const signature = JSON.stringify({actorId: values.actorId, name: values.name.trim(), placement: values.placement,
+    ...(values.placement === "cell" ? {row: values.row, col: values.col} : {})});
+  const existing = (scene.tokens ?? []).find(token => token.flags?.[MODULE_ID]?.desktopCreation?.id === values.creationId);
+  if (existing) {
+    if (existing.flags[MODULE_ID].desktopCreation.signature !== signature) throw new Error("This creation ID belongs to a different token request.");
+    return {tokenId: existing.id, creationId: values.creationId, name: existing.name};
+  }
+  const key = `${game.world?.id ?? ""}:${scene.id}:${values.creationId}`;
+  if (desktopTokenCreations.has(key)) {
+    const pending = desktopTokenCreations.get(key);
+    if (pending.signature !== signature) throw new Error("This creation ID belongs to a different token request.");
+    return pending.promise;
+  }
+  const create = async () => {
+    // getTokenDocument preserves system-specific prototype texture, sight and
+    // linking. It creates an unsaved document; only createEmbeddedDocuments writes.
+    const prototype = await actor.getTokenDocument({name: values.name.trim() || actor.name}, {parent: scene});
+    requireCurrent(); requireIdleCapture();
+    if (!actorCanCreateToken(actor)) throw new Error("Token creation permission changed.");
+    const data = prototype.toObject();
+    delete data._id;
+    Object.assign(data, desktopTokenPosition(values, data), {actorId: actor.id, name: values.name.trim() || actor.name});
+    data.flags = {...data.flags, [MODULE_ID]: {...data.flags?.[MODULE_ID],
+      desktopCreation: {id: values.creationId, signature}}};
+    const created = await scene.createEmbeddedDocuments("Token", [data], {sarweenSource: "desktopTokenCreate"});
+    if (!created?.[0]?.id) throw new Error("Foundry did not confirm token creation.");
+    requireCurrent();
+    sendSceneAndView();
+    return {tokenId: created[0].id, creationId: values.creationId, name: created[0].name};
+  };
+  const pending = {signature, promise: create()};
+  desktopTokenCreations.set(key, pending);
+  try {return await pending.promise;}
+  finally {if (desktopTokenCreations.get(key) === pending) desktopTokenCreations.delete(key);}
+}
+
+async function handleVttCommand(data, socket) {
+  const current = () => socket === ws && socket?.readyState === WebSocket.OPEN;
+  const initialSceneId = canvas?.scene?.id ?? null;
+  const requireCurrent = () => {
+    if (!current()) throw new Error("The Sarween connection changed. Try again.");
+    if (initialSceneId !== (canvas?.scene?.id ?? null)
+        || (data.sceneId !== undefined && data.sceneId !== initialSceneId)) throw new Error("The Foundry scene changed. Refresh and try again.");
+  };
+  let reload = false;
+  let completed = false;
+  let actionResult = null;
+  try {
+    requireCurrent();
+    if (!game.user?.isGM) throw new Error("VTT controls require a Foundry GM connection.");
+    if (typeof data.requestId !== "string" || !data.requestId || !VTT_ACTIONS.includes(data.action)) throw new Error("Unsupported VTT command.");
+    const values = data.values ?? {};
+    requireKeys(values, {
+      "settings.set": ["settings"], "markers.set": ["enabled"], "capture.start": ["participants", "scenario", "notes"],
+      "movement.select": ["tokenId"], "assignment.save": ["miniId", "tokenId"], "ui.setHidden": ["hidden"],
+      "lifecycle.setPaused": ["paused"],
+      "token.create": ["actorId", "name", "placement", "row", "col", "creationId"],
+    }[data.action] ?? []);
+    if (!["settings.set", "ui.setHidden", "lifecycle.reload", "lifecycle.setPaused", "state.sync"].includes(data.action)
+        && (!canvas?.ready || !canvas.scene)) throw new Error("Open a Foundry scene first.");
+    switch (data.action) {
+      case "settings.set": await setVttSettings(values.settings, requireCurrent); break;
+      case "markers.set": await setVttSettings({viewportMarkersEnabled: values.enabled}, requireCurrent); break;
+      case "ui.setHidden": await setVttSettings({foundryUIHidden: values.hidden}, requireCurrent); break;
+      case "capture.start": startGuidedCapture(values); break;
+      case "capture.confirm": {
+        const target = guidedCapture?.targets?.[guidedCapture.index];
+        if (!guidedCapture?.recording || guidedCapture.waiting || !target || guidedCapture.phase !== "placement") throw new Error("Wait for the next capture placement prompt.");
+        guidedCapture.waiting = true;
+        guidedCapture.message = "Confirming placement…";
+        if (!captureControl("confirm", {index: target.index})) throw new Error("Capture connection lost.");
+        break;
+      }
+      case "capture.stop":
+        if (!captureIsActive()) throw new Error("There is no active capture to finish.");
+        if (guidedCapture.phase === "Saving") throw new Error("The capture is already being saved.");
+        stopGuidedCapture(); break;
+      case "capture.new":
+        requireIdleCapture(); clearInterval(guidedCapture?.timer); guidedCapture = null; captureLastStatus = {state: "idle"};
+        testSequenceTargets = []; renderTestTargets(); sendTestSequence(); break;
+      case "capture.resume":
+        requireIdleCapture();
+        if (!captureControl("resume")) throw new Error("Could not resume tracking.");
+        break;
+      case "movement.select": {
+        requireIdleCapture();
+        if (values.tokenId === null) {canvas.tokens.releaseAll(); clearMovementSelection(); break;}
+        const token = canvas.scene.tokens.get(values.tokenId);
+        if (!token || !miniForToken(token)) throw new Error("Choose a token assigned to a mini.");
+        if (movementState?.tokenId === values.tokenId) break;
+        canvas.tokens.get(values.tokenId)?.control?.({releaseOthers: true});
+        if (movementState?.tokenId !== values.tokenId) selectMovementToken(token);
+        break;
+      }
+      case "movement.undo":
+        requireIdleCapture(); if (!movementState?.segments.length) throw new Error("There is no movement to undo.");
+        await undoSelectedMovement(); break;
+      case "movement.reset":
+        requireIdleCapture(); if (!movementState) throw new Error("Select a mini first.");
+        resetSelectedMovement(); break;
+      case "assignment.save": requireIdleCapture(); assignMiniFromDesktop(values); break;
+      case "token.create": actionResult = await createDesktopToken(values, requireCurrent); break;
+      case "assignment.cancel":
+        if (assignmentRequests.length) sendToPython({type: "assignMiniResult", ...assignmentRequests.shift(), tokenId: null, actorId: null, cancelled: true});
+        break;
+      case "lifecycle.reload": requireIdleCapture(); reload = true; break;
+      case "lifecycle.setPaused":
+        requireIdleCapture();
+        if (typeof values.paused !== "boolean") throw new Error("Choose an absolute pause state.");
+        if (typeof game.togglePause !== "function") throw new Error("This Foundry version cannot change pause state.");
+        await game.togglePause(values.paused, {broadcast: true});
+        requireCurrent();
+        if (Boolean(game.paused) !== values.paused) throw new Error("Foundry did not confirm the requested pause state.");
+        break;
+    }
+    requireCurrent();
+    sendToPython({type: "vttResult", requestId: data.requestId, success: true,
+      message: actionResult ? `Created ${actionResult.name}.` : "VTT controls updated.",
+      ...(actionResult ? {result: actionResult} : {}), state: vttState()});
+    completed = true;
+  } catch (err) {
+    if (current()) sendToPython({type: "vttResult", requestId: data.requestId, success: false,
+      message: String(err?.message ?? err), state: vttState()});
+  } finally {sendVttState();}
+  if (completed && current() && reload) setTimeout(() => {if (current() && !captureIsActive()) window.location.reload();}, 100);
+}
+
+function physicalGridSettings() {
+  return Object.fromEntries(Object.keys(PHYSICAL_GRID_LIMITS)
+    .map(key => [key, Number(getSetting(key))]));
+}
+
+function physicalGridState() {
+  return {
+    type: "physicalGridState",
+    supported: true,
+    ready: calculatePhysicalGridScale() !== null,
+    sceneId: canvas?.scene?.id ?? null,
+    settings: physicalGridSettings(),
+  };
+}
+
+function sendPhysicalGridState() {
+  // A get/reconnect during persistence must not publish half of a desktop edit.
+  if (physicalGridSettingsBatch) return;
+  sendToPython(physicalGridState());
+}
+
+async function physicalGridSettingsChanged() {
+  if (physicalGridSettingsBatch) return;
+  try {
+    await applyPhysicalGridScale({animate: false});
+  } finally {
+    sendPhysicalGridState();
+    sendVttState();
+  }
+}
+
+async function setPhysicalGridFromPython(data, socket = ws) {
+  const connectionIsCurrent = () => socket === ws && socket?.readyState === WebSocket.OPEN;
+  const reply = (success, message) => connectionIsCurrent() && sendToPython({
+    ...physicalGridState(), type: "physicalGridResult", requestId: data.requestId,
+    success, message,
+  });
+  if (!connectionIsCurrent()) return;
+  const settings = data.settings;
+  if (typeof data.requestId !== "string" || !data.requestId
+      || !settings || typeof settings !== "object" || Array.isArray(settings)
+      || (data.apply !== undefined && typeof data.apply !== "boolean")) {
+    reply(false, "Invalid physical grid request.");
+    return;
+  }
+  const entries = Object.entries(settings);
+  if (entries.some(([key, value]) => {
+    const limits = PHYSICAL_GRID_LIMITS[key];
+    return !Object.hasOwn(PHYSICAL_GRID_LIMITS, key) || typeof value !== "number"
+      || !Number.isFinite(value) || value < limits[0] || value > limits[1];
+  })) {
+    reply(false, "Physical grid settings are outside the supported range.");
+    return;
+  }
+  if (captureIsActive()) {
+    reply(false, "Finish guided capture before resizing the physical grid.");
+    return;
+  }
+  if (!canvas?.ready || !canvas.scene || calculatePhysicalGridScale() === null) {
+    reply(false, "Open a Foundry scene before resizing the physical grid.");
+    return;
+  }
+  if (data.sceneId !== undefined && data.sceneId !== canvas.scene.id) {
+    reply(false, "The Foundry scene changed. Refresh and try again.");
+    return;
+  }
+
+  const sceneId = canvas.scene.id;
+  const previous = physicalGridSettings();
+  const changed = entries.filter(([key, value]) => previous[key] !== value);
+  let attemptedApply = false;
+  let finishBatch;
+  physicalGridBatchSettled = new Promise(resolve => {finishBatch = resolve;});
+  const requireCurrentContext = () => {
+    if (!connectionIsCurrent()) {
+      throw new Error("The Sarween connection changed before grid resizing finished.");
+    }
+    if (!canvas?.ready || canvas.scene?.id !== sceneId) {
+      throw new Error("The Foundry scene changed before grid resizing finished.");
+    }
+    if (captureIsActive()) {
+      throw new Error("Guided capture started before grid resizing finished.");
+    }
+  };
+  physicalGridSettingsBatch = true;
+  try {
+    for (const [key, value] of changed) {
+      requireCurrentContext();
+      await game.settings.set(MODULE_ID, key, value);
+    }
+    requireCurrentContext();
+    if (data.apply !== false) {
+      attemptedApply = true;
+      if (!await applyPhysicalGridScale({animate: false})) {
+        throw new Error("Foundry could not apply the physical grid size.");
+      }
+      requireCurrentContext();
+      sendSceneAndView();
+    }
+    reply(true, data.apply === false ? "Physical grid settings saved." : "Physical grid size applied.");
+  } catch (err) {
+    // A failed settings write must not leave a partly applied desktop edit.
+    let restored = true;
+    for (const [key] of changed) {
+      try { await game.settings.set(MODULE_ID, key, previous[key]); }
+      catch { restored = false; }
+    }
+    if (attemptedApply && canvas?.ready && canvas.scene?.id === sceneId) {
+      try {
+        if (!await applyPhysicalGridScale({animate: false})) restored = false;
+        sendSceneAndView();
+      }
+      catch { restored = false; }
+    }
+    reply(false, restored ? "Physical grid update failed. Previous settings restored."
+      : "Physical grid update failed. Check the current Foundry grid settings.");
+    warn("Physical grid update failed:", err);
+  } finally {
+    physicalGridSettingsBatch = false;
+    finishBatch();
+    sendPhysicalGridState();
+    sendVttState();
+  }
 }
 
 function calculatePhysicalGridScale() {
@@ -84,7 +653,7 @@ async function applyPhysicalGridScale({animate = true, notify = false} = {}) {
     scale,
   };
   if (animate) await canvas.animatePan({...position, duration: 250});
-  else canvas.pan(position);
+  else await canvas.pan(position);
 
   log(`Applied physical grid scale ${scale.toFixed(4)}`);
   if (notify) {
@@ -92,11 +661,6 @@ async function applyPhysicalGridScale({animate = true, notify = false} = {}) {
     ui.notifications?.info(`Sarween: grid set to ${inches.toFixed(2)} inches per square.`);
   }
   return true;
-}
-
-function updateGridSizeInput() {
-  const input = statusEl?.querySelector("#sarween-grid-inches");
-  if (input) input.value = Number(getSetting("targetGridInches")).toFixed(2);
 }
 
 function removeViewportMarkers() {
@@ -145,138 +709,120 @@ function renderViewportMarkers() {
   document.body.appendChild(markerOverlayEl);
 }
 
-function updateMarkerToggleButton() {
-  const button = statusEl?.querySelector("#sarween-marker-toggle-btn");
-  if (!button) return;
-  const enabled = Boolean(getSetting("viewportMarkersEnabled"));
-  button.setAttribute("aria-pressed", String(enabled));
-  button.style.background = enabled
-    ? "rgba(80, 180, 120, 0.42)"
-    : "rgba(255,255,255,0.10)";
-}
-
-async function toggleViewportMarkers() {
-  await game.settings.set(
-    MODULE_ID,
-    "viewportMarkersEnabled",
-    !getSetting("viewportMarkersEnabled"),
-  );
-}
-
-function readStatusPanelPosition() {
-  try {
-    const value = JSON.parse(String(getSetting("statusPanelPosition") || ""));
-    if (Number.isFinite(value?.x) && Number.isFinite(value?.y)) return value;
-  } catch (_error) {
-    // An empty or outdated saved position simply uses the default placement.
-  }
-  return null;
-}
-
-function clampStatusPanelPosition(x, y) {
-  const margin = 8;
-  const width = statusEl?.offsetWidth ?? 0;
-  const height = statusEl?.offsetHeight ?? 0;
-  return {
-    x: Math.clamp(Number(x) || margin, margin, Math.max(margin, window.innerWidth - width - margin)),
-    y: Math.clamp(Number(y) || margin, margin, Math.max(margin, window.innerHeight - height - margin)),
-  };
-}
-
-function defaultStatusPanelPosition() {
-  const markerSize = Number(getSetting("viewportMarkerSize")) || 120;
-  const markerInset = Number(getSetting("viewportMarkerInset")) || 8;
-  if (window.innerWidth < markerInset + markerSize + 12 + (statusEl?.offsetWidth ?? 0)) {
-    return clampStatusPanelPosition(8, window.innerHeight - markerInset - markerSize - 12 - (statusEl?.offsetHeight ?? 0));
-  }
-  return clampStatusPanelPosition(
-    markerInset + markerSize + 12,
-    window.innerHeight - (statusEl?.offsetHeight ?? 0) - 10,
-  );
-}
-
-function applyStatusPanelPosition() {
-  if (!statusEl) return;
-  const position = readStatusPanelPosition() ?? defaultStatusPanelPosition();
-  const clamped = clampStatusPanelPosition(position.x, position.y);
-  statusEl.style.left = `${clamped.x}px`;
-  statusEl.style.top = `${clamped.y}px`;
-  statusEl.style.right = "auto";
-  statusEl.style.bottom = "auto";
-  statusEl.style.transform = "none";
-}
-
-async function saveStatusPanelPosition() {
-  if (!statusEl) return;
-  const rect = statusEl.getBoundingClientRect();
-  const position = clampStatusPanelPosition(rect.left, rect.top);
-  await game.settings.set(
-    MODULE_ID,
-    "statusPanelPosition",
-    JSON.stringify(position),
-  );
-}
-
-function enableStatusPanelDragging() {
-  const handle = statusEl?.querySelector("#sarween-drag-handle");
-  if (!handle) return;
-  let drag = null;
-
-  handle.addEventListener("pointerdown", event => {
-    if (event.button !== 0) return;
-    const rect = statusEl.getBoundingClientRect();
-    drag = {
-      pointerId: event.pointerId,
-      startX: event.clientX,
-      startY: event.clientY,
-      panelX: rect.left,
-      panelY: rect.top,
-    };
-    handle.setPointerCapture(event.pointerId);
-    event.preventDefault();
-  });
-
-  handle.addEventListener("pointermove", event => {
-    if (!drag || event.pointerId !== drag.pointerId) return;
-    const position = clampStatusPanelPosition(
-      drag.panelX + event.clientX - drag.startX,
-      drag.panelY + event.clientY - drag.startY,
-    );
-    statusEl.style.left = `${position.x}px`;
-    statusEl.style.top = `${position.y}px`;
-  });
-
-  const finishDrag = event => {
-    if (!drag || event.pointerId !== drag.pointerId) return;
-    drag = null;
-    try {
-      handle.releasePointerCapture(event.pointerId);
-    } catch (_error) {
-      // Pointer capture may already be released if the window lost focus.
-    }
-    void saveStatusPanelPosition();
-  };
-  handle.addEventListener("pointerup", finishDrag);
-  handle.addEventListener("pointercancel", finishDrag);
-}
-
-function columnName(index) {
-  let value = Number(index) + 1;
-  let name = "";
-  while (value > 0) {
-    value -= 1;
-    name = String.fromCharCode(65 + (value % 26)) + name;
-    value = Math.floor(value / 26);
-  }
-  return name;
-}
-
-function canvasPointToClient(x, y) {
-  const transform = canvas.stage.worldTransform;
+function canvasPointToClient(x, y, transform = canvas.stage.worldTransform) {
   return {
     x: transform.a * x + transform.c * y + transform.tx,
     y: transform.b * x + transform.d * y + transform.ty,
   };
+}
+
+function gridColumnName(column) {
+  let name = "";
+  for (let value = column + 1; value > 0; value = Math.floor((value - 1) / 26)) {
+    name = String.fromCharCode(65 + (value - 1) % 26) + name;
+  }
+  return name;
+}
+
+function gridLabelLayout() {
+  if (!getSetting("gridLabelsVisible") || !canvas?.ready || !canvas.scene
+      || Number(canvas.scene.grid?.type) !== 1) return null;
+  const width = Number(window.innerWidth), height = Number(window.innerHeight);
+  const grid = Number(canvas.scene.grid?.size);
+  const sceneWidth = Number(canvas.scene.width), sceneHeight = Number(canvas.scene.height);
+  const originX = Number(canvas.dimensions?.sceneX ?? 0) + Number(canvas.scene.grid?.shiftX ?? 0);
+  const originY = Number(canvas.dimensions?.sceneY ?? 0) + Number(canvas.scene.grid?.shiftY ?? 0);
+  if (![width, height, grid, sceneWidth, sceneHeight].every(value => Number.isFinite(value) && value > 0)
+      || ![originX, originY].every(Number.isFinite)) return null;
+  const inverse = getClientToCanvasTransform();
+  if (!inverse || !Object.values(inverse).every(Number.isFinite)) return null;
+  const determinant = inverse.a * inverse.d - inverse.b * inverse.c;
+  if (!Number.isFinite(determinant) || Math.abs(determinant) < 1e-12) return null;
+  // Invert the same client mapping used by tracking, including Foundry's native
+  // client-coordinate conversion when the canvas has a CSS offset or scale.
+  const forward = {
+    a: inverse.d / determinant, b: -inverse.b / determinant,
+    c: -inverse.c / determinant, d: inverse.a / determinant,
+    tx: (inverse.c * inverse.ty - inverse.d * inverse.tx) / determinant,
+    ty: (inverse.b * inverse.tx - inverse.a * inverse.ty) / determinant,
+  };
+  const corners = [[0, 0], [width, 0], [width, height], [0, height]].map(([x, y]) => ({
+    x: inverse.a * x + inverse.c * y + inverse.tx,
+    y: inverse.b * x + inverse.d * y + inverse.ty,
+  }));
+  const firstColumn = Math.max(0, Math.floor((Math.min(...corners.map(point => point.x)) - originX) / grid));
+  const lastColumn = Math.min(Math.ceil(sceneWidth / grid) - 1,
+    Math.floor((Math.max(...corners.map(point => point.x)) - originX) / grid));
+  const firstRow = Math.max(0, Math.floor((Math.min(...corners.map(point => point.y)) - originY) / grid));
+  const lastRow = Math.min(Math.ceil(sceneHeight / grid) - 1,
+    Math.floor((Math.max(...corners.map(point => point.y)) - originY) / grid));
+  if (firstColumn > lastColumn || firstRow > lastRow) return null;
+  const columns = lastColumn - firstColumn + 1, rows = lastRow - firstRow + 1;
+  const count = columns * rows;
+  const stride = Math.max(1, Math.ceil(Math.sqrt(count / MAX_GRID_LABELS)),
+    Math.ceil(columns / MAX_GRID_LABELS), Math.ceil(rows / MAX_GRID_LABELS));
+  const labels = [];
+  // Keep a consistent sampling lattice when an extreme zoom-out needs fewer
+  // labels. Normal tabletop views label every visible square.
+  for (let row = Math.ceil(firstRow / stride) * stride; row <= lastRow; row += stride) {
+    for (let column = Math.ceil(firstColumn / stride) * stride; column <= lastColumn; column += stride) {
+      const point = canvasPointToClient(originX + (column + .04) * grid,
+        originY + (row + .04) * grid, forward);
+      if (point.x < 0 || point.y < 0 || point.x > width - 8 || point.y > height - 12) continue;
+      labels.push({text: `${gridColumnName(column)}${row + 1}`, x: point.x, y: point.y});
+      if (labels.length >= MAX_GRID_LABELS) return {width, height, labels};
+    }
+  }
+  return {width, height, labels};
+}
+
+function removeGridLabels() {
+  gridLabelOverlayEl?.remove();
+  gridLabelOverlayEl = null;
+}
+
+function renderGridLabels() {
+  const layout = gridLabelLayout();
+  if (!layout || !layout.labels.length) {removeGridLabels(); return;}
+  if (!gridLabelOverlayEl) {
+    gridLabelOverlayEl = document.createElement("canvas");
+    gridLabelOverlayEl.id = "sarween-grid-labels";
+    gridLabelOverlayEl.setAttribute("aria-hidden", "true");
+    gridLabelOverlayEl.style.cssText = "position:fixed;inset:0;z-index:9997;pointer-events:none;user-select:none;";
+    document.body.appendChild(gridLabelOverlayEl);
+  }
+  const ratio = Math.min(2, Math.max(1, Number(window.devicePixelRatio) || 1));
+  const pixelWidth = Math.ceil(layout.width * ratio), pixelHeight = Math.ceil(layout.height * ratio);
+  if (gridLabelOverlayEl.width !== pixelWidth) gridLabelOverlayEl.width = pixelWidth;
+  if (gridLabelOverlayEl.height !== pixelHeight) gridLabelOverlayEl.height = pixelHeight;
+  gridLabelOverlayEl.style.width = `${layout.width}px`;
+  gridLabelOverlayEl.style.height = `${layout.height}px`;
+  const context = gridLabelOverlayEl.getContext("2d");
+  if (!context) {removeGridLabels(); return;}
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  context.clearRect(0, 0, layout.width, layout.height);
+  context.font = "10px sans-serif";
+  context.textBaseline = "top";
+  context.lineWidth = 2;
+  context.strokeStyle = "rgba(0,0,0,.7)";
+  context.fillStyle = "rgba(255,255,255,.72)";
+  for (const label of layout.labels) {
+    context.strokeText(label.text, label.x, label.y);
+    context.fillText(label.text, label.x, label.y);
+  }
+}
+
+function gridLabelsChanged() {
+  renderGridLabels();
+  sendToPython({type: "sceneVisualChanged", reason: "gridLabelsChanged"});
+}
+
+function scheduleGridLabelRender() {
+  if (gridLabelRenderTimer) return;
+  gridLabelRenderTimer = setTimeout(() => {
+    gridLabelRenderTimer = null;
+    renderGridLabels();
+  }, 50);
 }
 
 function visibleGridBounds({safeForCapture = false} = {}) {
@@ -329,64 +875,6 @@ function visibleGridBounds({safeForCapture = false} = {}) {
       Math.floor((Math.max(...ys) - originY) / gridSize) - 1,
     ),
   };
-}
-
-function generateTwoMiniTestSequence() {
-  const bounds = visibleGridBounds();
-  if (!bounds || bounds.lastColumn < bounds.firstColumn || bounds.lastRow < bounds.firstRow) {
-    return [];
-  }
-
-  const routes = {
-    A: {
-      ringColor: "red",
-      pattern: [
-        [0.18, 0.20],
-        [0.52, 0.50],
-        [0.80, 0.76],
-        [0.78, 0.22],
-        [0.20, 0.78],
-      ],
-    },
-    B: {
-      ringColor: "blue",
-      pattern: [
-        [0.77, 0.73],
-        [0.54, 0.50],
-        [0.15, 0.20],
-        [0.80, 0.69],
-        [0.23, 0.78],
-      ],
-    },
-  };
-  const routeTargets = {};
-  for (const [route, definition] of Object.entries(routes)) {
-    routeTargets[route] = definition.pattern.map(([xFraction, yFraction], index) => {
-      const column = Math.round(
-        bounds.firstColumn
-        + (bounds.lastColumn - bounds.firstColumn) * xFraction,
-      );
-      const row = Math.round(
-        bounds.firstRow
-        + (bounds.lastRow - bounds.firstRow) * yFraction,
-      );
-      return {
-        route,
-        ringColor: definition.ringColor,
-        step: index + 1,
-        label: `${route}${index + 1}`,
-        row,
-        column,
-        cell: `${columnName(column)}${row + 1}`,
-      };
-    });
-  }
-
-  const targets = [];
-  for (let index = 0; index < 5; index += 1) {
-    targets.push(routeTargets.A[index], routeTargets.B[index]);
-  }
-  return targets;
 }
 
 function removeTestTargets() {
@@ -473,43 +961,12 @@ function sendTestSequence() {
   });
 }
 
-function updateTestTargetButton() {
-  const button = statusEl?.querySelector("#sarween-two-mini-test-btn");
-  if (!button) return;
-  const enabled = testSequenceTargets.length > 0;
-  button.setAttribute("aria-pressed", String(enabled));
-  button.style.background = enabled
-    ? "rgba(217, 70, 239, 0.42)"
-    : "rgba(255,255,255,0.10)";
-}
-
-function toggleTestTargets() {
-  testSequenceTargets = testSequenceTargets.length
-    ? []
-    : generateTwoMiniTestSequence();
-  renderTestTargets();
-  updateTestTargetButton();
-  sendTestSequence();
-  if (testSequenceTargets.length) {
-    const sequence = testSequenceTargets
-      .map(target => `${target.label ?? target.step}:${target.cell}`)
-      .join("  ");
-    ui.notifications?.info(`Sarween test sequence: ${sequence}`);
-  }
-}
-
 function scheduleTestTargetRender() {
   if (testTargetRenderTimer) clearTimeout(testTargetRenderTimer);
   testTargetRenderTimer = setTimeout(() => {
     testTargetRenderTimer = null;
     renderTestTargets();
   }, 100);
-}
-
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, character => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  })[character]);
 }
 
 function captureControl(action, values = {}) {
@@ -522,10 +979,10 @@ function captureDelay(seconds, label, callback) {
   guidedCapture.waiting = true;
   guidedCapture.phase = label;
   guidedCapture.seconds = seconds;
-  renderCapturePanel();
+  publishCaptureState();
   guidedCapture.timer = setInterval(() => {
     guidedCapture.seconds = Math.max(0, Math.ceil((end - Date.now()) / 1000));
-    renderCapturePanel();
+    publishCaptureState();
     if (Date.now() >= end) {
       clearInterval(guidedCapture.timer);
       guidedCapture.timer = null;
@@ -548,7 +1005,7 @@ function promptCaptureTarget() {
   renderTestTargets();
   sendTestSequence();
   captureControl("prompt", {index: target.index});
-  renderCapturePanel();
+  publishCaptureState();
 }
 
 function stopGuidedCapture(reason = "userStopped") {
@@ -558,165 +1015,19 @@ function stopGuidedCapture(reason = "userStopped") {
   guidedCapture.phase = "Saving";
   guidedCapture.seconds = 0;
   captureControl("stop", {reason});
-  renderCapturePanel();
+  publishCaptureState();
 }
 
-function renderCapturePanel() {
-  if (!capturePanelEl) {
-    capturePanelEl = document.createElement("section");
-    capturePanelEl.id = "sarween-capture";
-    capturePanelEl.style.cssText = `position:fixed;left:144px;bottom:64px;z-index:10000;
-      width:340px;max-width:calc(100vw - 16px);box-sizing:border-box;padding:12px;
-      background:#202020;color:#fff;border:1px solid #666;border-radius:6px;
-      font:13px sans-serif;line-height:1.4;`;
-    document.body.appendChild(capturePanelEl);
-    const bar = statusEl?.getBoundingClientRect();
-    if (bar) {
-      capturePanelEl.style.left = `${bar.left}px`;
-      capturePanelEl.style.bottom = `${window.innerHeight - bar.top + 12}px`;
-    }
-  }
-  const target = guidedCapture?.targets[guidedCapture.index];
-  const active = Boolean(guidedCapture?.recording);
-  const saved = captureLastStatus.state === "saved";
-  const heading = guidedCapture?.phase === "placement" && target
-    ? `${target.label} · ${target.tokenName} · ${target.cell}`
-    : `${guidedCapture?.phase ?? (saved ? "Recording saved" : "Capture paused")}${guidedCapture?.seconds ? ` · ${guidedCapture.seconds}s` : ""}`;
-  capturePanelEl.innerHTML = `
-    <header style="display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:move">
-      <i class="fas fa-grip-vertical" aria-hidden="true"></i><strong style="flex:1">Dataset capture</strong>
-      <button data-action="close" title="Hide capture panel" style="width:26px;padding:2px"><i class="fas fa-times"></i></button>
-    </header>
-    <div style="font-size:18px;line-height:1.3;overflow-wrap:anywhere">${escapeHtml(heading)}</div>
-    <div style="margin:6px 0;color:#ccc">${guidedCapture ? `${Math.min(guidedCapture.index, guidedCapture.targets.length)}/${guidedCapture.targets.length} placements confirmed` : ""}</div>
-    <div style="color:#e5b4df;overflow-wrap:anywhere">${escapeHtml(guidedCapture?.message ?? (saved ? "Tracking predictions remain paused" : ""))}</div>
-    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
-      <button data-action="placed" ${!active || guidedCapture.waiting ? "disabled" : ""}><i class="fas fa-check"></i> Placed</button>
-      <button data-action="stop" ${!active ? "disabled" : ""} title="Save a partial recording"><i class="fas fa-stop"></i> Finish</button>
-      ${!active ? '<button data-action="new"><i class="fas fa-video"></i> New capture</button><button data-action="resume"><i class="fas fa-play"></i> Resume tracking</button>' : ""}
-    </div>`;
-  const panelRect = capturePanelEl.getBoundingClientRect();
-  capturePanelEl.style.left = `${Math.clamp(panelRect.left, 8, Math.max(8, window.innerWidth - panelRect.width - 8))}px`;
-  if (panelRect.top < 8 || panelRect.bottom > window.innerHeight - 8) {
-    capturePanelEl.style.top = `${Math.clamp(panelRect.top, 8, Math.max(8, window.innerHeight - panelRect.height - 8))}px`;
-    capturePanelEl.style.bottom = "auto";
-  }
-  capturePanelEl.querySelector('[data-action="placed"]').onclick = () => {
-    if (!target || guidedCapture.waiting) return;
-    guidedCapture.waiting = true;
-    guidedCapture.message = "Confirming placement…";
-    if (!captureControl("confirm", {index: target.index})) {
-      guidedCapture.message = "Connection lost; recording will be saved as partial";
-    }
-    renderCapturePanel();
-  };
-  capturePanelEl.querySelector('[data-action="stop"]').onclick = () => stopGuidedCapture();
-  capturePanelEl.querySelector('[data-action="close"]').onclick = () => {
-    capturePanelEl.remove();
-    capturePanelEl = null;
-  };
-  capturePanelEl.querySelector('[data-action="new"]')?.addEventListener("click", () => openCaptureSetup());
-  capturePanelEl.querySelector('[data-action="resume"]')?.addEventListener("click", () => captureControl("resume"));
-  // Keep the compact tool draggable without moving Foundry's canvas.
-  const header = capturePanelEl.querySelector("header");
-  header.onpointerdown = event => {
-    if (event.target.closest("button")) return;
-    const panel = capturePanelEl;
-    const rect = panel.getBoundingClientRect();
-    const startX = event.clientX, startY = event.clientY;
-    header.setPointerCapture(event.pointerId);
-    header.onpointermove = move => {
-      panel.style.left = `${Math.clamp(rect.left + move.clientX - startX, 8, Math.max(8, window.innerWidth - panel.offsetWidth - 8))}px`;
-      panel.style.top = `${Math.clamp(rect.top + move.clientY - startY, 8, Math.max(8, window.innerHeight - panel.offsetHeight - 8))}px`;
-      panel.style.bottom = "auto";
-    };
-    header.onpointerup = () => { header.onpointermove = null; };
-    event.preventDefault();
-  };
-}
-
-function openCaptureSetup() {
-  if (guidedCapture?.recording || guidedCapture?.phase === "Starting") {
-    renderCapturePanel();
-    return;
-  }
-  if (!canvas?.ready || !ws || ws.readyState !== WebSocket.OPEN) {
-    ui.notifications?.warn("Connect Sarween and open a scene first.");
-    return;
-  }
-  const choices = listSceneTokenChoices(canvas.scene);
-  const rows = CAPTURE_MINIS.map(mini => {
-    const selected = choices.find(choice => choice.tokenName.toLowerCase() === mini.tokenName.toLowerCase());
-    return `<tr data-route="${mini.route}"><td><input type="checkbox" ${selected ? "checked" : ""}></td>
-      <td>${mini.route} · ${mini.tokenName}</td><td><select style="width:100%"><option value="">Choose token</option>
-      ${choices.map(choice => `<option value="${escapeHtml(choice.tokenId)}" ${choice === selected ? "selected" : ""}>${escapeHtml(choice.tokenName)}</option>`).join("")}</select></td></tr>`;
-  }).join("");
-  new Dialog({
-    title: "Sarween: Dataset capture",
-    content: `<form><table><thead><tr><th></th><th>Mini ring</th><th>Foundry token</th></tr></thead><tbody>${rows}</tbody></table>
-      <label>Fog / lighting label</label><select name="scenario"><option value="fog-on">Fog on</option><option value="fog-off">Fog off</option></select>
-      <label>Notes</label><input name="notes" type="text" maxlength="2000">
-      </form>`,
-    buttons: {
-      start: {label: "Start camera recording", icon: '<i class="fas fa-video"></i>', callback: html => {
-        try {
-          if (!getSetting("viewportMarkersEnabled")) throw new Error("Turn on the ArUco markers first");
-          if (Number(canvas.scene.grid?.type) !== 1) throw new Error("Dataset capture currently requires a square Foundry grid");
-          const root = html[0];
-          const participants = CAPTURE_MINIS.flatMap(mini => {
-            const row = root.querySelector(`[data-route="${mini.route}"]`);
-            if (!row.querySelector("input").checked) return [];
-            const tokenId = row.querySelector("select").value;
-            if (!tokenId) throw new Error(`Choose a token for ${mini.tokenName}`);
-            const token = canvas.scene.tokens.get(tokenId);
-            if (Number(token.width) !== 1 || Number(token.height) !== 1) throw new Error(`${mini.tokenName} must be a one-square token for this capture`);
-            return [{...mini, tokenId, sight: token.sight?.toObject?.() ?? token.sight}];
-          });
-          if (!participants.length) throw new Error("Choose at least one mini");
-          if (new Set(participants.map(mini => mini.tokenId)).size !== participants.length) throw new Error("Choose a different token for every mini");
-          const scenario = root.querySelector('[name="scenario"]').value;
-          if (scenario === "fog-on" && !canvas.scene.tokenVision) throw new Error("Enable Token Vision in the scene before a fog-on capture");
-          if (scenario === "fog-on") {
-            const blind = participants.find(mini => !mini.sight?.enabled || !mini.sight?.range);
-            if (blind) throw new Error(`Enable vision and a sight range for ${blind.tokenName}`);
-          }
-          const targets = generateCaptureTargets(visibleGridBounds({safeForCapture: true}), participants);
-          guidedCapture = {
-            sessionId: crypto.randomUUID(), sceneId: canvas.scene.id, participants, targets,
-            index: 0, recording: false, waiting: true, phase: "Starting", timer: null,
-            viewSignature: JSON.stringify(getClientToCanvasTransform()),
-            originalTokens: participants.map(mini => {
-              const token = canvas.scene.tokens.get(mini.tokenId);
-              return {id: token.id, x: token.x, y: token.y};
-            }),
-            originalControlIds: (canvas.tokens.controlled ?? []).map(token => token.id),
-          };
-          captureLastStatus = {state: "starting"};
-          canvas.tokens.releaseAll();
-          for (const mini of participants) canvas.tokens.get(mini.tokenId)?.control({releaseOthers: false});
-          sendSceneAndView();
-          if (!captureControl("start", {
-            ...guidedCapture, timer: undefined,
-            scenario, notes: root.querySelector('[name="notes"]').value,
-            moduleVersion: game.modules.get(MODULE_ID)?.version,
-            sceneVision: {tokenVision: canvas.scene.tokenVision, fogExploration: canvas.scene.fog?.exploration},
-            markerSettings: {size: getSetting("viewportMarkerSize"), inset: getSetting("viewportMarkerInset")},
-          })) throw new Error("Could not start capture: connection lost");
-          renderCapturePanel();
-        } catch (exc) {
-          guidedCapture = null;
-          ui.notifications?.error(`Sarween: ${exc.message}`);
-        }
-      }},
-      cancel: {label: "Cancel"},
-    },
-    default: "cancel",
-  }, {width: 460}).render(true);
+function publishCaptureState() {
+  sendVttState();
 }
 
 async function handleCaptureStatus(data) {
+  if (data.state !== "recording" && data.sessionId && guidedCapture
+      && data.sessionId !== guidedCapture.sessionId) return;
   if (data.state === "confirmed") {
-    if (!guidedCapture?.recording || data.sessionId !== guidedCapture.sessionId || data.index !== guidedCapture.index) return;
+    if (!guidedCapture?.recording || guidedCapture.phase !== "placement" || !guidedCapture.waiting
+        || data.sessionId !== guidedCapture.sessionId || data.index !== guidedCapture.index) return;
     const target = guidedCapture.targets[guidedCapture.index];
     try {
       if (canvas.scene?.id !== guidedCapture.sceneId) throw new Error("Scene changed");
@@ -747,14 +1058,15 @@ async function handleCaptureStatus(data) {
     }
     guidedCapture.recording = true;
     guidedCapture.message = "";
+    if (guidedCapture.phase === "Saving") {publishCaptureState(); return;}
     captureDelay(5, "Baseline · no physical minis", promptCaptureTarget);
   } else if (data.state === "saved") {
     clearInterval(guidedCapture?.timer);
     if (guidedCapture) {
-      guidedCapture.recording = false;
       guidedCapture.seconds = 0;
-      guidedCapture.phase = data.reason === "completed" ? "Recording saved" : "Partial recording saved";
+      guidedCapture.phase = "Restoring";
       guidedCapture.message = "Tracking predictions remain paused";
+      publishCaptureState();
       const originalScene = game.scenes?.get(guidedCapture.sceneId)
         ?? (canvas.scene?.id === guidedCapture.sceneId ? canvas.scene : null);
       for (const original of guidedCapture.originalTokens ?? []) {
@@ -767,6 +1079,8 @@ async function handleCaptureStatus(data) {
           }
         }
       }
+      guidedCapture.recording = false;
+      guidedCapture.phase = data.reason === "completed" ? "Recording saved" : "Partial recording saved";
       if (canvas.scene?.id === guidedCapture.sceneId) {
         canvas.tokens.releaseAll();
         for (const id of guidedCapture.originalControlIds ?? []) canvas.tokens.get(id)?.control({releaseOthers: false});
@@ -775,20 +1089,18 @@ async function handleCaptureStatus(data) {
     testSequenceTargets = [];
     renderTestTargets();
     sendTestSequence();
-    renderCapturePanel();
+    publishCaptureState();
   } else if (data.state === "error") {
     if (guidedCapture) {
       guidedCapture.message = data.message;
       guidedCapture.waiting = false;
       if (!guidedCapture.recording) guidedCapture.phase = "Capture not started";
     }
-    ui.notifications?.warn(`Sarween capture: ${data.message}`);
-    renderCapturePanel();
+    publishCaptureState();
   } else if (data.state === "idle") {
     if (guidedCapture?.phase === "Starting") return;
     guidedCapture = null;
-    capturePanelEl?.remove();
-    capturePanelEl = null;
+    sendVttState();
   }
 }
 
@@ -810,16 +1122,41 @@ function stopReferenceCapture() {
 }
 
 function captureRenderedReference() {
-  if (!canvas?.ready || !canvas.scene || ws?.readyState !== WebSocket.OPEN) return;
+  if (referenceCaptureBusy || !canvas?.ready || !canvas.scene || ws?.readyState !== WebSocket.OPEN) return false;
+  let target = null;
+  referenceCaptureBusy = true;
   try {
+    const renderer = canvas.app?.renderer;
+    const stage = canvas.app?.stage;
+    const width = Number(renderer?.screen?.width);
+    const height = Number(renderer?.screen?.height);
+    const resolution = Number(renderer?.resolution ?? 1);
+    if (!renderer?.render || !renderer?.extract?.canvas || !stage
+        || !globalThis.PIXI?.RenderTexture?.create
+        || ![width, height, resolution].every(Number.isFinite)
+        || width <= 0 || height <= 0 || resolution <= 0
+        || width * height * resolution * resolution > 33_554_432) {
+      throw new Error("The Foundry renderer cannot create a bounded viewport snapshot.");
+    }
+    const sceneId = canvas.scene.id;
+    const renderStartedAtEpochMs = Date.now();
+    // Render the actual application stage into an owned, screen-sized target.
+    // extract.canvas() without a target can read a browser-cleared framebuffer
+    // between animation frames. Extracting a DisplayObject directly instead
+    // uses its world bounds, losing the viewport crop and camera pan/zoom.
+    // The explicit texture keeps the stage transform, lighting and fog layers.
+    target = PIXI.RenderTexture.create({width, height, resolution});
+    renderer.render(stage, {renderTexture: target, clear: true});
+    const capturedAtEpochMs = Date.now();
     const viewTransform = buildViewTransformPayload();
-    if (!viewTransform) return;
-    // Extract the Foundry canvas, not the camera or DOM marker overlay. The
-    // registration rectangle makes its pixels correspond to the camera warp.
-    const source = canvas.app.renderer.extract.canvas();
-    const registration = getViewportRegistration();
-    const scaleX = source.width / window.innerWidth;
-    const scaleY = source.height / window.innerHeight;
+    if (!viewTransform || canvas.scene.id !== sceneId) return false;
+    const source = renderer.extract.canvas(target);
+    const registration = viewTransform.registration;
+    const scaleX = source.width / viewTransform.viewportWidth;
+    const scaleY = source.height / viewTransform.viewportHeight;
+    if (!source.width || !source.height || ![scaleX, scaleY].every(Number.isFinite)) {
+      throw new Error("Foundry returned an empty viewport snapshot.");
+    }
     const snapshot = document.createElement("canvas");
     snapshot.width = 640;
     snapshot.height = 360;
@@ -832,19 +1169,43 @@ function captureRenderedReference() {
     );
     sendToPython({
       type: "renderedReference",
-      sceneId: canvas.scene.id,
+      sceneId,
       viewTransform,
+      capture: {
+        schemaVersion: 1,
+        method: "pixi-stage-render-texture-v1",
+        sessionId: referenceCaptureSessionId ??= crypto.randomUUID(),
+        sequence: ++referenceCaptureSequence,
+        renderStartedAtEpochMs,
+        capturedAtEpochMs,
+        durationMs: Date.now() - renderStartedAtEpochMs,
+        sourceWidth: source.width,
+        sourceHeight: source.height,
+        rendererResolution: resolution,
+        viewportWidth: width,
+        viewportHeight: height,
+      },
       image: snapshot.toDataURL("image/jpeg", 0.7),
     });
+    referenceCaptureErrors = 0;
+    return true;
   } catch (err) {
-    stopReferenceCapture();
+    referenceCaptureErrors++;
+    if (referenceCaptureErrors >= 3) stopReferenceCapture();
+    sendToPython({type: "renderedReferenceStatus", state: "error",
+      message: String(err?.message ?? err), stopped: referenceCaptureErrors >= 3});
     warn("Could not capture a rendered reference; video recording will continue:", err);
+    return false;
+  } finally {
+    try { target?.destroy(true); }
+    finally { referenceCaptureBusy = false; }
   }
 }
 
 function setReferenceCapture(enabled) {
   stopReferenceCapture();
   if (enabled) {
+    referenceCaptureErrors = 0;
     captureRenderedReference();
     referenceCaptureTimer = setInterval(captureRenderedReference, 2000);
   }
@@ -882,13 +1243,16 @@ function getClientToCanvasTransform() {
 }
 
 function buildViewTransformPayload(type = "viewTransform") {
-  if (!canvas?.ready || !canvas.scene || !getSetting("viewportMarkersEnabled")) return null;
+  // Paper markers still need the viewport-to-scene transform when LCD marker
+  // drawings are hidden. Drawing visibility must not stop registration data.
+  if (!canvas?.ready || !canvas.scene) return null;
   const transform = canvas.stage.worldTransform;
   const dimensions = canvas.dimensions;
   return {
     type,
     sceneId: canvas.scene.id,
     viewportMarkerMode: true,
+    viewportMarkersVisible: Boolean(getSetting("viewportMarkersEnabled")),
     markerIds: VIEWPORT_MARKER_IDS,
     viewportWidth: window.innerWidth,
     viewportHeight: window.innerHeight,
@@ -918,6 +1282,72 @@ function sendSceneAndView() {
   const scene = buildSceneInfoPayload(canvas?.scene);
   if (scene) sendToPython(scene);
   sendViewTransform();
+}
+
+function cancelPendingSceneVisualChange() {
+  if (!pendingSceneVisualChange) return;
+  clearTimeout(pendingSceneVisualChange.fallbackTimer);
+  clearTimeout(pendingSceneVisualChange.refreshTimer);
+  pendingSceneVisualChange = null;
+}
+
+function visualChangeIsCurrent(change) {
+  return change.socket === ws && ws?.readyState === WebSocket.OPEN
+    && canvas?.ready && canvas.scene?.id === change.sceneId;
+}
+
+function flushSceneVisualChange(change) {
+  if (pendingSceneVisualChange !== change) return;
+  cancelPendingSceneVisualChange();
+  if (!visualChangeIsCurrent(change) || captureIsActive()) return;
+  const reasons = [...change.reasons], tokenIds = [...change.tokenIds];
+  sendToPython({
+    type: "sceneVisualChanged", sceneId: change.sceneId,
+    reason: reasons.includes("sarweenTokenMove") ? "sarweenTokenMove"
+      : reasons.length === 1 ? reasons[0] : "tokenVisualChanged",
+    reasons, tokenIds, ...(tokenIds.length === 1 ? {tokenId: tokenIds[0]} : {}),
+    sentAt: Date.now(),
+  });
+}
+
+function queueSceneVisualChange(reason, {sceneId = canvas?.scene?.id, tokenId = null, socket = ws} = {}) {
+  if (captureIsActive() || !sceneId || socket !== ws || socket?.readyState !== WebSocket.OPEN
+      || !canvas?.ready || canvas.scene?.id !== sceneId) return;
+  if (pendingSceneVisualChange && !visualChangeIsCurrent(pendingSceneVisualChange)) {
+    cancelPendingSceneVisualChange();
+  }
+  let created = false;
+  if (!pendingSceneVisualChange) {
+    const change = {sceneId, socket, reasons: new Set(), tokenIds: new Set(),
+      fallbackTimer: null, refreshTimer: null};
+    pendingSceneVisualChange = change;
+    created = true;
+  }
+  const change = pendingSceneVisualChange;
+  change.reasons.add(reason);
+  if (tokenId) change.tokenIds.add(tokenId);
+  // A later mutation needs its own perception refresh; an earlier refresh is
+  // no longer evidence that the final canvas state has been drawn.
+  clearTimeout(change.refreshTimer);
+  change.refreshTimer = null;
+  // A fixed deadline prevents an animated light's repeated refreshes from
+  // indefinitely postponing the notification for this known mutation.
+  if (created) change.fallbackTimer = setTimeout(() => flushSceneVisualChange(change), VISUAL_FALLBACK_MS);
+}
+
+function tokenVisualChanged(token, reason) {
+  const document = tokenDocument(token);
+  if (!document?.id) return;
+  const sceneId = document.parent?.id ?? document.scene?.id ?? canvas?.scene?.id;
+  queueSceneVisualChange(reason, {sceneId, tokenId: document.id});
+}
+
+function perceptionRefreshed() {
+  const change = pendingSceneVisualChange;
+  if (!change) return;
+  if (!visualChangeIsCurrent(change)) {cancelPendingSceneVisualChange(); return;}
+  clearTimeout(change.refreshTimer);
+  change.refreshTimer = setTimeout(() => flushSceneVisualChange(change), VISUAL_REFRESH_DELAY_MS);
 }
 
 function scheduleViewTransformSend() {
@@ -985,7 +1415,8 @@ function tokenMovementBudget(token) {
   const movement = document?.actor?.system?.attributes?.movement;
   const walk = Number(movement?.walk?.value ?? movement?.walk);
   if (Number.isFinite(walk) && walk > 0) return walk;
-  return Math.max(0, Number(getSetting("defaultMovementSpeed")) || 30);
+  const fallback = Number(getSetting("defaultMovementSpeed"));
+  return Number.isFinite(fallback) && fallback >= 0 ? fallback : 30;
 }
 
 function measureMovementFeet(from, to) {
@@ -1025,30 +1456,10 @@ function ensureMovementOverlay() {
   return movementOverlayEl;
 }
 
-function updateMovementStatusUI() {
-  const status = statusEl?.querySelector("#sarween-movement-status");
-  const undo = statusEl?.querySelector("#sarween-movement-undo");
-  const reset = statusEl?.querySelector("#sarween-movement-reset");
-  if (!status || !undo || !reset) return;
-  if (!movementState) {
-    status.hidden = true;
-    undo.hidden = true;
-    reset.hidden = true;
-    return;
-  }
-  const overage = movementOverage(movementState);
-  status.hidden = false;
-  undo.hidden = false;
-  reset.hidden = false;
-  status.textContent = overage > 0
-    ? `${movementState.label}: ${overage} ft over`
-    : `${movementState.label}: ${movementState.usedFeet}/${movementState.budgetFeet} ft`;
-  status.style.color = movementColor(movementState);
-  undo.disabled = movementState.segments.length === 0;
-}
+function publishMovementState() {sendVttState();}
 
 function renderMovementOverlay() {
-  updateMovementStatusUI();
+  publishMovementState();
   if (!movementState || !canvas?.ready) {
     movementOverlayEl?.remove();
     movementOverlayEl = null;
@@ -1122,7 +1533,7 @@ function togglePhysicalMiniSelection(miniId) {
   if (!getSetting("physicalTapSelection")) return;
   const token = tokenForMini(miniId);
   if (!token) {
-    ui.notifications?.warn(`Sarween: No Foundry token is assigned to ${miniId}.`);
+    void promptAssignMini(miniId);
     return;
   }
   const document = tokenDocument(token);
@@ -1159,17 +1570,16 @@ async function undoSelectedMovement() {
   if (!movementState) return;
   const undone = undoMovementPoint(movementState);
   if (!undone.point) return;
-  movementState = undone.state;
-  ignoredMovementUpdates.add(movementState.tokenId);
+  const tokenId = movementState.tokenId;
+  ignoredMovementUpdates.add(tokenId);
   try {
     await canvas.scene.updateEmbeddedDocuments(
       "Token",
-      [{_id: movementState.tokenId, x: undone.point.x, y: undone.point.y}],
+      [{_id: tokenId, x: undone.point.x, y: undone.point.y}],
       {animate: getSetting("animateTokenMovement")},
     );
-  } finally {
-    setTimeout(() => ignoredMovementUpdates.delete(movementState?.tokenId), 1000);
-  }
+    movementState = undone.state;
+  } finally {setTimeout(() => ignoredMovementUpdates.delete(tokenId), 1000);}
   renderMovementOverlay();
 }
 
@@ -1194,347 +1604,171 @@ Hooks.once("init", () => {
     MIN_CANVAS_ZOOM
   );
 
-  game.settings.register(MODULE_ID, "wsUrl", {
+  registerVttSetting("wsUrl", {
     name: "Python WebSocket URL",
     hint: "Where to connect for Sarween output. Default: ws://127.0.0.1:8765",
     scope: "world",
-    config: true,
+    config: false,
     type: String,
     default: "ws://127.0.0.1:8765"
   });
 
-  game.settings.register(MODULE_ID, "autoConnect", {
+  registerVttSetting("autoConnect", {
     name: "Auto-connect to Python",
     hint: "Automatically connect when the world loads. Reconnect automatically if the connection drops.",
     scope: "world",
-    config: true,
+    config: false,
     type: Boolean,
     default: true
   });
 
-  game.settings.register(MODULE_ID, "debug", {
+  registerVttSetting("debug", {
     name: "Enable debug logging",
     hint: "Log Sarween WebSocket events to the browser console.",
     scope: "client",
-    config: true,
+    config: false,
     type: Boolean,
     default: true
   });
 
-  game.settings.register(MODULE_ID, "physicalGridAutoApply", {
+  registerVttSetting("physicalGridAutoApply", {
     name: "Automatically apply physical grid size",
     hint: "Reapply Sarween's physical grid scale when a scene opens or the Foundry window changes size.",
     scope: "client",
-    config: true,
+    config: false,
     type: Boolean,
     default: true
   });
 
-  game.settings.register(MODULE_ID, "displayDiagonalInches", {
+  registerVttSetting("gridLabelsVisible", {
+    name: "Show grid cell labels on the map",
+    hint: "Show small A1-style labels in the top-left corner of visible grid squares.",
+    scope: "client",
+    config: false,
+    type: Boolean,
+    default: false,
+    onChange: gridLabelsChanged
+  });
+
+  registerVttSetting("displayDiagonalInches", {
     name: "Display diagonal (inches)",
     hint: "Physical diagonal of the TV or display showing the battle map.",
     scope: "client",
-    config: true,
+    config: false,
     type: Number,
     range: {min: 10, max: 150, step: 0.5},
     default: DEFAULT_DISPLAY_DIAGONAL_INCHES,
-    onChange: () => applyPhysicalGridScale({animate: false})
+    onChange: physicalGridSettingsChanged
   });
 
-  game.settings.register(MODULE_ID, "targetGridInches", {
+  registerVttSetting("targetGridInches", {
     name: "Grid square size (inches)",
     hint: "Desired physical size of each grid square on the display.",
     scope: "client",
-    config: true,
+    config: false,
     type: Number,
     range: {min: 0.25, max: 3, step: 0.05},
     default: DEFAULT_GRID_INCHES,
-    onChange: () => {
-      updateGridSizeInput();
-      applyPhysicalGridScale({animate: false});
-    }
+    onChange: physicalGridSettingsChanged
   });
 
-  game.settings.register(MODULE_ID, "physicalGridCalibration", {
+  registerVttSetting("physicalGridCalibration", {
     name: "Physical grid calibration",
     hint: "Fine adjustment after measuring a square with a ruler. Increase this value if squares are too small.",
     scope: "client",
-    config: true,
+    config: false,
     type: Number,
     range: {min: 0.5, max: 1.5, step: 0.005},
     default: 1,
-    onChange: () => applyPhysicalGridScale({animate: false})
+    onChange: physicalGridSettingsChanged
   });
 
-  game.settings.register(MODULE_ID, "viewportMarkersEnabled", {
+  registerVttSetting("viewportMarkersEnabled", {
     name: "Fixed viewport ArUco markers",
     hint: "Show four high-contrast registration markers above fog and keep them fixed while the map pans.",
     scope: "client",
-    config: true,
+    config: false,
     type: Boolean,
     default: true,
     onChange: () => {
       renderViewportMarkers();
-      updateMarkerToggleButton();
-      applyStatusPanelPosition();
       scheduleViewTransformSend();
     }
   });
 
-  game.settings.register(MODULE_ID, "viewportMarkerSize", {
+  registerVttSetting("viewportMarkerSize", {
     name: "Viewport marker size (pixels)",
     hint: "Displayed size including the white border. Increase this if the far markers are difficult for the camera to read.",
     scope: "client",
-    config: true,
+    config: false,
     type: Number,
     range: {min: 72, max: 240, step: 4},
     default: 120,
     onChange: () => {
       renderViewportMarkers();
-      applyStatusPanelPosition();
       scheduleViewTransformSend();
     }
   });
 
-  game.settings.register(MODULE_ID, "viewportMarkerInset", {
+  registerVttSetting("viewportMarkerInset", {
     name: "Viewport marker inset (pixels)",
     hint: "Distance between each marker plate and the edge of the Foundry window.",
     scope: "client",
-    config: true,
+    config: false,
     type: Number,
     range: {min: 0, max: 80, step: 2},
     default: 8,
     onChange: () => {
       renderViewportMarkers();
-      applyStatusPanelPosition();
       scheduleViewTransformSend();
     }
   });
 
-  game.settings.register(MODULE_ID, "animateTokenMovement", {
+  registerVttSetting("animateTokenMovement", {
     name: "Animate tracked token movement",
     hint: "Slide tracked tokens between squares instead of updating their position immediately.",
     scope: "client",
-    config: true,
+    config: false,
     type: Boolean,
     default: true
   });
 
-  game.settings.register(MODULE_ID, "physicalTapSelection", {
+  registerVttSetting("physicalTapSelection", {
     name: "Physical tap selects a mini",
     hint: "Let the overhead camera select or deselect a player mini after a short physical tap.",
     scope: "world",
-    config: true,
+    config: false,
     type: Boolean,
-    default: true
+    default: false
   });
 
-  game.settings.register(MODULE_ID, "defaultMovementSpeed", {
+  registerVttSetting("defaultMovementSpeed", {
     name: "Fallback movement speed (feet)",
     hint: "Used when the selected Foundry actor does not provide a walking speed.",
     scope: "world",
-    config: true,
+    config: false,
     type: Number,
     range: {min: 0, max: 120, step: 5},
     default: 30
   });
 
-  game.settings.register(MODULE_ID, "statusPanelPosition", {
-    name: "Sarween panel position",
-    scope: "client",
-    config: false,
-    type: String,
-    default: ""
+  registerVttSetting("foundryUIHidden", {
+    name: "Hide Foundry interface on the battle map",
+    scope: "client", config: false, type: Boolean, default: false,
+    onChange: applyFoundryUIVisibility,
   });
 
   console.log("sarween | Settings registered.");
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Status UI
+// Connection state
 // ──────────────────────────────────────────────────────────────────────────────
 
-function ensureStatusUI() {
-  if (statusEl) return;
-
-  statusEl = document.createElement("div");
-  statusEl.id = "sarween-status";
-  statusEl.style.cssText = `
-    position: fixed;
-    top: 8px;
-    left: 8px;
-    z-index: 10000;
-    font-family: sans-serif;
-    font-size: 12px;
-    background: rgba(0,0,0,0.75);
-    color: white;
-    padding: 8px 10px;
-    border-radius: 8px;
-    display: flex;
-    flex-wrap: wrap;
-    max-width: calc(100vw - 16px);
-    box-sizing: border-box;
-    align-items: center;
-    gap: 8px;
-    user-select: none;
-  `;
-
-  statusEl.innerHTML = `
-    <span id="sarween-drag-handle" title="Drag Sarween panel" style="
-      width: 14px;
-      height: 26px;
-      display: grid;
-      place-items: center;
-      color: rgba(255,255,255,0.72);
-      cursor: grab;
-      touch-action: none;
-    "><i class="fas fa-grip-vertical"></i></span>
-    <span id="sarween-dot" style="width:10px;height:10px;border-radius:50%;display:inline-block;background:#aa0000;"></span>
-    <span id="sarween-text">Sarween: Disconnected</span>
-    <label for="sarween-grid-inches" style="margin-left:6px;white-space:nowrap;">Grid</label>
-    <input id="sarween-grid-inches" type="number" min="0.25" max="3" step="0.05" style="
-      width: 52px;
-      padding: 3px 4px;
-      border: 1px solid rgba(255,255,255,0.25);
-      border-radius: 4px;
-      background: rgba(255,255,255,0.10);
-      color: white;
-    ">
-    <span>in</span>
-    <button id="sarween-grid-btn" type="button" title="Apply physical grid size" style="
-      width: 28px;
-      height: 26px;
-      padding: 0;
-      border-radius: 4px;
-      border: 1px solid rgba(255,255,255,0.25);
-      background: rgba(255,255,255,0.10);
-      color: white;
-      cursor: pointer;
-    "><i class="fas fa-ruler-horizontal"></i></button>
-    <button id="sarween-two-mini-test-btn" type="button" title="Guided one-to-five-mini dataset capture" aria-pressed="false" style="
-      width: 28px;
-      height: 26px;
-      padding: 0;
-      border-radius: 4px;
-      border: 1px solid rgba(255,255,255,0.25);
-      background: rgba(255,255,255,0.10);
-      color: white;
-      cursor: pointer;
-    "><i class="fas fa-users"></i></button>
-    <button id="sarween-marker-toggle-btn" type="button" title="Toggle ArUco corner markers" aria-pressed="true" style="
-      width: 28px;
-      height: 26px;
-      padding: 0;
-      border-radius: 4px;
-      border: 1px solid rgba(255,255,255,0.25);
-      background: rgba(80, 180, 120, 0.42);
-      color: white;
-      cursor: pointer;
-    "><i class="fas fa-qrcode"></i></button>
-    <span id="sarween-movement-status" hidden style="font-weight:700;white-space:nowrap;"></span>
-    <button id="sarween-movement-undo" type="button" hidden title="Undo last tracked movement" style="
-      width: 28px;
-      height: 26px;
-      padding: 0;
-      border-radius: 4px;
-      border: 1px solid rgba(255,255,255,0.25);
-      background: rgba(255,255,255,0.10);
-      color: white;
-      cursor: pointer;
-    "><i class="fas fa-rotate-left"></i></button>
-    <button id="sarween-movement-reset" type="button" hidden title="Reset movement from the current square" style="
-      width: 28px;
-      height: 26px;
-      padding: 0;
-      border-radius: 4px;
-      border: 1px solid rgba(255,255,255,0.25);
-      background: rgba(255,255,255,0.10);
-      color: white;
-      cursor: pointer;
-    "><i class="fas fa-arrows-rotate"></i></button>
-    <button id="sarween-btn" style="
-      margin-left: 6px;
-      padding: 3px 8px;
-      border-radius: 8px;
-      border: 1px solid rgba(255,255,255,0.25);
-      background: rgba(255,255,255,0.10);
-      color: white;
-      cursor: pointer;
-    ">Connect</button>
-  `;
-
-  document.body.appendChild(statusEl);
-  updateGridSizeInput();
-  updateTestTargetButton();
-  updateMarkerToggleButton();
-  applyStatusPanelPosition();
-  enableStatusPanelDragging();
-
-  const gridInput = statusEl.querySelector("#sarween-grid-inches");
-  const saveAndApplyGridSize = async () => {
-    const value = Math.clamp(Number(gridInput.value) || DEFAULT_GRID_INCHES, 0.25, 3);
-    await game.settings.set(MODULE_ID, "targetGridInches", value);
-  };
-  gridInput.addEventListener("change", saveAndApplyGridSize);
-  gridInput.addEventListener("keydown", event => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      saveAndApplyGridSize();
-      gridInput.blur();
-    }
-  });
-  statusEl.querySelector("#sarween-grid-btn").addEventListener("click", () => {
-    applyPhysicalGridScale({animate: true, notify: true});
-  });
-  statusEl.querySelector("#sarween-two-mini-test-btn").addEventListener("click", () => {
-    openCaptureSetup();
-  });
-  statusEl.querySelector("#sarween-marker-toggle-btn").addEventListener("click", () => {
-    void toggleViewportMarkers();
-  });
-  statusEl.querySelector("#sarween-movement-undo").addEventListener("click", () => {
-    void undoSelectedMovement();
-  });
-  statusEl.querySelector("#sarween-movement-reset").addEventListener("click", () => {
-    resetSelectedMovement();
-  });
-
-  statusEl.querySelector("#sarween-btn").addEventListener("click", () => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      disconnectFromPython("Manual disconnect");
-    } else {
-      manualDisconnect = false;
-      connectToPython();
-    }
-  });
-}
-
 function setStatus(state, extraText = "") {
-  ensureStatusUI();
-
-  const dot = statusEl.querySelector("#sarween-dot");
-  const text = statusEl.querySelector("#sarween-text");
-  const btn  = statusEl.querySelector("#sarween-btn");
-
-  const suffix = extraText ? ` (${extraText})` : "";
-
-  if (state === "connected") {
-    dot.style.background = "#00aa44";
-    text.textContent = "Sarween: Connected" + suffix;
-    btn.textContent = "Disconnect";
-  } else if (state === "connecting") {
-    dot.style.background = "#d4aa00";
-    text.textContent = "Sarween: Connecting" + suffix;
-    btn.textContent = "Disconnect";
-  } else if (state === "disconnected") {
-    dot.style.background = "#aa0000";
-    text.textContent = "Sarween: Disconnected" + suffix;
-    btn.textContent = "Connect";
-  } else if (state === "error") {
-    dot.style.background = "#aa0000";
-    text.textContent = "Sarween: Error" + suffix;
-    btn.textContent = "Connect";
-  }
+  connectionStatus = {state, message: extraText};
+  applyFoundryUIVisibility();
+  sendVttState();
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1559,96 +1793,19 @@ function listSceneTokenChoices(scene) {
   const tokens = (scene?.tokens ?? []).map(t => ({
     tokenId: t.id,
     tokenName: t.name || `(token ${t.id})`,
-    actorId: t.actorId || null
+    actorId: t.actorId || null,
+    width: Number(t.width ?? 1), height: Number(t.height ?? 1),
+    sightEnabled: Boolean(t.sight?.enabled), sightRange: Number(t.sight?.range ?? 0),
   }));
   tokens.sort((a, b) => (a.tokenName || "").localeCompare(b.tokenName || ""));
   return tokens;
 }
 
 async function promptAssignMini(miniId) {
-  const scene = canvas.scene;
-  if (!scene) {
-    ui.notifications?.warn("Sarween: No active scene to select tokens from.");
-    return;
+  if (!assignmentRequests.some(request => request.miniId === String(miniId))) {
+    assignmentRequests.push({miniId: String(miniId), sceneId: canvas?.scene?.id ?? null});
   }
-
-  const choices = listSceneTokenChoices(scene);
-  if (!choices.length) {
-    ui.notifications?.warn("Sarween: No tokens found on the current scene.");
-    return;
-  }
-
-  const optionsHtml = choices
-    .map(c => `<option value="${c.tokenId}">${c.tokenName}</option>`)
-    .join("\n");
-
-  return new Promise((resolve) => {
-    const content = `
-      <p><b>Assign scanned mini</b></p>
-      <p>Mini ID: <code>${miniId}</code></p>
-      <div style="margin-top:8px">
-        <label>Move which token?</label>
-        <select id="sarween-token-select" style="width:100%; margin-top:6px">
-          ${optionsHtml}
-        </select>
-      </div>
-      <p style="opacity:0.8; margin-top:10px">
-        Tip: put the token you want on the scene first.
-      </p>
-    `;
-
-    new Dialog({
-      title: "Sarween: Assign Mini → Token",
-      content,
-      buttons: {
-        assign: {
-          label: "Assign",
-          callback: (html) => {
-            const tokenId = html.find("#sarween-token-select").val();
-            const chosen = choices.find(c => c.tokenId === tokenId);
-
-            if (!tokenId || !chosen) {
-              ui.notifications?.warn("Sarween: No token selected.");
-              resolve(null);
-              return;
-            }
-            if (canvas.scene?.id !== scene.id) {
-              ui.notifications?.warn("Sarween: Scene changed; assign the mini in the active scene.");
-              resolve(null);
-              return;
-            }
-
-            sendToPython({
-              type: "assignMiniResult",
-              sceneId: scene.id,
-              miniId: String(miniId),
-              tokenId: chosen.tokenId,
-              actorId: chosen.actorId
-            });
-            miniTokenBindings.set(String(miniId), String(chosen.tokenId));
-
-            ui.notifications?.info(`Sarween: Assigned mini ${miniId} → ${chosen.tokenName}`);
-            resolve(chosen);
-          }
-        },
-        cancel: {
-          label: "Cancel",
-          callback: () => {
-            sendToPython({
-              type: "assignMiniResult",
-              sceneId: scene.id,
-              miniId: String(miniId),
-              tokenId: null,
-              actorId: null,
-              cancelled: true
-            });
-            resolve(null);
-          }
-        }
-      },
-      default: "assign"
-    }).render(true);
-  });
+  sendVttState();
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1692,10 +1849,13 @@ function buildSceneInfoPayload(scene) {
     scene.data?.img ??
     null;
 
-  const miniBindings = Object.fromEntries(CAPTURE_MINIS.flatMap(mini => {
+  const miniBindings = Object.fromEntries([...miniTokenBindings].filter(([_miniId, tokenId]) =>
+    (scene.tokens ?? []).some(token => token.id === tokenId)));
+  for (const mini of CAPTURE_MINIS) {
+    if (miniBindings[mini.miniId]) continue;
     const matches = (scene.tokens ?? []).filter(token => token.name?.toLowerCase() === mini.tokenName.toLowerCase());
-    return matches.length === 1 ? [[mini.miniId, matches[0].id]] : [];
-  }));
+    if (matches.length === 1) miniBindings[mini.miniId] = matches[0].id;
+  }
   for (const [miniId, tokenId] of Object.entries(miniBindings)) {
     miniTokenBindings.set(miniId, tokenId);
   }
@@ -1720,6 +1880,7 @@ function buildSceneInfoPayload(scene) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 function clearTimers() {
+  cancelPendingSceneVisualChange();
   if (heartbeatTimer) {
     clearInterval(heartbeatTimer);
     heartbeatTimer = null;
@@ -1732,18 +1893,6 @@ function clearTimers() {
 
 function scheduleReconnect(reason = "") {
   clearTimers();
-
-  if (manualDisconnect) {
-    log("Manual disconnect active; not scheduling reconnect.");
-    setStatus("disconnected", "manual");
-    return;
-  }
-
-  if (!getSetting("autoConnect")) {
-    log("Auto-connect disabled; not scheduling reconnect.");
-    setStatus("disconnected", "auto-connect off");
-    return;
-  }
 
   reconnectAttempts += 1;
   const base = 2000;
@@ -1764,12 +1913,45 @@ function scheduleReconnect(reason = "") {
 // Message handling
 // ──────────────────────────────────────────────────────────────────────────────
 
-async function handlePythonMessage(data) {
+function persistedTokenPosition(token) {
+  let source;
+  if (token && "_source" in token) source = token._source;
+  else if (typeof token?.toObject === "function") source = token.toObject(true);
+  // Lightweight document stand-ins expose their committed fields directly.
+  // Foundry Documents always provide source data; never substitute their
+  // prepared x/y, which Token animation changes on every rendered frame.
+  else if (token && (token.constructor?.name === "Object" || Object.getPrototypeOf(token) === null)) source = token;
+  if (!source || typeof source !== "object" || Array.isArray(source)
+      || !Number.isFinite(source.x) || !Number.isFinite(source.y)) {
+    throw new Error("Foundry token has no valid persisted position");
+  }
+  return {x: source.x, y: source.y};
+}
+
+async function handlePythonMessage(data, socket = ws) {
   if (data?.type !== "renderedReference") log("Received message from Python:", data);
 
   const { sceneId, tokenId, x, y, type } = data || {};
 
   if (type === "ping") return;
+  if (type === "vttGet") {
+    vttControlsRequested = true;
+    sendVttState({force: true});
+    return;
+  }
+  if (type === "vttCommand") {
+    vttControlsRequested = true;
+    await handleVttCommand(data, socket);
+    return;
+  }
+  if (type === "physicalGridGet") {
+    sendPhysicalGridState();
+    return;
+  }
+  if (type === "physicalGridSet") {
+    await setPhysicalGridFromPython(data, socket);
+    return;
+  }
   if (type === "referenceCapture") {
     setReferenceCapture(Boolean(data.enabled));
     return;
@@ -1819,15 +2001,20 @@ async function handlePythonMessage(data) {
   }
 
   if (type !== "moveToken") return;
-  const reply = (replyType, values = {}) => sendToPython({
-    type: replyType, commandId: data.commandId, miniId: data.miniId,
-    sceneId, tokenId, ...values,
-  });
+  const reply = (replyType, values = {}) => {
+    // The document update can finish after reconnect. Its old command must
+    // never acknowledge through the replacement connection.
+    if (socket !== ws || socket?.readyState !== WebSocket.OPEN) return false;
+    return sendToPython({
+      type: replyType, commandId: data.commandId, miniId: data.miniId,
+      sceneId, tokenId, ...values,
+    });
+  };
   if (!data.commandId || !sceneId || !tokenId || !Number.isFinite(x) || !Number.isFinite(y)) {
     reply("tokenMoveError", {error: "Invalid move command"});
     return;
   }
-  if (guidedCapture?.recording || guidedCapture?.phase === "Starting") {
+  if (captureIsActive()) {
     reply("tokenMoveError", {error: "Tracking is paused for guided capture"});
     return;
   }
@@ -1843,18 +2030,21 @@ async function handlePythonMessage(data) {
     return;
   }
 
+  let moved = false;
   try {
     const token = scene.tokens.get(tokenId);
+    const current = persistedTokenPosition(token);
     // A retry after a lost acknowledgement must not replay animation or budget.
-    if (token.x !== x || token.y !== y) {
+    if (current.x !== x || current.y !== y) {
       await scene.updateEmbeddedDocuments(
         "Token",
         [{ _id: tokenId, x, y }],
         { animate: getSetting("animateTokenMovement"), sarweenSource: data.source }
       );
+      moved = true;
     }
-    const applied = scene.tokens.get(tokenId);
-    if (applied?.x !== x || applied?.y !== y) {
+    const applied = persistedTokenPosition(scene.tokens.get(tokenId));
+    if (applied.x !== x || applied.y !== y) {
       throw new Error("Foundry did not apply the requested position");
     }
     reply("tokenMoveApplied", {x: applied.x, y: applied.y});
@@ -1864,15 +2054,7 @@ async function handlePythonMessage(data) {
     return;
   }
   log(`Moved token ${tokenId} to (${x}, ${y}) in scene ${scene.id}`);
-  setTimeout(() => {
-    sendToPython({
-      type: "sceneVisualChanged",
-      sceneId: scene.id,
-      tokenId,
-      reason: "sarweenTokenMove",
-      sentAt: Date.now(),
-    });
-  }, 150);
+  if (moved) queueSceneVisualChange("sarweenTokenMove", {sceneId: scene.id, tokenId, socket});
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1880,120 +2062,76 @@ async function handlePythonMessage(data) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 function dispatchPythonMessage(data, socket) {
-  if (data.type !== "moveToken") return handlePythonMessage(data);
-  moveMessageChain = moveMessageChain.then(async () => {
-    if (socket === ws && ws.readyState === WebSocket.OPEN) {
-      await handlePythonMessage(data);
-    }
-  }).catch(err => error("Move handling failed:", err));
-  return moveMessageChain;
+  if (["physicalGridSet", "vttCommand", "moveToken", "captureStatus"].includes(data.type)) {
+    commandMessageChain = commandMessageChain.then(async () => {
+      if (socket === ws && ws.readyState === WebSocket.OPEN) {
+        await handlePythonMessage(data, socket);
+      }
+    }).catch(err => error("VTT command handling failed:", err));
+    return commandMessageChain;
+  }
+  return handlePythonMessage(data, socket);
 }
 
 function connectToPython() {
-  ensureStatusUI();
-
-  if (!game.user.isGM) {
-    console.log("sarween | Not GM; WebSocket relay disabled.");
-    setStatus("disconnected", "not GM");
-    return;
-  }
-
-  const url = getSetting("wsUrl");
-  if (!url) {
-    warn("No WebSocket URL configured.");
-    setStatus("error", "no wsUrl");
-    return;
-  }
-
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-    try { ws.close(1000, "Reconnecting"); } catch {}
-  }
+  if (!game.user.isGM) return;
+  cancelPendingSceneVisualChange();
+  const url = "ws://127.0.0.1:8765";
+  const previous = ws;
   ws = null;
-
+  assignmentRequests = [];
+  vttControlsRequested = false;
+  if (previous) {
+    try {previous.close(1000, "Reconnecting");} catch {}
+  }
   setStatus("connecting", "opening…");
-  log("Connecting to Python WebSocket at", url);
-
-  try {
-    ws = new WebSocket(url);
-  } catch (err) {
+  let socket;
+  try {socket = new WebSocket(url);}
+  catch (err) {
     error("Failed to create WebSocket:", err);
     setStatus("error", "create failed");
     scheduleReconnect("create failed");
     return;
   }
-
-  ws.onopen = () => {
+  ws = socket;
+  socket.onopen = () => {
+    if (socket !== ws) return;
     reconnectAttempts = 0;
     clearTimers();
-    manualDisconnect = false;
-
-    console.log(`sarween | WebSocket connected to Python at ${url}.`);
     setStatus("connected");
-
-    try {
-      ws.send(JSON.stringify({ type: "hello", source: "foundry-sarween", protocolVersion: 2 }));
-      if (testSequenceTargets.length) sendTestSequence();
-    } catch (err) {
-      error("Failed to send hello:", err);
-    }
-
-    // Proactively send sceneInfo on connect (helps Foundry mode feel instant)
-    try {
-      const payload = buildSceneInfoPayload(canvas.scene);
-      if (payload) ws.send(JSON.stringify(payload));
-      const viewPayload = buildViewTransformPayload();
-      if (viewPayload) ws.send(JSON.stringify(viewPayload));
-    } catch (err) {
-      error("Failed to send initial scene/viewport info:", err);
-    }
-
+    socket.send(JSON.stringify({type: "hello", source: "foundry-sarween", protocolVersion: 2,
+      physicalGridControls: true, vttControls: true}));
+    vttControlsRequested = true;
+    if (testSequenceTargets.length) sendTestSequence();
+    sendSceneAndView();
+    sendPhysicalGridState();
+    sendVttState();
     heartbeatTimer = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        try {
-          ws.send(JSON.stringify({ type: "ping", ts: Date.now() }));
-        } catch (err) {
-          error("Failed to send ping:", err);
-        }
+      if (socket === ws && socket.readyState === WebSocket.OPEN) {
+        sendToPython({type: "ping", ts: Date.now()});
       }
     }, 10000);
   };
-
-  const connectedSocket = ws;
-  ws.onmessage = async (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      await dispatchPythonMessage(data, connectedSocket);
-    } catch (err) {
-      error("Error parsing/handling message:", err);
-    }
+  socket.onmessage = async event => {
+    if (socket !== ws || socket.readyState !== WebSocket.OPEN) return;
+    try {await dispatchPythonMessage(JSON.parse(event.data), socket);}
+    catch (err) {error("Error parsing/handling message:", err);}
   };
-
-  ws.onclose = (event) => {
+  socket.onclose = event => {
+    if (socket !== ws) return;
     clearTimers();
     stopReferenceCapture();
     ws = null;
-    warn("WebSocket closed:", event.code, event.reason || "(no reason)");
+    assignmentRequests = [];
+    vttControlsRequested = false;
     setStatus("disconnected", event.reason || "closed");
     scheduleReconnect(event.reason || "closed");
   };
-
-  ws.onerror = (errEvent) => {
-    error("WebSocket error:", errEvent);
+  socket.onerror = err => {
+    if (socket !== ws) return;
+    error("WebSocket error:", err);
     setStatus("error", "socket error");
   };
-}
-
-function disconnectFromPython(reason = "Manual disconnect") {
-  manualDisconnect = true;
-  clearTimers();
-
-  if (ws) {
-    try { ws.close(1000, reason); } catch {}
-  }
-  ws = null;
-
-  warn("Disconnected from Python:", reason);
-  setStatus("disconnected", "manual");
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2006,86 +2144,119 @@ Hooks.once("ready", () => {
     return;
   }
 
-  ensureStatusUI();
   renderViewportMarkers();
+  renderGridLabels();
 
   game.sarween = {
     ...(game.sarween ?? {}),
     applyPhysicalGridScale,
     calculatePhysicalGridScale,
     sendViewTransform,
-    toggleTestTargets,
-    openCaptureSetup,
     selectMovementToken,
     clearMovementSelection,
     resetSelectedMovement,
   };
 
-  if (getSetting("autoConnect")) {
-    console.log("sarween | World ready, starting Python WebSocket connection");
-    connectToPython();
-  } else {
-    setStatus("disconnected", "auto-connect off");
-    console.log("sarween | Auto-connect disabled. Use the Sarween UI button to connect.");
-  }
+  applyFoundryUIVisibility();
+  connectToPython();
 });
 
 Hooks.on("canvasReady", () => {
+  cancelPendingSceneVisualChange();
   clearMovementSelection();
-  if (guidedCapture?.recording) stopGuidedCapture("sceneChanged");
+  if (captureIsActive()) stopGuidedCapture("sceneChanged");
+  assignmentRequests = assignmentRequests.filter(request => request.sceneId === canvas?.scene?.id);
   testSequenceTargets = [];
   renderTestTargets();
   sendTestSequence();
   renderViewportMarkers();
+  renderGridLabels();
   setTimeout(async () => {
+    while (physicalGridSettingsBatch) await physicalGridBatchSettled;
     if (game.settings.get(MODULE_ID, "physicalGridAutoApply")) {
       await applyPhysicalGridScale({animate: true});
     }
     sendSceneAndView();
+    sendPhysicalGridState();
+    sendVttState();
   }, 50);
 });
 
 Hooks.on("updateScene", (scene, changes) => {
   if (scene.id !== canvas?.scene?.id) return;
   const relevant = Object.keys(changes).some(key => /^(width|height|grid|background|padding)(\.|$)/.test(key));
-  if (!relevant) return;
-  if (guidedCapture?.recording) stopGuidedCapture("geometryChanged");
-  sendSceneAndView();
-  scheduleViewTransformSend();
+  const visual = relevant || Object.keys(changes).some(key =>
+    /^(tokenVision|environment|darkness|darknessLevel|globalLight|globalLightThreshold|fog|fogExploration|fogOverlay|fogExploredColor|fogUnexploredColor|backgroundColor)(\.|$)/.test(key));
+  if (relevant) {
+    if (captureIsActive()) stopGuidedCapture("geometryChanged");
+    sendSceneAndView();
+    sendPhysicalGridState();
+    sendVttState();
+    scheduleViewTransformSend();
+    scheduleGridLabelRender();
+  } else sendVttState();
+  if (visual) queueSceneVisualChange("sceneSettingsChanged", {sceneId: scene.id});
 });
 
 Hooks.on("canvasPan", () => {
-  if (guidedCapture?.recording && JSON.stringify(getClientToCanvasTransform()) !== guidedCapture.viewSignature) {
+  if (captureIsActive() && JSON.stringify(getClientToCanvasTransform()) !== guidedCapture.viewSignature) {
     stopGuidedCapture("viewportChanged");
   }
   scheduleViewTransformSend();
   scheduleTestTargetRender();
+  scheduleGridLabelRender();
   renderMovementOverlay();
 });
 
+Hooks.on("canvasTearDown", () => {
+  cancelPendingSceneVisualChange();
+  if (gridLabelRenderTimer) clearTimeout(gridLabelRenderTimer);
+  gridLabelRenderTimer = null;
+  removeGridLabels();
+});
+
 Hooks.on("controlToken", (token, controlled) => {
-  if (guidedCapture?.recording) return;
+  if (captureIsActive()) return;
   const document = tokenDocument(token);
   if (controlled) {
     selectMovementToken(document);
   } else if (movementState?.tokenId === document?.id) {
     clearMovementSelection();
   }
+  tokenVisualChanged(token, controlled ? "tokenControlled" : "tokenReleased");
 });
 
-Hooks.on("updateToken", (document, changes, options) => {
+Hooks.on("updateToken", (document, changes, options = {}) => {
   recordSelectedMovement(document, changes, options);
+  if (Object.keys(changes).some(key => /^(x|y|rotation|elevation|hidden|width|height|sight|light)(\.|$)/.test(key))) {
+    tokenVisualChanged(document, options.sarweenSource ? "sarweenTokenMove" : "tokenUpdated");
+  }
+  if (Object.keys(changes).some(key => /^(name|actorId|width|height|sight)(\.|$)/.test(key))) {
+    sendSceneAndView(); sendVttState();
+  }
 });
+
+// These hooks only finish a queued, known scene/token mutation. Animated lighting
+// refreshes by themselves must never cause a stream of background reseeds.
+Hooks.on("sightRefresh", perceptionRefreshed);
+Hooks.on("lightingRefresh", perceptionRefreshed);
 
 Hooks.on("deleteToken", document => {
   if (movementState?.tokenId === document?.id) clearMovementSelection();
+  sendSceneAndView(); sendVttState();
+  tokenVisualChanged(document, "tokenDeleted");
+});
+
+Hooks.on("createToken", document => {
+  sendSceneAndView(); sendVttState();
+  tokenVisualChanged(document, "tokenCreated");
 });
 
 window.addEventListener("resize", () => {
   renderViewportMarkers();
   renderTestTargets();
   renderMovementOverlay();
-  applyStatusPanelPosition();
+  renderGridLabels();
   if (game.settings.get(MODULE_ID, "physicalGridAutoApply")) {
     applyPhysicalGridScale({animate: false});
   }

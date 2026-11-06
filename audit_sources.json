@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "description": "Explicit full-video replay sources only. Predictions require human review; sparse manual watchpoints are never imported as truth.",
+  "sources": [
+    {
+      "video": "sarween_rec_20260905_233022.mp4",
+      "path": "tracking_reports/shared-engine-20260921/report.json",
+      "caseVideo": "sarween_rec_20260905_233022.mp4",
+      "label": "Archived replay \u00b7 Sep21",
+      "note": "Saved full-video detector predictions from archived code. These are not confirmed physical movements.",
+      "profile": "tests/fixtures/red10_baseline.profiles.json"
+    },
+    {
+      "video": "sarween_rec_20260911_135922.mp4",
+      "path": "tracking_reports/replay-ui-reviewed-baseline/report.json",
+      "caseVideo": "sarween_rec_20260911_135922.mp4",
+      "label": "Archived replay \u00b7 reviewed baseline",
+      "note": "Saved full-video detector predictions from archived code. These are not confirmed physical movements.",
+      "profile": "tests/fixtures/red10_baseline.profiles.json"
+    },
+    {
+      "video": "sarween_rec_20260911_141952.mp4",
+      "path": "tracking_reports/shared-engine-20260921/report.json",
+      "caseVideo": "sarween_rec_20260911_141952.mp4",
+      "label": "Archived replay \u00b7 Sep21",
+      "note": "Saved full-video detector predictions from archived code. These are not confirmed physical movements.",
+      "profile": "tests/fixtures/red10_baseline.profiles.json"
+    },
+    {
+      "video": "sarween_rec_20260911_162031.mp4",
+      "path": "tracking_reports/shared-engine-20260921/report.json",
+      "caseVideo": "sarween_rec_20260911_162031.mp4",
+      "label": "Archived replay \u00b7 Sep21",
+      "note": "Saved full-video detector predictions from archived code. These are not confirmed physical movements.",
+      "profile": "tests/fixtures/red10_baseline.profiles.json"
+    },
+    {
+      "video": "sarween_rec_20260911_165442.mp4",
+      "path": "tracking_reports/shared-engine-20260921/report.json",
+      "caseVideo": "sarween_rec_20260911_165442.mp4",
+      "label": "Archived replay \u00b7 Sep21",
+      "note": "Saved full-video detector predictions from archived code. These are not confirmed physical movements.",
+      "profile": "tests/fixtures/red10_baseline.profiles.json"
+    },
+    {
+      "video": "sarween_rec_20261103_154731.mp4",
+      "path": "artifacts/manual_review_20261103_194320/diagnosis/production-base-appearance-review/154731-recorded-final/events.json",
+      "inputs": "artifacts/manual_review_20261103_194320/diagnosis/production-base-appearance-review/154731-recorded-final/inputs.json",
+      "label": "Replay \u00b7 recorded profiles",
+      "note": "Saved full-video replay using the recorded ring profiles."
+    },
+    {
+      "video": "sarween_rec_20261103_160008.mp4",
+      "path": "artifacts/manual_review_20261103_194320/diagnosis/production-base-appearance-review/160008-recorded-final-180s/events.json",
+      "inputs": "artifacts/manual_review_20261103_194320/diagnosis/production-base-appearance-review/160008-recorded-final-180s/inputs.json",
+      "label": "Replay \u00b7 recorded profiles",
+      "note": "Saved full-video replay using the recorded ring profiles."
+    },
+    {
+      "video": "sarween_rec_20261103_190135.mp4",
+      "path": "artifacts/manual_review_20261103_194320/diagnosis/production-base-appearance-review/190135-sized-final/events.json",
+      "inputs": "artifacts/manual_review_20261103_194320/diagnosis/production-base-appearance-review/190135-sized-final/inputs.json",
+      "label": "Software replay \u00b7 updated mini profile",
+      "note": "Results using the updated mini profile. The original live test recorded no moves."
+    },
+    {
+      "video": "sarween_rec_20261103_194320.mp4",
+      "path": "artifacts/manual_review_20261103_194320/diagnosis/production-base-appearance-review/194320-sized-final/events.json",
+      "inputs": "artifacts/manual_review_20261103_194320/diagnosis/production-base-appearance-review/194320-sized-final/inputs.json",
+      "label": "Software replay \u00b7 refreshed background",
+      "note": "Results using the updated mini profile. The original live test recorded no moves."
+    }
+  ],
+  "unavailable": [
+    {
+      "video": "sarween_rec_20261103_164259.mp4",
+      "videoSha256": "51850c79f0cbb429e14707cdddff1282f83272198f361e84e3b4ca9d5adf7f68",
+      "reason": "Incomplete recording: MP4 index is missing (moov atom not found); playback and review are unavailable."
+    }
+  ]
+}

@@ -8,8 +8,11 @@ import zipfile
 
 import numpy as np
 
+WATERMARK_ARRAYS = ("_watermark_bg_invalid_cam", "_watermark_bg_invalid_warp",
+                    "_watermark_clear_count_cam", "_watermark_clear_count_warp",
+                    "_watermark_prev_blur_cam", "_watermark_prev_blur_warp")
 CORE_ARRAYS = ("H_saved", "_H_inv", "last_mask_cam", "last_mask_warp", "BG_warp_f32",
-               "_heal_acc", "_last_shadowfree_cam", "_last_final_mask_cam")
+               "_heal_acc", "_last_shadowfree_cam", "_last_final_mask_cam") + WATERMARK_ARRAYS
 CORE_SCALARS = ("frame_idx", "warp_w", "warp_h", "grid_w", "grid_h", "aruco_every_n",
                 "aruco_every_n_fast", "lock_drop_after", "warp_motion_thresh", "fog_change_ratio",
                 "bg_alpha_slow", "bg_alpha_fast", "view_settle_seconds", "_view_settle_frames",
@@ -35,6 +38,9 @@ def save_checkpoint(path, session, tracking=None):
               if getattr(session, name, None) is not None}
     arrays.update({"BG_cam_" + key: value for key, value in session.BG_cam.items()})
     state = {name: json_value(getattr(session, name)) for name in CORE_SCALARS}
+    state["_watermark_background_known"] = bool(getattr(session, "_watermark_background_known", False))
+    if hasattr(session, "registration_metadata_snapshot"):
+        state["markerRegistration"] = json_value(session.registration_metadata_snapshot())
     state["tracking"] = json_value(tracking or {})
     arrays["metadata"] = np.frombuffer(json.dumps(state, allow_nan=False).encode(), dtype=np.uint8)
     path = Path(path)
@@ -64,16 +70,21 @@ def restore_checkpoint(timeline_path, entry, session, engine):
     with np.load(path, allow_pickle=False) as archive:
         metadata = json.loads(archive["metadata"].tobytes())
         background_only = entry.get("kind") == "background"
-        names = ("BG_warp_f32",) if background_only else CORE_ARRAYS
+        names = ("BG_warp_f32",) + WATERMARK_ARRAYS if background_only else CORE_ARRAYS
         for name in names:
             setattr(session, name, archive[name].copy() if name in archive else None)
         session.BG_cam = {key: archive["BG_cam_" + key].copy() for key in ("bgr", "blur")}
+        session._watermark_background_known = bool(metadata.get("_watermark_background_known", False)
+                                                   and all(name in archive for name in WATERMARK_ARRAYS[:2]))
+        session._watermark_background_ref = id(session.BG_cam["bgr"])
         if background_only:
             session._bg_seeded = metadata["_bg_seeded"]
             return None
         for name in CORE_SCALARS:
             if name != "frame_idx":
                 setattr(session, name, copy.deepcopy(metadata[name]))
+        if metadata.get("markerRegistration") is not None:
+            session.configure_recorded_registration(metadata["markerRegistration"], preserve_geometry=True)
         session._frame_phase_offset = int(metadata["frame_idx"]) + 1 - int(entry["frame"])
         tracking = metadata.get("tracking", {})
         if tracking.get("engine"):

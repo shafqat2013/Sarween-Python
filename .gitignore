@@ -37,3 +37,24 @@ supabase/.temp/
 .env
 .env.*
 *.private.pem
+
+# Local validation media, generated reports and launch/build products.
+/artifacts/
+/output/
+/blended_cache/
+/blended_output.jpg
+/Sarween Video Review.app/
+
+# Separate local wall-detection checkout; not part of this project.
+/auto-wall-main/
+
+# Xcode/Swift local state and signing assets.
+ios/**/.build/
+ios/**/.swiftpm/
+ios/**/DerivedData/
+ios/**/xcuserdata/
+*.xcuserstate
+*.mobileprovision
+*.p12
+*.ipa
+*.xcarchive/

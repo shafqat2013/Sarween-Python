@@ -20,6 +20,7 @@ import v3_tracking as tracking
 from mini_calibration import load_profiles_with_curves
 from app_paths import data_path
 from tracking_regression import FoundryTimelineReplay
+from reference_health import MAX_REFERENCE_AGE_SECONDS, image_quality, matching_view, validated_view
 
 
 def difference_mask(camera: np.ndarray, reference: np.ndarray) -> np.ndarray:
@@ -51,15 +52,38 @@ def load_references(timeline_path: Path) -> dict[int, tuple[dict, np.ndarray]]:
         image = cv2.imread(str(path))
         if image is None or image.shape[:2] != (360, 640):
             raise ValueError(f"Missing or invalid rendered reference: {path}")
-        references[int(entry["frame"])] = (entry, image)
+        # Recompute content statistics rather than trust old or edited metadata.
+        references[int(entry["frame"])] = ({**entry, "quality": image_quality(image)}, image)
     return references
 
 
-def matching_view(reference_view: dict | None, current_view: dict | None) -> bool:
-    if not reference_view or not current_view:
-        return False
-    keys = ("sceneId", "registration", "canvasTransform", "clientToCanvasTransform")
-    return all(reference_view.get(key) == current_view.get(key) for key in keys)
+def reference_for_camera(references, capture_time, view, *, max_age=MAX_REFERENCE_AGE_SECONDS):
+    """Choose a past, recent, informative reference with captured geometry.
+
+    Receipt and sender wall clocks only estimate camera alignment. This is
+    sufficient for inspecting a diagnostic, never for authorizing token moves.
+    Legacy snapshots cannot establish timing and are deliberately excluded.
+    """
+    choices = []
+    for entry, image in references.values():
+        provenance = entry.get("provenance") or {}
+        if not provenance.get("verified") or not entry.get("quality", {}).get("informative"):
+            continue
+        if not matching_view(entry.get("viewTransform"), view):
+            continue
+        try:
+            validated_view(entry.get("viewTransform"), entry.get("sceneId"))
+            source_time = float(entry["receivedAtMonotonic"]) - float(provenance["ageAtReceiptSeconds"])
+            age = float(capture_time) - source_time
+            if not np.isfinite([source_time, age]).all() or not 0 <= age <= max_age:
+                continue
+        except (KeyError, TypeError, ValueError):
+            continue
+        choices.append((source_time, entry, image, age))
+    if not choices:
+        return None
+    _source_time, entry, image, age = max(choices, key=lambda item: item[0])
+    return entry, image, age
 
 
 def candidate_evidence(mask: np.ndarray, detections: dict, warp_size: tuple[int, int]) -> list[dict]:
@@ -90,6 +114,13 @@ def compare_video(video_path: Path, timeline_path: Path, max_frames: int | None 
             "This recording has no rendered references. Older videos cannot reconstruct "
             "the actual fog/lighting; record a new session with the updated module."
         )
+    if not any(entry.get("provenance", {}).get("verified") and entry["quality"]["informative"]
+               for entry, _image in references.values()):
+        raise ValueError(
+            "No usable rendered reference evidence: exports are low-information or lack "
+            "explicit-render provenance and capture clocks. Uniform black may be legitimate fog; "
+            "it cannot establish export correctness or alignment. Reload the updated module and record again."
+        )
     last_reference_frame = max(references) + 1
     max_frames = min(max_frames, last_reference_frame) if max_frames is not None else last_reference_frame
     timeline = FoundryTimelineReplay(timeline_path)
@@ -110,14 +141,13 @@ def compare_video(video_path: Path, timeline_path: Path, max_frames: int | None 
         source_frames_undistorted=bool(timeline.data.get("framesUndistorted", True)),
     )
     results = []
+    capture_times = {int(row["frame"]): row.get("captureTime") for row in timeline.data.get("frameClocks", [])}
     try:
-        # References arrive between camera frames. The closest of the adjacent
-        # frames is enough for this diagnostic, but not for movement decisions.
         for bundle in sess.frames():
-            frame = int(sess.cap.get(cv2.CAP_PROP_POS_FRAMES) or bundle.frame_idx)
+            frame = max(0, int(sess.cap.get(cv2.CAP_PROP_POS_FRAMES) or bundle.frame_idx) - 1)
             if frame > max_frames:
                 break
-            reference = references.get(frame) or references.get(frame - 1)
+            reference = reference_for_camera(references, capture_times.get(frame), fo.get_view_transform_payload())
             if reference is None or not bundle.locked or bundle.warp_bgr is None:
                 for name in profiles:
                     previous = prev_state.setdefault(name, {})
@@ -125,7 +155,7 @@ def compare_video(video_path: Path, timeline_path: Path, max_frames: int | None 
                         previous, float(bundle.raw_motion_ratio or 0)
                     )
                 continue
-            entry, image = reference
+            entry, image, age = reference
             if entry["sceneId"] != fo.SCENE_ID or not matching_view(
                 entry.get("viewTransform"), fo.get_view_transform_payload()
             ):
@@ -143,6 +173,9 @@ def compare_video(video_path: Path, timeline_path: Path, max_frames: int | None 
                 "referenceFrame": int(entry["frame"]),
                 "changedPercent": round(100.0 * cv2.countNonZero(mask) / mask.size, 2),
                 "viewRevision": entry["viewRevision"],
+                "referenceAgeSeconds": round(age, 6),
+                "synchronizationVerified": False,
+                "diagnosticOnly": True,
                 "candidates": candidate_evidence(
                     mask, detections, (bundle.warp_w, bundle.warp_h)
                 ),

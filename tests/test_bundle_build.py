@@ -181,6 +181,36 @@ class BundleBuildTest(unittest.TestCase):
                           and any(isinstance(target, ast.Name) and target.id == "hidden" for target in node.targets))
             self.assertFalse(set(ast.literal_eval(hidden)) & retired)
 
+    def test_developer_bypass_is_not_staged_from_source_or_overrides(self):
+        self.write("dev_access.py", "# development-only login bypass\n")
+        self.write("app_bundle_overrides/dev_access.py", "# development-only override\n")
+        output = builder.build(self.root, self.root / "dist", stage_only=True)
+        self.assertFalse((output / "source/dev_access.py").exists())
+        manifest = json.loads((output / "build-inputs.json").read_text())
+        self.assertNotIn("dev_access.py", {row["path"] for row in manifest["files"]})
+        self.assertTrue((self.root / "dev_access.py").is_file())
+        self.assertTrue((self.root / "app_bundle_overrides/dev_access.py").is_file())
+
+    def test_developer_bypass_cannot_be_added_as_bundle_data(self):
+        self.write("dev_access.py", "# development-only login bypass\n")
+        self.write("app_bundle_overrides/dev_access.py", "# development-only override\n")
+        for source in ("dev_access.py", "app_bundle_overrides/dev_access.py", "app_bundle_overrides"):
+            with self.subTest(source=source):
+                self.write("app_bundle_overrides/sarween.spec", f"added_files = [({source!r}, '.')]\n")
+                with self.assertRaisesRegex(ValueError, "Development-only code must not be bundled"):
+                    builder.collect_inputs(self.root)
+
+    def test_real_bundle_specs_exclude_developer_bypass(self):
+        import ast
+        self.assertNotIn("dev_access.py", builder.collect_inputs(builder.ROOT))
+        for relative in ("sarween.spec", "app_bundle_overrides/sarween.spec"):
+            with self.subTest(spec=relative):
+                tree = ast.parse((builder.ROOT / relative).read_text())
+                analysis = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                                and isinstance(node.func, ast.Name) and node.func.id == "Analysis")
+                excluded = next(keyword.value for keyword in analysis.keywords if keyword.arg == "excludes")
+                self.assertIn("dev_access", ast.literal_eval(excluded))
+
     def test_symlinked_data_is_rejected(self):
         (self.root / "maps/link.png").symlink_to(self.root / "profile.json")
         with self.assertRaisesRegex(ValueError, "Symlinked"):
@@ -188,7 +218,8 @@ class BundleBuildTest(unittest.TestCase):
 
     def test_personal_data_is_rejected_even_if_added_to_spec(self):
         for name in ("combo_profiles.json", "hardware_config.json", "mini_library.json.bak",
-                     "camera_matrix.npy", "mini_captures", "sarween_rec_private.mp4"):
+                     "camera_matrix.npy", "mini_captures", "sarween_rec_private.mp4",
+                     "hardware_profiles.json", "vtt_display.json"):
             with self.subTest(name=name):
                 self.write("app_bundle_overrides/sarween.spec", f"added_files = [({name!r}, '.')]")
                 with self.assertRaisesRegex(ValueError, "Personal user data"):

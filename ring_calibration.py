@@ -28,11 +28,60 @@ def sample_ring_patch(image, point):
     return tuple(float(value) for value in median)
 
 
-def profile_with_sample(existing, lab, *, replace_colors=False):
+def parse_base_diameter_squares(value):
+    if value is None:
+        return None
+    message = "Base diameter must be greater than 0 and at most 6 grid squares"
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(message)
+    try:
+        diameter = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(message) from None
+    if not np.isfinite(diameter) or not 0 < diameter <= 6:
+        raise ValueError(message)
+    return diameter
+
+
+def profile_with_sample(existing, lab, *, replace_colors=False, sample_kind="identity",
+                        base_diameter_squares=None):
+    """Update one explicitly chosen cue without changing the other cue's colors."""
+    if not isinstance(sample_kind, str) or sample_kind not in ("identity", "base_appearance"):
+        raise ValueError("Choose Ring color or Base appearance for this sample")
+    if sample_kind == "identity" and base_diameter_squares is not None:
+        raise ValueError("Base diameter applies only to Base appearance samples")
+    diameter = parse_base_diameter_squares(base_diameter_squares)
     values = np.asarray(lab, dtype=float)
     if values.shape != (3,) or not np.isfinite(values).all():
         raise ValueError("A scan must contain three finite Lab values")
     profile = copy.deepcopy(existing or {})
+    if sample_kind == "base_appearance":
+        identity_points = [profile.get("lab"), *(profile.get("lab_curve") or [])]
+        has_identity = False
+        for point in identity_points:
+            try:
+                identity = np.asarray(point, dtype=float)
+                has_identity |= identity.shape == (3,) and bool(np.isfinite(identity).all())
+            except (TypeError, ValueError):
+                continue
+        if not has_identity:
+            raise ValueError("Save a ring color sample first")
+        appearance = profile.get("base_appearance")
+        if appearance is None:
+            appearance = {}
+        if not isinstance(appearance, dict):
+            raise ValueError("Existing base appearance must be a profile object")
+        old_curve = appearance.get("lab_curve") or ([appearance["lab"]] if appearance.get("lab") else [])
+        curve = [] if replace_colors else copy.deepcopy(old_curve)
+        if not any(point is not None and np.allclose(point, values) for point in curve):
+            curve.append(values.tolist())
+        appearance.update(lab=values.tolist(), lab_curve=curve,
+                          scan_source="manual-base-appearance-sample")
+        appearance.setdefault("presence_lab_dist", 18.0)
+        if diameter is not None:
+            appearance["diameter_squares"] = diameter
+        profile["base_appearance"] = appearance
+        return profile
     old_curve = profile.get("lab_curve") or ([profile["lab"]] if profile.get("lab") else [])
     if replace_colors:
         old_curve = []

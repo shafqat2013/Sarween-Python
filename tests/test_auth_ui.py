@@ -31,7 +31,8 @@ class AuthUITests(unittest.TestCase):
         runner = Mock()
         with tempfile.TemporaryDirectory() as directory, \
              patch("app_window.data_path", side_effect=lambda name: Path(directory) / name):
-            app = AppWindow(root, service=service, run_session=runner,
+            # Keep auth gating isolated from the separately tested inline startup.
+            app = AppWindow(root, service=service, run_session=runner, inline_startup=False,
                 auth_panel_factory=lambda root, parent, **kw: AuthPanel(root, parent, factory=lambda: case.access, **kw))
             try:
                 self.spin(root, lambda: not app.auth.pending)
@@ -95,7 +96,7 @@ class AuthUITests(unittest.TestCase):
         root = tk.Tk()
         with tempfile.TemporaryDirectory() as directory, \
              patch("app_window.data_path", side_effect=lambda name: Path(directory) / name):
-            app = AppWindow(root, service=FoundryService(), run_session=Mock(),
+            app = AppWindow(root, service=FoundryService(), run_session=Mock(), inline_startup=False,
                 auth_panel_factory=lambda root, parent, **kw: AuthPanel(root, parent, factory=lambda: case.access, **kw))
             try:
                 self.spin(root, lambda: app.auth.allowed and not app.auth.pending and app.home.winfo_ismapped())

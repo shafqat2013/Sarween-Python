@@ -1,0 +1,171 @@
+SARWEEN MINI OBSERVER — LIVE TEST
+
+Launch the source app as usual:
+
+    python main.py --dev-no-login
+
+After a tracker update, fully quit the old Sarween process before running this
+command again. Stopping and restarting only the session does not reload Python
+code. Foundry and OBS may remain open.
+
+PRINTED MARKERS / POLARIZER SETUP (OPTIONAL, PHYSICAL TEST STILL PENDING)
+
+In VTT Controls > Startup, Start Foundry can launch the selected world, join as
+the selected GM and unpause. For the first automatic launch, close a native
+Foundry instance opened outside Sarween once; the startup flow will not replace
+or close another running session. Reload Foundry is also in Startup.
+
+In VTT Controls > Display, select the calibrated TV/display profile and put
+Foundry fullscreen on that TV. Create matching print sheet uses the current
+viewport/marker settings and that profile's physical diagonal. Print at Actual
+Size (100%), check the 50 mm ruler and retain the white borders. The supplied
+default sheet matches a 54-inch LCD, 1920x1080 fullscreen viewport, 120-pixel
+markers and 8-pixel inset; generate another sheet if those settings differ.
+
+During steps 1-2 below, before choosing mini starting positions, place paper
+20 over screen guide 10, 21 over 11, 22 over 12 and 23 over 13, align
+the card edges, clear your hands, then click Align with screen guides. That is
+your declared placement, not independently measured screen alignment. It saves
+and selects the paper layout in the active display profile. Acquire four paper
+markers before choosing six mini positions. Three matching cards can maintain
+an existing lock; two cannot. Keep the paper, camera and filter fixed.
+
+For cards beside the LCD instead, Calibrate bezel placement requires all four
+paper markers and all four LCD markers visible together for a one-time measured
+alignment. Keep them flat and close to the LCD plane. Registered paper markers
+allow the screen drawings to be hidden while viewport geometry still updates.
+Changing registration mode or layout requires new mini bindings.
+
+1. On Sarween's home screen, click “Start mini observer”. Use the existing
+   Foundry setup. For the direct USB feed, choose Sarween Camera and its own
+   calibrated USB-camera profile; the OBS profile is a different capture path.
+2. Wait for a camera image, a Foundry scene and verified marker lock. Keep the
+   camera, map pan and zoom fixed during this first test.
+3. In the Mini observer window, click “Choose starting positions”. The view
+   freezes. Click the CENTER OF EACH BASE/RING once, for six minis. Those
+   clicks assign Mini 1 through Mini 6. Keep the physical minis still while
+   choosing. No individual color scans are needed. A new capture path or changed
+   resolution/orientation needs its own camera calibration before this test.
+4. Observation and an input recording start automatically after the sixth
+   click. Those clicks save starting positions; they do not mean the bases have
+   been detected. Keep the minis still until the status says “Bases acquired:
+   6/6” AND “6/6 visible”. While acquiring, the status shows visible and confirmed counts and
+   the starting labels stay amber. If acquisition stalls, preserve that failure
+   instead of beginning a movement test.
+5. Once all six bases are acquired, move one mini, clear your hand and watch
+   its labeled circle and the movement transcript. Foundry tokens will stay
+   still: tracker movement is OFF.
+6. Try several moves, one mini at a time. Leave one mini stationary. For a
+   clean first test, place bases near square centers.
+7. Click “Stop recording” IN THE OBSERVER WINDOW when finished. The observer
+   continues to run and export its latest preview. A later recording can start
+   when all bases are visible and settled.
+
+Green means last confirmed position, not a fresh measurement on every frame.
+Amber means held or uncertain. A destination such as P13/Q13 is intentionally
+left uncertain. A starting cell can also be unknown if its click is near a
+border. The circle measures the base, not the reflective sticker on its head.
+“Bases acquired” records successful initial acquisition; the separate visible
+count describes the current frame. Temporary caption coverage can hold one or
+more bases while the others remain observable.
+
+Ring appearance finds candidate bases. IDs come from the starting clicks and
+movement history, not a per-color identity mapping. Move one physical mini at a
+time. Missing identities stay unresolved until positive observations restore
+them; caption coverage cannot turn an already ambiguous identity into certainty.
+
+If marker lock is lost or the scene/viewport/calibration changes, the observer
+holds and asks for starting positions again. Clearing a temporary obstruction
+does not automatically claim positions were observed while hidden.
+
+Closing the observer keeps tracker movement disabled for the rest of that live
+session. Reopen the observer to continue, or stop the session. Starting a normal
+live session is a separate choice. Old pending token moves are cleared.
+
+LIVE FEED WITHOUT DESKTOP CONTROL
+
+The observer uses the camera already owned by Sarween. It does not open a
+second camera, control OBS, or require Accessibility APIs. Every second it
+exports a rectified TV preview and status for read-only inspection:
+
+    ~/Library/Application Support/Sarween/Recordings/Observer/latest.json
+
+That file points to the active run's latest.jpg and latest.json. Check active,
+updated_at, locked and fresh_board_pixels before interpreting an image as live.
+Verify the preview.sha256 in the run status against latest.jpg: the two files
+are individually atomic, so a reader between writes must retry a mismatched pair.
+Codex can read these files after you launch the updated source app normally.
+
+The first user-launched live test successfully exported camera pixels, but the
+original detector missed four pale rings and recorded no move. Its exact input
+journal is retained. Candidate replay results on that recording are development
+checks; a new user-launched live test is still required for the updated tracker.
+
+RECORDINGS AND REPLAY
+
+Observer recordings are separate from the Session tab's normal camera MP4.
+Each observer run has recording_001, recording_002, etc. Each interval contains:
+
+    manifest.json      bindings, mapping, detector/caption mode, source/asset hashes, limits
+    inputs/            exact lossless board and caption-exclusion PNGs
+    inputs.jsonl       original capture clocks, lock/mapping and reference info
+    decisions.jsonl    actual engine decisions for those exact inputs
+
+Each interval stops at five minutes or 2 GB. The UI reports the stop; observing
+continues. Disk/save failures are reported instead of silently claiming success.
+Start another recording if exact pixels are needed for later replay. Stopping a
+recording is separate from stopping observation. Accepted movement events keep
+saving independently to the run's movement-events.jsonl, even after the input
+limit. Latest status exposes movement_event_journal (saved/pending/error counts)
+and movement_events (bounded recent history); the full JSONL is authoritative.
+Readable movement-events.txt and movement-events.csv sit beside it. Their UTC,
+source-clock and frame columns are explicit; source clocks are not video-relative
+timestamps. exports.current and exportError describe these derived files without
+changing the durable JSONL saved count. A pending/error status is not a successful save. Run and binding-generation IDs
+separate moves after reinitialization or a new recording. These are software
+observations, not a complete record of the physical movements the detector missed.
+
+New observer recordings use board-template-v1 caption handling. The shared
+engine supplements supplied masks with verified known-caption glyphs in the
+rectified image and records recognition provenance. Replay explicitly restores
+that mode; historical recordings without the setting retain provided-mask mode.
+Saved input masks are never silently rewritten. Caption handling masks covered
+pixels; it does not reconstruct a miniature hidden behind the lettering.
+
+To verify and produce a watchable replay:
+
+    python observer_journal.py '/absolute/path/to/recording_001' --preview
+
+This writes replay-verification.json, annotated.mp4, movements.csv and
+transcript.txt. verification_passed means the saved inputs reproduce the live
+software decisions with the same engine. It does not mean the decisions match
+the physical game. Review the video separately for tracking accuracy.
+
+FOG TEST — AFTER THE FIRST MOVEMENT CHECK
+
+With all physical minis still, change Foundry vision/fog once. A known visual
+revision now holds the observer with display_changed_rebind_required and emits
+no physical move. It remains held even if old camera pixels look quiet: the
+notification is not synchronized to AirPlay or camera arrival. After visually
+confirming the new display, explicitly choose starting positions again. Then
+make a physical move after fresh acquisition. Preserve the whole test.
+
+This verifies a known-change safety hold and fresh acquisition after rebinding.
+It is NOT acceptance of automatic tracking through fog changes. Missing visual
+revision metadata is marked unmonitored; silent animation is not covered.
+
+This is an experiment: the current shared color/boundary detector and settled
+camera-image reference still assume a substantially static map. Foundry render
+references are now available for analysis, but they are NOT yet used to explain
+away fog changes in the ring detector. Automatic fog tracking is unproven.
+
+Foundry reference capture is diagnostic at one image every two seconds. Its
+status checks captured geometry, source time and image quality; stale intervals
+are deliberately marked stale. Actual camera/display alignment is unverified.
+
+The updated Foundry module was installed with a backup and reloaded through
+Sarween's supported connection. Actual scene pixels and six warmed captures
+were verified. No relay or capture probe remains running after development.
+
+This candidate is available from source. The installed Sarween desktop bundle
+has not been rebuilt as part of this work.
