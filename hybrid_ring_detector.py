@@ -4,7 +4,9 @@ Pale hollow rings need annular edge proposals; a base whose inner ring is hidden
 by the miniature may still have a useful partial color boundary. This adapter
 preserves both measurement families, selects an existing supported measurement
 within each compatible circle cluster, and reports which family supplied it.
-It neither averages centers nor reduces an existing uncertainty allowance.
+The chosen center is retained, but its allowance encloses every accepted
+measurement's center and existing allowance in that cluster. This engineering
+envelope accounts for disagreement; it is not a calibrated confidence interval.
 
 No identities, expected destinations or recording-specific coordinates are
 used. Digital circular artwork can still be observed; temporal association and
@@ -48,6 +50,19 @@ class HybridRingDetector:
         return (math.hypot(left["cx"] - right["cx"], left["cy"] - right["cy"]) <= .4 * self.grid_px
                 and abs(left["radius"] - right["radius"]) <= .5 * self.grid_px)
 
+    @staticmethod
+    def _uncertainty_envelope(chosen, cluster):
+        # The representative is an observed center, not an average. Retaining
+        # its optimistic allowance would discard accepted alternative centers.
+        # A circle of radius distance + allowance about this center encloses
+        # each alternative's existing allowance without claiming independence
+        # or statistical calibration of the two measurement families.
+        offsets = [math.hypot(item["cx"] - chosen["cx"], item["cy"] - chosen["cy"])
+                   for _family, item in cluster]
+        envelope = max(offset + float(item["uncertainty_px"])
+                       for offset, (_family, item) in zip(offsets, cluster))
+        return float(envelope), float(max(offsets))
+
     def detect(self, board, excluded_mask=None):
         warm = self.warm.detect(board, excluded_mask)
         annular = self.annular.detect(board, excluded_mask)
@@ -76,6 +91,11 @@ class HybridRingDetector:
                  **{key: deepcopy(item.get(key)) for key in (
                      "cx", "cy", "radius", "uncertainty_px", "support_coverage", "confidence", "source")}}
                 for source, item in cluster]
+            envelope, disagreement = self._uncertainty_envelope(chosen, cluster)
+            candidate["selected_uncertainty_px"] = float(chosen["uncertainty_px"])
+            candidate["measurement_center_disagreement_px"] = disagreement
+            candidate["uncertainty_px"] = envelope
+            candidate["uncertainty_basis"] = "accepted-measurement-envelope"
             output.append(candidate)
         output.sort(key=lambda item: (item["cy"], item["cx"]))
         shape = board.shape[:2]
@@ -87,6 +107,9 @@ class HybridRingDetector:
                                       if self.warm.last_obstruction_mask is not None else zero)
         self.last_diagnostics = {"candidate_count": len(output), "color_candidates": len(warm),
                                  "annular_candidates": len(annular),
+                                 "expanded_uncertainty_candidates": sum(
+                                     item["uncertainty_px"] > item["selected_uncertainty_px"] + 1e-9
+                                     for item in output),
                                  "color_diagnostics": deepcopy(self.warm.last_diagnostics),
                                  "annular_diagnostics": deepcopy(self.annular.last_diagnostics)}
         return output
