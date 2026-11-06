@@ -22,7 +22,7 @@
     "deviceBuild": "passed",
     "simulatorBuild": "passed",
     "signedDeviceBuild": "passed",
-    "newAppInstalled": false
+    "newAppInstalled": true
   },
   "syntheticTransport": {
     "scope": "SYNTHETIC localhost, production Swift server and Python receiver; NOT actual USB/camera",
@@ -132,5 +132,63 @@
     "observer_session.py": "b88aa1680863318f65d1e228d7f031e1469745db2ba5ec5022e34e0d7e6c56b3",
     "phone_camera.py": "9ccb091bc5a8763e091e8bac2823ac0f7c7b03af34d6b85823d0ef9fa3829987",
     "phone_camera_protocol.py": "a6315ffb4562dfb1a5310deb61b7b9bf98c81b785a5ed34ff8be03824e9bdbde"
+  },
+  "realPresetChecks": {
+    "scope": "Short raw USB camera checks on the iPhone 13 Pro after installing the preset update; not tracking, table calibration, sensor-to-display latency or sustained thermal/battery validation",
+    "modes": [
+      {
+        "preset": "standard",
+        "imageSize": [
+          1080,
+          1920
+        ],
+        "nominalFPS": 15,
+        "observedReceiveFPS": 15.004,
+        "framesReceived": 226,
+        "sampleSeconds": 15.004,
+        "warmupFramesExcluded": 10,
+        "medianHostReceiveIntervalMs": 66.678,
+        "medianPhoneCaptureIntervalMs": 66.67,
+        "medianEncodeMs": 24.28,
+        "receiverDroppedLatestFrames": 0
+      },
+      {
+        "preset": "smooth",
+        "imageSize": [
+          1080,
+          1920
+        ],
+        "nominalFPS": 30,
+        "observedReceiveFPS": 15.005,
+        "framesReceived": 226,
+        "sampleSeconds": 15.007,
+        "warmupFramesExcluded": 10,
+        "medianHostReceiveIntervalMs": 66.609,
+        "medianPhoneCaptureIntervalMs": 66.657,
+        "medianEncodeMs": 24.057,
+        "receiverDroppedLatestFrames": 0
+      },
+      {
+        "preset": "detail",
+        "imageSize": [
+          2160,
+          3840
+        ],
+        "nominalFPS": 15,
+        "observedReceiveFPS": 4.973,
+        "framesReceived": 76,
+        "sampleSeconds": 15.036,
+        "warmupFramesExcluded": 10,
+        "medianHostReceiveIntervalMs": 199.766,
+        "medianPhoneCaptureIntervalMs": 200.01,
+        "medianEncodeMs": 71.711,
+        "receiverDroppedLatestFrames": 0
+      }
+    ],
+    "standardSmoothOpticalIdMatches": true,
+    "detailOpticalIdDiffers": true,
+    "recommendedDefault": "standard",
+    "smooth30FPSTargetAchieved": false,
+    "detail15FPSTargetAchieved": false
   }
 }

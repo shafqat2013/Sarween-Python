@@ -18,6 +18,23 @@ The app becomes ready when it is foregrounded and camera permission is granted. 
 
 The **Torch** switch is available while streaming and defaults to off. It turns off when streaming stops, the camera pauses, or the app leaves the foreground. Frames report the actual torch state and level. Torch changes affect illumination and may require a lighting sample/background refresh in Sarween, but they do not change geometric camera identity.
 
+## Short on-device measurements
+
+On 6 November 2026, the iPhone 13 Pro delivered the declared portrait dimensions
+through the production USB receiver in all three presets. After excluding ten
+warmup frames, each sample covered approximately 15 seconds:
+
+| Preset | Target FPS | Observed received FPS | Median JPEG encode time |
+| --- | ---: | ---: | ---: |
+| Standard | 15 | 15.0 | 24.3 ms |
+| Smooth | 30 | 15.0 | 24.1 ms |
+| Detail | 15 | 5.0 | 71.7 ms |
+
+Keep Standard as the default. Mode capability and nominal FPS do not establish
+actual delivery speed. These short checks do not measure sensor-to-display delay,
+sustained heat/battery, table-image quality or tracking accuracy. Standard/Smooth
+reported the same optical identity; Detail reported a different identity.
+
 ## Install on an iPhone for development
 
 Requirements: a Mac with Xcode, an Apple account added to Xcode, an iPhone running iOS 17 or later, and a cable that supports data. An unsigned build cannot be installed on an ordinary iPhone.

@@ -886,11 +886,15 @@ The installed first prototype was checked with real 1080x1920 USB video at
 - **Detail:** native 4K / 15 FPS only when the rear wide camera supports it;
   experimental, with separate resolution/calibration requirements.
 
-The new modes have compiled and passed synthetic protocol tests, but have not
-been tested on the physical iPhone. The working installed prototype was left
-unchanged while its owner was away. Stop the Mac session before changing
-resolution or orientation, then use a matching camera profile and fresh mini
-bindings. FPS-only calibration reuse depends on retaining the exact same format.
+The update is installed on the test iPhone 13 Pro. Short raw USB checks measured
+Standard at about 15 FPS, Smooth at about 15 FPS despite its 30 FPS target, and
+Detail at about 5 FPS despite its 15 FPS target. All three delivered their declared
+native dimensions; higher targets are not guaranteed delivered throughput.
+Standard remains the recommended default. Sustained heat/battery behavior and
+mini tracking at the new modes remain untested. Stop the Mac session before
+changing resolution or orientation, then use a matching camera profile and
+fresh mini bindings. FPS-only calibration reuse depends on retaining the exact
+same format.
 
 In the observer, movement-events.jsonl now preserves accepted moves separately
 from video-recording limits and preview refreshes. The latest status exposes

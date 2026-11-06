@@ -93,3 +93,12 @@ The new signed iPhone build is prepared locally for installation when the user
 returns. The working phone installation was preserved. Physical markers/CPL and
 fresh independently reviewed recordings remain the blockers to physical tracking
 acceptance. The saved six-move development clip still fails strict exact cells.
+
+## User-return preset check
+
+The new signed camera build was installed after the user returned. Short actual
+USB samples confirmed all three native portrait dimensions. Standard delivered
+15.0 FPS, Smooth 15.0 FPS against its 30 FPS target, and Detail 5.0 FPS against its
+15 FPS target. Standard/Smooth optical identity matched; Detail differed.
+Standard is restored and recommended. The test receiver stopped. Sustained
+thermal/battery behavior and physical tracking are still unvalidated.
