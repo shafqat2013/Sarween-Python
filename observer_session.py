@@ -20,6 +20,7 @@ import numpy as np
 
 from observer_engine import BoardGeometry, ObserverEngine, draw_observer_frame
 from observer_journal import ObserverJournal
+from observer_event_journal import ObserverEventJournal
 from hybrid_ring_detector import HybridRingDetector
 
 
@@ -43,7 +44,8 @@ def geometry_key(view, shape, calibration=None, registration=None):
 
 
 class LiveObserverController:
-    def __init__(self, parent, output_root, *, window_factory=None, mini_count=6):
+    def __init__(self, parent, output_root, *, window_factory=None, mini_count=6,
+                 event_journal_factory=None):
         if window_factory is None:
             from observer_window import ObserverWindow
             window_factory = ObserverWindow
@@ -51,6 +53,9 @@ class LiveObserverController:
         self.output_root = Path(output_root)
         self.folder = self.output_root / f"observer_{stamp}_{uuid.uuid4().hex[:6]}"
         self.folder.mkdir(parents=True)
+        self.movement_journal = (event_journal_factory or ObserverEventJournal)(
+            self.folder / "movement-events.jsonl", self.folder.name)
+        self._event_generation = None
         self.engine = None
         self.journal = None
         self.current = None
@@ -78,6 +83,7 @@ class LiveObserverController:
             "kind": "sarween-live-observer-location", "folder": str(self.folder.resolve()),
             "status": str((self.folder / "latest.json").resolve()),
             "image": str((self.folder / "latest.jpg").resolve()),
+            "movement_event_journal": self.movement_journal.status(),
             "active": not self.closed, "foundry_token_output": False}))
 
     def _stop_recording(self, reason="userStopped", error=None):
@@ -95,6 +101,8 @@ class LiveObserverController:
 
     def reset(self):
         saved = self._stop_recording("reinitialized")
+        self.movement_journal.end_generation("bindings_reset")
+        self._event_generation = None
         self.engine = self.result = None
         self._last_processed_timestamp = None
         if saved:
@@ -110,16 +118,22 @@ class LiveObserverController:
         geometry = BoardGeometry(frozen_context["view"], (frozen_board.shape[1], frozen_board.shape[0]))
         self.engine = ObserverEngine(geometry, positions, geometry_key=frozen_context["geometry_key"],
                                      detector_factory=HybridRingDetector,
-                                     watermark_mode="board-template-v1")
+                                     watermark_mode="board-template-v1",
+                                     display_transition_policy="hold-known-display-changes-v1")
         try:
+            self._event_generation = self.movement_journal.begin_generation(
+                self.engine.initialization(), reason="initial_bindings")
             self._start_recording()
             self._consume(frozen_board, frozen_context)
         except Exception as exc:
             self._stop_recording("initializationError", error=exc)
             self.engine = self.result = None
+            self.movement_journal.end_generation("initialization_failed")
+            self._event_generation = None
             self.error = f"Observer initialization could not finish: {exc}"
             raise
-        self.window.set_status("Starting positions saved. Keep the minis still while their bases are acquired.")
+        self.window.set_status(self._movement_message(
+            "Starting positions saved. Keep the minis still while their bases are acquired."))
         return True
 
     def _start_recording(self):
@@ -144,10 +158,14 @@ class LiveObserverController:
         board, context = self.current
         positions = deepcopy(self.engine.mover.positions)
         cells = deepcopy(self.engine.confirmed_cells)
+        self.movement_journal.end_generation("input_recording_restarted")
         self.engine = ObserverEngine(self.engine.geometry, positions, cells,
                                      geometry_key=context["geometry_key"],
                                      detector_factory=HybridRingDetector,
-                                     watermark_mode="board-template-v1")
+                                     watermark_mode="board-template-v1",
+                                     display_transition_policy="hold-known-display-changes-v1")
+        self._event_generation = self.movement_journal.begin_generation(
+            self.engine.initialization(), reason="input_recording_restarted")
         self._last_processed_timestamp = None
         self._start_recording()
         self._consume(board, context)
@@ -158,9 +176,17 @@ class LiveObserverController:
             raise ValueError("Observer capture clock did not advance; choose starting positions again")
         result = self.engine.process(board, context["mask"], timestamp,
                                      locked=context["locked"], geometry_key=context["geometry_key"],
-                                     frame_index=context.get("frame_index"))
+                                     frame_index=context.get("frame_index"),
+                                     scene_visual_revision=context.get("metadata", {}).get("scene_visual_revision"))
         self._last_processed_timestamp = timestamp
         self.result = result
+        # A confirmed movement must not depend on the video budget or the next
+        # one-second preview tick. Keep the original engine result unchanged.
+        self.movement_journal.append_events(self._event_generation, result.get("events", []),
+            reason=result.get("state", {}).get("reason"),
+            recording_folder=str(self.journal.folder) if self.is_recording else None)
+        if result.get("needs_reset"):
+            self.movement_journal.end_generation(result.get("state", {}).get("reason") or "observer_held")
         if self.is_recording:
             try:
                 written = self.journal.append(board, context["mask"], timestamp, result,
@@ -229,6 +255,8 @@ class LiveObserverController:
                                    "held": list(self.result["positions"]), "needs_reset": True,
                                    "state": {"phase": "held", "reason": "observer_error"}}
                 self.engine = None
+                self.movement_journal.end_generation("observer_error")
+                self._event_generation = None
                 self.window.invalidate_initialization(self.error)
         result = self.result
         reason = (result or {}).get("state", {}).get("reason", "Choose starting positions to begin.")
@@ -249,6 +277,10 @@ class LiveObserverController:
             str(reason).replace("_", " "))
         if ref.get("message"):
             status += " · Reference: " + str(ref["message"])
+        status = self._movement_message(status)
+        if self.movement_journal.error:
+            # A save failure must be visible even between image refreshes.
+            self.window.set_status(status)
         now = time.perf_counter()
         if now - self._last_preview >= 1 / 12:
             displayed = ({**result, "events": deepcopy(self.engine.events)}
@@ -262,30 +294,45 @@ class LiveObserverController:
             self.window.set_status(self.error)
         return result
 
+    def _movement_message(self, message):
+        history = self.movement_journal.status()
+        errors = list(dict.fromkeys(value for value in (history["error"], history.get("exportError"))
+                                    if value and value not in message))
+        return " · ".join([*errors, message])
+
     def _publish(self, board, context, result, status, *, force=False):
         now = time.perf_counter()
         if not force and now - self._last_publish < 1:
             return
         self._last_publish = now
+        self.movement_journal.flush()
         preview = draw_observer_frame(board, result, self.engine.geometry) if result and self.engine else board
         ok, encoded = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 88])
         if not ok:
             raise OSError("Could not export observer preview")
-        _atomic(self.folder / "latest.jpg", encoded.tobytes())
+        preview_bytes = encoded.tobytes()
+        _atomic(self.folder / "latest.jpg", preview_bytes)
         _atomic(self.folder / "latest.json", _json_bytes({
             "kind": "sarween-live-observer-status", "active": not self.closed,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "capture_timestamp": context["timestamp"], "frame_index": context["frame_index"],
+            "preview": {"file": "latest.jpg", "sha256": hashlib.sha256(preview_bytes).hexdigest(),
+                        "frame_index": context["frame_index"], "capture_timestamp": context["timestamp"],
+                        "pairing": "Verify the image hash; image and status are individually atomic"},
             "fresh_board_pixels": context["metadata"]["fresh_board_pixels"],
-            "locked": context["locked"], "message": status,
+            "locked": context["locked"], "message": self._movement_message(status),
             "recording": self.is_recording,
             "recording_folder": str(self.journal.folder) if self.journal else None,
             "reference_status": context["metadata"].get("reference_status"),
             "scene_visual_revision": context["metadata"].get("scene_visual_revision"),
+            "movement_event_journal": self.movement_journal.status(),
+            "movement_events": self.movement_journal.recent_events(),
+            "movement_events_scope": "bounded recent run history; full accepted-move history is in movement_event_journal.path",
             "observation": result, "foundry_token_output": False, "fog_validated": False}))
 
     def snapshot(self):
         return {"kind": "live-observer", "foundry_token_output": False,
+                "movement_event_journal": self.movement_journal.status(),
                 "initialization": self.engine.initialization() if self.engine else None,
                 "last_observation": deepcopy(self.result)}
 
@@ -293,6 +340,11 @@ class LiveObserverController:
         if self.closed:
             return
         self._stop_recording("observerClosed")
+        self.movement_journal.close()
+        if self.movement_journal.error:
+            self.error = self.movement_journal.error
+            if not self.window.closed:
+                self.window.set_status(self.error)
         self.closed = True
         try:
             if self.current:

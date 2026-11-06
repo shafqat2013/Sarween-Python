@@ -130,6 +130,35 @@ class LiveObserverSessionTests(unittest.TestCase):
         self.assertEqual(len(replay["events"]), 1)
         self.assertEqual(replay["events"][0]["mini"], "mini1")
         self.assertEqual(replay["events"][0]["to_cell"], "F3")
+
+    def test_known_display_change_latches_hold_and_records_replayable_evidence(self):
+        self.update(1.0, metadata={"scene_visual_revision": 10})
+        board, context = self.controller.current
+        self.controller.window.choose(POSITIONS, board.copy(), deepcopy(context))
+        self.update(1.125, metadata={"scene_visual_revision": 10})
+        acquired = self.update(1.25, metadata={"scene_visual_revision": 10})
+        self.assertTrue(acquired["acquired"])
+        held = self.update(1.375, metadata={"scene_visual_revision": 11})
+        self.assertTrue(held["needs_reset"])
+        self.assertEqual(held["state"]["reason"], "display_changed_rebind_required")
+        self.assertEqual(held["events"], [])
+        self.assertEqual(held["positions"], acquired["positions"])
+        again = self.update(1.5, metadata={"scene_visual_revision": 11})
+        self.assertTrue(again["needs_reset"])
+        self.assertFalse(self.controller.window.initialized)
+        journal = self.controller.journal
+        self.controller._stop_recording("policy_test")
+        self.assertEqual(journal.manifest["initialization"]["display_transitions"]["policy"],
+                         "hold-known-display-changes-v1")
+        self.assertEqual(lines(journal.folder / "inputs.jsonl")[-1]["metadata"]["scene_visual_revision"], 11)
+        replay = replay_journal(journal.folder)
+        self.assertTrue(replay["verification_passed"])
+        self.assertEqual(replay["events"], [])
+        from observer_event_journal import read_event_journal
+        records = read_event_journal(self.controller.movement_journal.path)["records"]
+        self.assertTrue(any(record["type"] == "generation_ended"
+                            and record["reason"] == "display_changed_rebind_required" for record in records))
+        self.assertEqual(self.controller.movement_journal.status()["acceptedMoveCount"], 0)
         self.assertTrue(all(not item["foundry_token_output"] for item in lines(journal.folder / "decisions.jsonl")))
 
     def test_lock_loss_remains_held_after_reacquisition_until_explicit_rebinding(self):

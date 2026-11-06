@@ -19,6 +19,9 @@ from poc_ring_detector import RingDetector
 from poc_scene_reference import SceneReference
 from single_mover_state import SingleMover
 
+DISPLAY_TRANSITION_POLICIES = ("disabled", "hold-known-display-changes-v1")
+_UNKNOWN_REVISION = object()
+
 
 class BoardGeometry:
     """Transform rectified board coordinates into continuous Foundry cells."""
@@ -111,11 +114,14 @@ class ObserverEngine:
     """
 
     def __init__(self, geometry, initial_positions, initial_cells=None, *, geometry_key=None,
-                 detector_factory=None, watermark_mode="provided"):
+                 detector_factory=None, watermark_mode="provided", display_transition_policy="disabled"):
         self.geometry = geometry
         if watermark_mode not in ("provided", "board-template-v1"):
             raise ValueError("Unsupported observer watermark mode")
         self.watermark_mode = watermark_mode
+        if display_transition_policy not in DISPLAY_TRANSITION_POLICIES:
+            raise ValueError("Unsupported observer display-transition policy")
+        self.display_transition_policy = display_transition_policy
         self._detector_factory = RingDetector if detector_factory is None else detector_factory
         if not callable(self._detector_factory):
             raise ValueError("Observer detector factory must be callable")
@@ -149,6 +155,8 @@ class ObserverEngine:
         self._last_timestamp = None
         self._frame_count = 0
         self._invalid_reason = None
+        self._display_baseline_revision = _UNKNOWN_REVISION
+        self._display_observed_revision = None
         self.events = []
         self.last_record = None
         # Clicks declare identity and approximate location. They are not visual
@@ -174,6 +182,9 @@ class ObserverEngine:
                 "detector": {"module": type(self.detector).__module__,
                              "class": type(self.detector).__name__},
                 "watermark": {"mode": self.watermark_mode},
+                "display_transitions": {"policy": self.display_transition_policy,
+                    "notification_is_not_camera_render_synchronization": True,
+                    "automatic_recovery": False},
                 "acquisition": {"settle_seconds": self.acquisition_settle_seconds,
                                 "window_seconds": self.acquisition_window_seconds,
                                 "minimum_measurements": 2},
@@ -270,11 +281,22 @@ class ObserverEngine:
                   "reference_updates": self.reference.reference_updates,
                   "reference_evidence": deepcopy(self.reference.last_evidence),
                   "foundry_token_output": False}
+        if self.display_transition_policy != "disabled":
+            record["display_transition"] = {
+                "policy": self.display_transition_policy,
+                "baseline_revision": (None if self._display_baseline_revision is _UNKNOWN_REVISION
+                                      else self._display_baseline_revision),
+                "observed_revision": self._display_observed_revision,
+                "revision_available": self._display_observed_revision is not None,
+                "requires_explicit_rebind": self._invalid_reason in (
+                    "display_changed_rebind_required", "display_revision_unavailable"),
+                "automatic_recovery": False,
+                "scope": "Known Foundry changes only; no fog segmentation or TV timing verification"}
         self.last_record = deepcopy(record)
         return record
 
     def process(self, board_bgr, excluded_mask, timestamp, *, frame_index=None,
-                locked=True, geometry_key=None):
+                locked=True, geometry_key=None, scene_visual_revision=None):
         now = float(timestamp)
         if not math.isfinite(now) or (self._last_timestamp is not None and now <= self._last_timestamp):
             raise ValueError("Observer capture timestamps must be finite and strictly increasing")
@@ -284,6 +306,9 @@ class ObserverEngine:
             excluded_mask = np.zeros(board_bgr.shape[:2], np.uint8)
         elif not isinstance(excluded_mask, np.ndarray) or excluded_mask.ndim != 2 or excluded_mask.shape != board_bgr.shape[:2]:
             raise ValueError("Caption exclusion mask must match the board image")
+        if self.display_transition_policy != "disabled" and scene_visual_revision is not None:
+            if type(scene_visual_revision) is not int or not 0 <= scene_visual_revision < 2**63:
+                raise ValueError("Scene visual revision must be a nonnegative integer or unavailable")
         mask = np.where(excluded_mask > 0, 255, 0).astype(np.uint8)
         self._watermark_evidence = {"mode": self.watermark_mode, "recognized": False,
                                     "provided_pixels": int(np.count_nonzero(mask))}
@@ -296,6 +321,19 @@ class ObserverEngine:
             self._invalid_reason = self._invalid_reason or "geometry_changed"
         if board_bgr.shape[:2] != (self.geometry.height, self.geometry.width):
             self._invalid_reason = self._invalid_reason or "board_size_changed"
+        if self.display_transition_policy == "hold-known-display-changes-v1":
+            self._display_observed_revision = scene_visual_revision
+            if self._display_baseline_revision is _UNKNOWN_REVISION:
+                if scene_visual_revision is not None:
+                    self._display_baseline_revision = scene_visual_revision
+            elif scene_visual_revision is None:
+                self._invalid_reason = self._invalid_reason or "display_revision_unavailable"
+            elif scene_visual_revision != self._display_baseline_revision:
+                # A relay notification is not proof that AirPlay/the camera has
+                # seen the new pixels. Never resume just because old pixels are
+                # quiet or resemble the old anchors. Explicit rebinding starts
+                # a new causal experiment after the user sees the new display.
+                self._invalid_reason = self._invalid_reason or "display_changed_rebind_required"
         if self.needs_reset:
             state = {"phase": "held", "reason": self._invalid_reason,
                      "pending": None, "active_mini": None, "missing": [],

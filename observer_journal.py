@@ -324,11 +324,15 @@ def replay_journal(folder, *, require_same_code=True, write_preview=False):
     if watermark is not None and (not isinstance(watermark, dict)
                                   or watermark.get("mode") not in ("provided", "board-template-v1")):
         raise ValueError("Unsupported observer watermark mode")
+    display = initial.get("display_transitions", {"policy": "disabled"})
+    if not isinstance(display, dict):
+        raise ValueError("Unsupported observer display-transition policy")
     engine = ObserverEngine(BoardGeometry(initial["view"], initial["warp_size"]),
                             initial["initial_positions"], initial["initial_cells"],
                             geometry_key=initial.get("geometry_key"),
                             detector_factory=_resolve_detector(initial),
-                            watermark_mode=watermark["mode"] if watermark is not None else "provided")
+                            watermark_mode=watermark["mode"] if watermark is not None else "provided",
+                            display_transition_policy=display.get("policy"))
     inputs = [json.loads(line) for line in (folder / "inputs.jsonl").read_text().splitlines()]
     decisions = [json.loads(line) for line in (folder / "decisions.jsonl").read_text().splitlines()]
     timestamps = [float(entry["timestamp"]) for entry in inputs]
@@ -349,6 +353,7 @@ def replay_journal(folder, *, require_same_code=True, write_preview=False):
             board, mask = _read_pixels(folder, entry, "board"), _read_pixels(folder, entry, "mask")
             started = time.perf_counter()
             record = engine.process(board, mask, entry["timestamp"], locked=entry["locked"],
+                                    scene_visual_revision=(entry.get("metadata") or {}).get("scene_visual_revision"),
                                     geometry_key=entry.get("geometry_key"), frame_index=entry.get("frame_index"))
             elapsed.append((time.perf_counter() - started) * 1000)
             if index >= len(decisions) or canonical(record) != canonical(decisions[index]):
