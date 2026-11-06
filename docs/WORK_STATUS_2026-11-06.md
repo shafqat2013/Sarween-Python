@@ -45,19 +45,33 @@ Score identity, origin/destination or justified border abstention, missed/extra
 moves and hand-clear response delay. Keep observer output disconnected from
 Foundry token movement until the acceptance criteria are met.
 
-## Unblocked work authorized next
+## Follow-up work implemented after the GitHub checkpoint
 
-1. Preserve every movement event in a durable run-scoped journal, independently
-   of the bounded frame recording and one-second status export. The current
-   status export can omit events between publication ticks.
-2. Add a small supported camera-preset selector. Keep the validated 1080p/15 mode
-   as default; treat 30 FPS and higher resolution as unvalidated until measured.
-   Resolution/format geometry changes require their own verified calibration.
-3. Include accepted detector-family disagreement in location uncertainty rather
-   than selecting the most optimistic allowance. Preserve border abstentions.
-4. Prepare explicit fog-transition holds and auditable test guidance. Existing
-   observer detection remains a substantially static-background experiment;
-   printed markers or polarization alone do not prove fog robustness.
+1. Accepted moves now append to a run-scoped movement-events.jsonl independently
+   of bounded frame recording and preview refresh. Run/generation IDs distinguish
+   rebindings and recording restarts; pending saves and corruption are visible.
+   Readable TXT/CSV snapshots retain UTC/source/frame data and expose their own
+   export failures separately from the durable JSONL status.
+2. Supported presets are implemented on the phone. Standard 1080p/15 remains the
+   default; Smooth 1080p/30 retains the exact Standard native format, and native
+   Detail 4K/15 is offered only when supported and remains experimental. All modes
+   passed synthetic framing tests; 28 Swift tests, device/simulator compilation
+   and a signed device build passed. The installed working app was not replaced.
+3. Location allowances now include accepted detector-family disagreement without
+   moving centers or altering color/shape gates. Across 1,030 saved frames, all
+   selected centers/radii/confidences stayed identical. The six-move clip still
+   fails strict exact-cell acceptance: two of four required exact destinations,
+   with an additional Salmon AM19/AM20 abstention instead of an optimistic AM20.
+4. New live observer runs record a hold-known-display-changes-v1 policy. Known
+   Foundry visual revisions latch a hold until explicit rebinding; quiet old TV
+   pixels do not trigger automatic recovery. Recorded revision evidence replays
+   identically. This is not automatic fog separation or recovery.
+5. Preview status now identifies the exact JPEG by SHA-256 and capture/frame IDs,
+   so readers can detect an image/status mismatch between their atomic writes.
+
+The first GitHub checkpoint is 81f31c9 on codex/iphone-camera-and-tracking.
+See PHYSICAL_ACCEPTANCE.md for the remaining hardware tests and
+validation/2026-11-06.json for the final portable verification summary.
 
 ## Local evidence locations
 
@@ -65,3 +79,17 @@ The capture Mac retains artifacts/phone-camera-20261106/verification.json and
 actual-usb-feed.json, the methodology review under
 artifacts/methodology-review-20261105/, and prior replay/optical evidence under
 artifacts/poc_single_mover_20261105/. These are not required to build the source.
+
+## Final offline verification
+
+From a clean committed-source checkout with isolated user data: 1,040 Python
+tests ran, 1,023 passed and 17 skipped. All 69 JavaScript checks passed with the
+VM-modules flag. The updated native app passed 28 Swift tests plus device,
+simulator and signed-device builds. Nine localhost cross-language checks covered
+synthetic Standard, Smooth, Detail and landscape JPEGs. These synthetic checks
+are not phone/USB speed, heat, battery or tracking measurements.
+
+The new signed iPhone build is prepared locally for installation when the user
+returns. The working phone installation was preserved. Physical markers/CPL and
+fresh independently reviewed recordings remain the blockers to physical tracking
+acceptance. The saved six-move development clip still fails strict exact cells.

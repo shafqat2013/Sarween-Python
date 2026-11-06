@@ -859,15 +859,47 @@ for a real five-mini, fog-on acceptance run after returning home.
 Retired trackers, old debug tools, superseded builds and obsolete generated
 caches were moved into `deprecated/` without deleting their contents. See
 [the archive index](deprecated/README.md) for original paths and recovery notes.
-The current 0.2.0 app and installer remain in `dist/`. Recordings, saved scans,
-calibration data, map/marker assets and the Auto-wall source were left in place.
+Generated apps and installers are local build products in ignored `dist/`;
+obsolete tracked bundle files have been removed from source control. Build from
+source with `scripts/build_bundle.py`. Recordings, saved scans, calibration data,
+map/marker assets and the separate local Auto-wall checkout were left in place.
 The current app still uses `mini_tracking.py`, `ui_preview.py` (UI test helpers),
 and the remaining `app_bundle_overrides/`; those are not retired.
 
 Future builds exclude the archive and no longer bundle the old band/blob
-trackers. The already-verified 0.2.0 installer is unchanged; this cleanup does
+trackers. The existing local 0.2.0 installer is unchanged; source cleanup does
 not require reinstalling it. Historical build paths in the reliability review
 now resolve under `deprecated/builds/` as documented in the archive index.
+
+## Direct iPhone camera (development prototype)
+
+Sarween Camera supplies a portrait or landscape feed directly over USB to the
+Mac app, without OBS or a virtual camera. Build/install instructions are in
+[ios/SarweenCamera/README.md](ios/SarweenCamera/README.md).
+
+The installed first prototype was checked with real 1080x1920 USB video at
+15 FPS, and the user confirmed Sarween's preview. The newer preset build adds:
+
+- **Standard:** 1080p / 15 FPS, the existing default.
+- **Smooth:** 1080p / 30 FPS only when the identical Standard camera format
+  supports it. Its optical calibration identity is unchanged.
+- **Detail:** native 4K / 15 FPS only when the rear wide camera supports it;
+  experimental, with separate resolution/calibration requirements.
+
+The new modes have compiled and passed synthetic protocol tests, but have not
+been tested on the physical iPhone. The working installed prototype was left
+unchanged while its owner was away. Stop the Mac session before changing
+resolution or orientation, then use a matching camera profile and fresh mini
+bindings. FPS-only calibration reuse depends on retaining the exact same format.
+
+In the observer, movement-events.jsonl now preserves accepted moves separately
+from video-recording limits and preview refreshes. The latest status exposes
+recent events, the full log location and any pending save error. Known Foundry
+visual changes now hold the observer until explicit rebinding; this is a guard
+for its static-background assumption, not implemented automatic fog tracking.
+
+See [the work checkpoint](docs/WORK_STATUS_2026-11-06.md) and the
+[physical acceptance plan](docs/PHYSICAL_ACCEPTANCE.md) for evidence and open work.
 
 ## Backlog
 
@@ -899,9 +931,10 @@ Current priorities, distinguishing implemented software from physical acceptance
    still required; this does not create actors or infer mini assignments.
 8. **Physical taps:** paused, default off and deferred until tracking is reliable.
 9. **Holistic methodology/code review:** completed. See the
-   [read-only review](artifacts/methodology-review-20261105/report.txt) for prioritized
-   findings and proposed tests. Its tracking recommendations have not been silently
-   applied as a refactor.
+   [read-only review](docs/reviews/TRACKING_METHODOLOGY_2026-11-05.txt) for prioritized
+   findings and proposed tests. Durable event history and accepted-family
+   uncertainty have since been addressed explicitly; automatic fog separation and
+   measured physical localization accuracy remain open.
 
 Other retained work:
 

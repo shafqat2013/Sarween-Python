@@ -1,0 +1,144 @@
+SARWEEN TRACKING / METHODOLOGY REVIEW — 2026-11-05
+
+Read-only review of current source and already saved evidence. No product source,
+camera, OBS, Foundry runtime, or thresholds were changed. Source-line references
+below describe the reviewed snapshot; parallel feature work may move those lines.
+This is not a new tracking validation run. report.json records source hashes.
+
+The next decision should be an acceptance gate, not a wholesale rewrite. The
+observer has useful safety and reproducibility machinery, but remains a static-
+background experiment. A successful replay of recordings used during development
+does not establish reliable live play, accurate exact-square labels, or fog support.
+
+1. Preserve movement events independently of input recording. PROVEN DEFECT.
+
+observer_session.py:260-280 publishes at most once a second and includes only the
+current frame's result.events. The preview UI instead receives cumulative
+engine.events at lines 247-251. An event between export ticks can therefore never
+appear in latest.json, and any published event is overwritten by the next empty
+frame. Stopping or exhausting an input recording leaves no durable event stream.
+observer_journal.py:91 and123-126 deliberately cap inputs at 300 seconds; observing
+continues after that cap (observer_session.py:166-168).
+
+This occurred in the actual live Mini6 AR13→AL20 test. recording_001 ended after
+828 inputs at source frame 980, with zero saved events, while the later live state
+retained move_count 1 and the destination. The saved snapshot already has events
+empty. See artifacts/poc_single_mover_20261105/live-blind-move-1501/observation.json
+and latest-status-snapshot.json. Event timing and the full move cannot be replayed.
+
+Safe fix: an append-only, sequence-addressed event journal independent of bounded
+frame recording, plus cumulative/recent events in the export with explicit run ID.
+Test an event between publication ticks, continuation past recording limits, and
+close/restart without duplicates. Keep the frame-recording limit explicit.
+
+2. Fog/rendered-reference integration is missing. DESIGN LIMITATION / GOAL BLOCKER.
+
+poc_scene_reference.py:47-57 explicitly establishes camera-image change, not a
+physical object. Near confirmed anchors it accepts detector candidates directly
+(136-139); elsewhere it requires local changed pixels. Fog, artwork and exposure
+changes can satisfy that evidence too. ObserverEngine.process only receives board,
+mask, time, lock and geometry (observer_session.py:152-158). Foundry rendered images
+are saved separately and labeled asynchronous/not alignment verified (174-194).
+scene_visual_revision is recorded as metadata (210-214,279), not used to gate
+movement. The engine declares substantially static background (observer_engine.py:
+180-182); OBSERVER_TESTING.txt:109-116 correctly documents the restriction.
+
+This review does not prove a current fog false move. It proves the intended
+changing-map discrimination is not implemented by the available reference data.
+Printed registration can improve alignment visibility; it does not itself solve
+physical-versus-displayed foreground separation.
+
+Safe next step: retain observer-only output and test stationary minis while fog,
+lighting and displayed tokens change, then a physical move after settling. Define
+an explicit transition/unknown policy before integrating clock-paired, aligned
+rendered-reference evidence. Avoid treating a settled display as proof of a
+physical base or blindly resetting on every visual revision.
+
+3. Exact-cell labels inherit uncalibrated, selectively optimistic allowances.
+PROVEN DISAGREEMENT HANDLING; ACCURACY CONSEQUENCE NOT YET MEASURED.
+
+poc_ring_detector.py:24-26 calls uncertainty_px an engineering allowance; line 130
+sets it from a few coverage buckets. hybrid_ring_detector.py:38-49 ranks the
+smallest allowance first and merges measurements up to 0.4 grid apart; lines69-78
+retain that selected allowance without accounting for accepted family disagreement.
+observer_engine.py:65-76 then converts it directly to exact-cell/border labels.
+single_mover_state.py:275-280 includes temporal spread, but not calibration,
+registration or cross-family systematic error.
+
+Actual saved optical measurements demonstrate the gap: bright frame 148 Yellow
+selects warm center (346.87, 332.45), allowance 3.36 px, despite also accepting annular
+center (339.99, 329.21), 7.61 px away. Frame 156 pink alternatives differ 8.76 px while the
+selected allowance is 2.52 px. These are observations in artifacts/polarization-
+20261105-164045/away-analysis/detector-comparison.json. Neither alternative is
+independent ground truth; the finding is that accepted disagreement is discarded.
+
+Safe fix: measure base-center error on held-out imagery, include registration and
+family disagreement, and abstain when localization does not support one square.
+Tests should place disagreeing accepted candidates near a border and ensure the
+reported allowance covers the disagreement or the result explicitly abstains.
+Preserve the honest Orange P13/Q13 uncertainty; do not narrow it to pass exact Q13.
+
+4. Reproducibility currently has stronger evidence than generalization or latency.
+VALIDATION GAP, NOT A REPLAY IMPLEMENTATION DEFECT.
+
+observer_journal.py:317-381 verifies source/assets, exact saved inputs and canonical
+decisions, and correctly says this is not independent accuracy. Keep this. The
+failed 116-frame sequence was used to revise caption recognition, pale-ring
+detection and association, so its corrected six-move replay is a development
+regression. Its evaluation.json says so. The 611-frame development result still
+fails one required exact destination: Orange P13/Q13 versus reviewed Q13.
+See visibility-recovery/regressions/{actual003,original611}/evaluation.json and
+visibility-recovery/report.txt:45-64. The 259 ms median processing diagnostic excludes
+capture, core rectification, GUI and recording I/O; it is not hand-clear gameplay
+response time. cv_core.py:1292-1316 timestamps after reading/undistorting, not at
+sensor exposure, so camera transport delay is also outside that measurement.
+
+Next acceptance data: a new user-confirmed sequence withheld from tuning; adjacent
+bases, repeated same-mover moves, temporary hand occlusions, caption phases, one
+stationary mini, and a separate fog-only/physical-after-fog sequence. Score identity,
+order, origin, exact cell or justified abstention, false/missed moves, acquisition
+failure and hand-clear-to-visible-result delay. Save failed initialization too.
+No large test count should substitute for these physical-task criteria.
+
+5. Clarify the two tracker paths and reconcile documentation. MAINTENANCE RISK.
+
+Normal main.py:49 defaults observer_onlyFalse and v3_tracking.py:1190 uses the
+legacy TrackingEngine/detect_minis. The observer runs HybridRingDetector instead
+(observer_session.py:108-110) and explicitly bypasses old detection, taps and token
+emission (v3_tracking.py:1463-1495). This is intentional isolation, but improvements
+to one path do not automatically fix the other. Keep engine name, capability and
+output status explicit until the observer meets acceptance; promote it only through
+one deliberate integration boundary.
+
+README.md:284 says physical tap is enabled by default, while module.js:1736-1742,
+tracking_engine.py:46 and vtt_controls.py:21 default it off. README.md:487 says the
+first screen is Mini Library; the current home defaults to Session. Its803-804
+hardware-dialog description predates the inline startup work. These concrete
+inconsistencies should be corrected after concurrent UI work settles. README was
+not edited by this review. app_bundle_overrides/setup.py duplicates substantial
+setup logic, and calibration.py is copied with an import-order difference; future
+cleanup should isolate bundle behavior rather than maintain parallel algorithms.
+This review found no current calibration behavioral divergence to claim as a bug.
+
+Risks to cover before more threshold tuning (not established live failures):
+
+- Observer initializes pooled appearance once from the first clicked image
+  (observer_engine.py:325-329; annular_ring_detector.py:71 onward). Test caption-
+  covered/partial first images before adding bounded multi-frame initialization.
+- Warm-family NMS suppresses a second center within 1.8 times the larger radius
+  (poc_ring_detector.py:140-142), potentially exceeding one grid square for oversized
+  rings. Test actual neighboring/overlapping bases; Hybrid recovery is not assured.
+- The frame-difference motion guard is not a semantic hand detector
+  (observer_engine.py:91-97). A still hand no longer produces frame motion. Preserve
+  image-level hand/clutter negatives when changing detector gates.
+- latest.jpg and latest.json are each replaced atomically but as separate files
+  (observer_session.py:269-280). A reader can briefly combine a newer image with
+  older state. Include image hash/frame reference or publish an atomic pointer to
+  immutable frame pairs when exact visual/event auditing depends on that pairing.
+
+Preserve the existing strengths: two-measurement base acquisition instead of
+assuming clicks mean detection; unresolved-ID history through masks; explicit
+holds and rebinding after lock/geometry loss; border abstention; deterministic
+caption provenance and exact source/input fingerprints. These mechanisms address
+real earlier failures. The priority is to tighten evidence, then validate one
+bounded operating condition at a time, not remove these safeguards to look faster.

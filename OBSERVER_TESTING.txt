@@ -37,13 +37,15 @@ allow the screen drawings to be hidden while viewport geometry still updates.
 Changing registration mode or layout requires new mini bindings.
 
 1. On Sarween's home screen, click “Start mini observer”. Use the existing
-   Foundry setup and the saved iPhone/OBS camera profile.
+   Foundry setup. For the direct USB feed, choose Sarween Camera and its own
+   calibrated USB-camera profile; the OBS profile is a different capture path.
 2. Wait for a camera image, a Foundry scene and verified marker lock. Keep the
    camera, map pan and zoom fixed during this first test.
 3. In the Mini observer window, click “Choose starting positions”. The view
    freezes. Click the CENTER OF EACH BASE/RING once, for six minis. Those
    clicks assign Mini 1 through Mini 6. Keep the physical minis still while
-   choosing. No individual color scans or new camera calibration are needed.
+   choosing. No individual color scans are needed. A new capture path or changed
+   resolution/orientation needs its own camera calibration before this test.
 4. Observation and an input recording start automatically after the sixth
    click. Those clicks save starting positions; they do not mean the bases have
    been detected. Keep the minis still until the status says “Bases acquired:
@@ -90,6 +92,8 @@ exports a rectified TV preview and status for read-only inspection:
 
 That file points to the active run's latest.jpg and latest.json. Check active,
 updated_at, locked and fresh_board_pixels before interpreting an image as live.
+Verify the preview.sha256 in the run status against latest.jpg: the two files
+are individually atomic, so a reader between writes must retry a mismatched pair.
 Codex can read these files after you launch the updated source app normally.
 
 The first user-launched live test successfully exported camera pixels, but the
@@ -109,8 +113,17 @@ Each observer run has recording_001, recording_002, etc. Each interval contains:
 
 Each interval stops at five minutes or 2 GB. The UI reports the stop; observing
 continues. Disk/save failures are reported instead of silently claiming success.
-Start another recording before making more moves after that limit. Stopping a
-recording is separate from stopping observation.
+Start another recording if exact pixels are needed for later replay. Stopping a
+recording is separate from stopping observation. Accepted movement events keep
+saving independently to the run's movement-events.jsonl, even after the input
+limit. Latest status exposes movement_event_journal (saved/pending/error counts)
+and movement_events (bounded recent history); the full JSONL is authoritative.
+Readable movement-events.txt and movement-events.csv sit beside it. Their UTC,
+source-clock and frame columns are explicit; source clocks are not video-relative
+timestamps. exports.current and exportError describe these derived files without
+changing the durable JSONL saved count. A pending/error status is not a successful save. Run and binding-generation IDs
+separate moves after reinitialization or a new recording. These are software
+observations, not a complete record of the physical movements the detector missed.
 
 New observer recordings use board-template-v1 caption handling. The shared
 engine supplements supplied masks with verified known-caption glyphs in the
@@ -130,9 +143,16 @@ the physical game. Review the video separately for tracking accuracy.
 
 FOG TEST — AFTER THE FIRST MOVEMENT CHECK
 
-With all physical minis still, change Foundry vision/fog once. Watch whether
-the observer reports a physical move. Then make a physical move after the
-display settles. Preserve the recording, including any failures.
+With all physical minis still, change Foundry vision/fog once. A known visual
+revision now holds the observer with display_changed_rebind_required and emits
+no physical move. It remains held even if old camera pixels look quiet: the
+notification is not synchronized to AirPlay or camera arrival. After visually
+confirming the new display, explicitly choose starting positions again. Then
+make a physical move after fresh acquisition. Preserve the whole test.
+
+This verifies a known-change safety hold and fresh acquisition after rebinding.
+It is NOT acceptance of automatic tracking through fog changes. Missing visual
+revision metadata is marked unmonitored; silent animation is not covered.
 
 This is an experiment: the current shared color/boundary detector and settled
 camera-image reference still assume a substantially static map. Foundry render
