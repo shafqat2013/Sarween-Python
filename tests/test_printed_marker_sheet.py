@@ -31,6 +31,36 @@ class SheetTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parameters_from_context(None, context)
 
+    def test_independent_margin_changes_card_without_shrinking_the_pattern(self):
+        no_margin = dimensions(54, 1920, 1080, pattern_size_px=48, marker_margin_px=0)
+        thin_margin = dimensions(54, 1920, 1080, pattern_size_px=48, marker_margin_px=6)
+        thick_margin = dimensions(54, 1920, 1080, pattern_size_px=48, marker_margin_px=12)
+        self.assertEqual([row["markerSizePx"] for row in (no_margin, thin_margin, thick_margin)], [48, 60, 72])
+        self.assertEqual(no_margin["blackSquareMm"], thin_margin["blackSquareMm"])
+        self.assertEqual(thin_margin["blackSquareMm"], thick_margin["blackSquareMm"])
+        self.assertEqual(no_margin["whiteBorderMm"], 0)
+        self.assertAlmostEqual(thin_margin["whiteBorderMm"] * 2, thick_margin["whiteBorderMm"])
+        self.assertAlmostEqual(thin_margin["plateMm"], thin_margin["blackSquareMm"] + 2 * thin_margin["whiteBorderMm"])
+        self.assertEqual(dimensions(54, 1920, 1080, 60)["markerSizePx"], 60)
+        for pattern, margin in ((0, 6), (48, -1), (48, 13), (48, float("nan"))):
+            with self.assertRaises(ValueError):
+                dimensions(54, 1920, 1080, pattern_size_px=pattern, marker_margin_px=margin)
+
+    def test_current_new_settings_require_the_matching_white_margin(self):
+        profile = {"settings": {"displayDiagonalInches": 54}}
+        context = {"ready": True, "settings": {"viewportMarkerSize": 120,
+            "viewportMarkerPatternSize": 48, "viewportMarkerMargin": 6, "viewportMarkerInset": 8},
+            "view": {"viewportWidth": 1920, "viewportHeight": 1080,
+                "registration": {"left": 14, "top": 14, "right": 1906, "bottom": 1066}}}
+        args = parameters_from_context(profile, context)
+        self.assertNotIn("marker_size_px", args)
+        self.assertEqual(args["pattern_size_px"], 48)
+        self.assertEqual(args["marker_margin_px"], 6)
+        self.assertEqual(dimensions(**args)["markerSizePx"], 60)
+        context["settings"]["viewportMarkerMargin"] = 12
+        with self.assertRaisesRegex(ValueError, "disagree"):
+            parameters_from_context(profile, context)
+
     def test_normal_runtime_without_reportlab_writes_four_vector_cards(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "sheet.pdf"
@@ -50,6 +80,17 @@ class SheetTest(unittest.TestCase):
                                  viewport_height=1080, marker_size_px=240, engine="vector")
             self.assertEqual(result["pages"], 4)
             self.assertAlmostEqual(result["plateMm"], 149.43162584)
+
+    def test_new_settings_print_at_the_same_pattern_and_margin_dimensions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "thin-margin.pdf"
+            result = build_sheet(path, diagonal_inches=54, viewport_width=1920,
+                                 viewport_height=1080, pattern_size_px=48, marker_margin_px=6,
+                                 engine="vector")
+            self.assertEqual(result["markerPatternSizePx"], 48)
+            self.assertEqual(result["markerMarginPx"], 6)
+            self.assertEqual(result["markerSizePx"], 60)
+            self.assertIn(b"48px pattern + 6px margin/side", path.read_bytes())
 
     def test_cells_are_real_opencv_dictionary_codes(self):
         import cv2

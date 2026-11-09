@@ -114,8 +114,8 @@ def run_observer_session(service, *, startup=None):
         return (run_live_session(service, observer_only=True) if startup is None else
                 run_live_session(service, observer_only=True, startup=startup))
     finally:
-        # Inline setup owns the guard across a delayed connection or an
-        # inline retry. AppWindow releases it on cancel/session completion.
+        # AppWindow owns the inline runner's guard and releases it before
+        # returning to setup on a delayed connection, failure or completion.
         if startup is None:
             fo.set_observation_only(False)
 

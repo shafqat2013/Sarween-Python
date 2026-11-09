@@ -30,7 +30,11 @@ DISPLAY_SETTING_RULES = {
     "displayDiagonalInches": (10, 150),
     "physicalGridCalibration": (0.5, 1.5),
     "viewportMarkersEnabled": bool,
-    "viewportMarkerSize": (72, 240),
+    # Legacy total tile width stays readable; new editors store the pattern
+    # and per-side margin separately.
+    "viewportMarkerSize": (1, 240),
+    "viewportMarkerPatternSize": (1, 240),
+    "viewportMarkerMargin": (0, 12),
     "viewportMarkerInset": (0, 80),
     "physicalGridAutoApply": bool,
 }
@@ -349,7 +353,11 @@ class HardwareProfiles:
                 if changed_binding and "calibration" not in values:
                     profile["bindingVerified"] = False
             else:
-                profile["settings"] = _display_settings({**(existing or {}).get("settings", {}), **profile["settings"]})
+                settings = _display_settings({**(existing or {}).get("settings", {}), **profile["settings"]})
+                if {"viewportMarkerPatternSize", "viewportMarkerMargin"} & set((values.get("settings") or {})):
+                    from marker_geometry import normalized_marker_settings
+                    settings = normalized_marker_settings(settings)
+                profile["settings"] = _display_settings(settings)
                 if profile.get("targetDisplayId") is not None:
                     profile["targetDisplayId"] = _text(profile["targetDisplayId"], "target display ID", 512)
                 profile["printedMarkerLayout"], profile["printedMarkersEnabled"] = _printed_marker_values(profile)

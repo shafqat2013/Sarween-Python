@@ -8,6 +8,7 @@ returns False on timeout/loss; callers must invalidate tracking while disconnect
 from __future__ import annotations
 
 import copy
+from collections import deque
 import socket
 import threading
 import time
@@ -17,7 +18,8 @@ import numpy as np
 
 from phone_camera_protocol import (
     PHONE_PORT, PROTOCOL_VERSION, CameraCancelled, ProtocolError, encode_packet,
-    jpeg_dimensions, read_packet, validate_frame, validate_hello,
+    jpeg_dimensions, read_packet, validate_frame, validate_frame_optics, validate_hello,
+    validate_feedback, validate_request,
 )
 from phone_usb import PhoneUSBError, USBMuxClient, list_phone_cameras
 
@@ -61,6 +63,11 @@ class PhoneCameraCapture:
         self._code = None
         self._connected = False
         self._dropped = 0
+        self._host_feedback = False
+        self._pending_feedback = None
+        self._feedback_sent_at = 0.
+        self._requests = deque(maxlen=16)
+        self._request_ids = deque(maxlen=64)
         self._thread = threading.Thread(target=self._run, name="SarweenPhoneCamera", daemon=True)
         self._thread.start()
 
@@ -117,14 +124,31 @@ class PhoneCameraCapture:
             self._source_id = hello.get("sourceId")
             self._latest = None
             self._last_received = None
-        self._command("start", ackFrames=True)
+            self._last_frame_metadata = None
+            self._host_feedback = hello.get("hostFeedback") is True
+            self._pending_feedback = None
+            self._requests.clear()
+            self._request_ids.clear()
+            self._feedback_sent_at = 0.
+        self._command("start", ackFrames=True, **({"hostFeedback": True} if self._host_feedback else {}))
         self._update("waiting", "USB connected. Waiting for the iPhone camera…", connected=True)
         previous_seq = previous_capture = -1
         while not self._stop.is_set():
+            self._flush_feedback()
             header, payload = read_packet(sock, cancel_event=self._stop, deadline=time.monotonic() + self.packet_timeout)
             received = self._clock()
             if header["sessionId"] != session:
                 raise ProtocolError("Camera session changed without reconnecting")
+            if header["type"] == "request":
+                if not self._host_feedback:
+                    raise ProtocolError("Phone requests were not negotiated")
+                request = validate_request(header)
+                with self._condition:
+                    if request["requestId"] not in self._request_ids:
+                        self._request_ids.append(request["requestId"])
+                        self._requests.append({**request, "sessionId": session,
+                            "connectionGeneration": self._generation, "hostReceivedMonotonic": received})
+                continue
             if header["type"] in {"status", "pong"}:
                 message = header.get("message", "Waiting for the iPhone camera…")
                 if not isinstance(message, str):
@@ -139,6 +163,7 @@ class PhoneCameraCapture:
                 raise PhoneUSBError("phone_camera_error", str(message)[:1024])
             seq, capture_ns = validate_frame(header, session_id=session, previous_seq=previous_seq,
                                               previous_capture_ns=previous_capture)
+            validate_frame_optics(header, fmt)
             dimensions = (header["width"], header["height"])
             if dimensions != (fmt["width"], fmt["height"]):
                 raise ProtocolError("Phone capture dimensions changed without a new handshake")
@@ -180,6 +205,10 @@ class PhoneCameraCapture:
         with self._condition:
             sock, self._socket = self._socket, None
             self._session_id = None
+            self._host_feedback = False
+            self._pending_feedback = None
+            self._requests.clear()
+            self._request_ids.clear()
         if sock is not None:
             try:
                 sock.shutdown(socket.SHUT_RDWR)
@@ -248,10 +277,49 @@ class PhoneCameraCapture:
                     "deviceId": self.device_id, "deviceName": self._device_name, "sessionId": self._session_id,
                     "sourceId": self._source_id,
                     "connectionGeneration": self._generation, "format": copy.deepcopy(self._format),
+                    "hostFeedback": self._host_feedback,
                     "hostReceiveAgeSeconds": age, "droppedFrames": self._dropped}
 
     def snapshot_metadata(self):
         return self.status
+
+    def send_feedback(self, feedback):
+        """Queue one latest UI update; never wait for USB or perform a read."""
+        value = validate_feedback(feedback)
+        with self._condition:
+            if not self._host_feedback or not self._connected or self._stop.is_set():
+                return False
+            if "sourceSeq" in value:
+                last = self._last_frame_metadata
+                if (not last or last.get("sessionId") != self._session_id
+                        or last.get("seq") != value["sourceSeq"]
+                        or self._clock() - last["hostReceivedMonotonic"] > self.stale_timeout):
+                    return False
+            self._pending_feedback = self._generation, value
+        return True
+
+    def _flush_feedback(self, *, force=False):
+        with self._condition:
+            pending = self._pending_feedback
+            if (pending is None or not self._host_feedback or self._socket is None
+                    or (not force and time.monotonic() - self._feedback_sent_at < .5)):
+                return
+            self._pending_feedback = None
+            if pending[0] != self._generation:
+                return
+            if "sourceSeq" in pending[1]:
+                last = self._last_frame_metadata
+                if (not last or last.get("sessionId") != self._session_id
+                        or self._clock() - last["hostReceivedMonotonic"] > self.stale_timeout):
+                    return
+            self._feedback_sent_at = time.monotonic()
+        self._command("feedback", feedback=pending[1])
+
+    def take_requests(self):
+        with self._condition:
+            requests = list(self._requests)
+            self._requests.clear()
+            return copy.deepcopy(requests)
 
     def isOpened(self):
         return not self._stop.is_set() and not self._terminal
@@ -273,6 +341,7 @@ class PhoneCameraCapture:
             return
         self._stop.set()
         try:
+            self._flush_feedback(force=True)
             self._command("stop")
         except (OSError, ProtocolError):
             pass
@@ -292,8 +361,9 @@ class PhoneCameraCapture:
 def _diagnostic_telemetry(header):
     """Carry small validated measurements; none participates in stream identity."""
     result = {}
-    if type(header.get("torchOn")) is bool:
-        result["torchOn"] = header["torchOn"]
+    for key in ("torchOn", "exposureLocked", "whiteBalanceLocked"):
+        if type(header.get(key)) is bool:
+            result[key] = header[key]
     for key, low, high in (("torchLevel", 0, 1), ("lensPosition", 0, 1), ("iso", 0, 1_000_000)):
         value = header.get(key)
         if type(value) in (int, float) and low <= value <= high:

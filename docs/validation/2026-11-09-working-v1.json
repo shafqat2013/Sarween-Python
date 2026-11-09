@@ -1,0 +1,73 @@
+{
+  "milestone": "Working V1",
+  "date": "2026-11-09",
+  "timezone": "Asia/Bangkok",
+  "branch": "codex/working-v1",
+  "tag": "working-v1-2026-11-09",
+  "user_confirmation": "it worked! every move was picked up!",
+  "live_test": {
+    "scope": "One user-confirmed six-mini static-map session",
+    "accepted_moves": 7,
+    "recorded_frames": 303,
+    "recording_complete": true,
+    "policy": "continuous-static-map-v1",
+    "watermark_mode": "provided",
+    "fog_of_war": false,
+    "camera": "iPhone13Pro / Sarween Camera USB / Wide1x / Detail / portrait2160x3840",
+    "torch": false,
+    "exposure_locked": true,
+    "white_balance_locked": true
+  },
+  "automated_checks": {
+    "python_tests_run": 1288,
+    "skipped": 18,
+    "failures": 0,
+    "errors": 0,
+    "simulated_feedback_moves": 42,
+    "simulated_minis": 6
+  },
+  "runtime": {
+    "python": "3.13.9",
+    "platform": {
+      "system": "Darwin",
+      "machine": "arm64",
+      "macos": "26.3"
+    },
+    "packages": {
+      "numpy": "2.3.4",
+      "opencv-python": "4.12.0",
+      "Pillow": "12.1.1",
+      "websockets": "15.0.1",
+      "pyobjc-core": "12.0",
+      "pyobjc-framework-Cocoa": "12.0",
+      "scipy": "1.16.3",
+      "screeninfo": "0.8.1",
+      "cryptography": "50.0.2",
+      "keyring": "25.6.0"
+    }
+  },
+  "source_sha256": {
+    "main.py": "439001b5332a5b021888944ed0efbf7492122a46f4c021919b717b1419bbdf85",
+    "v3_tracking.py": "a5de6f379c7d0c826af4af0cc4de962b5dfd8fcb847a4299b8f4c56d01d28da9",
+    "cv_core.py": "0534df8eee7b00ee1899a38190e208a31cf69c0454544f88d4ac25f9d4786618",
+    "observer_engine.py": "4fe8b41a70abe2bbd36042f5dda7595bc40a748ba0910e0bb3ba6592aaa463f2",
+    "observer_session.py": "8ec96d506af2b96ed1bcd6dcbf34d204f5ded0f0806a36e68921d48ea2936c31",
+    "core_token_bridge.py": "4e9c6f1deaec80339a5e719e0db2653a8e913d34e304ba0df1879ef28c0ca385",
+    "foundryoutput.py": "3e9b910bc5ebf8f428f72f0da6583a7f556f113f4055532f894733bcfc211c62",
+    "foundry_delivery.py": "91dbfd5f6610f022449fee8dbbc223abcd6e30dc5a673d76e8476780af55b483",
+    "module.js": "69d0b0716a32566b840d450acf5a2506f81e23eead95e459b701f13200048a6b",
+    "module.json": "4ac77d6f41ffdc2cbeb97fc421086bdade23adb5924c6d07f7667a59205699cb",
+    "capture_logic.mjs": "9ab417d5a0e5bd9ff59dbd762600ad5c327dc74567adf428aacffecd53ab195e",
+    "movement_logic.mjs": "3c1fbb2748f1794a7ec6a03e39cc2e1ac8df9a274aaedb7fed52485a190750ce",
+    "ios/SarweenCamera/Sources/App/CameraCapture.swift": "3f0727e4bc355e2db7bb581db24f5fa73ef2a3798a743dd430d58176aab742ee",
+    "ios/SarweenCamera/Sources/App/CameraViewModel.swift": "9d303669394a9868f1e252ea5479f37cd3a12c808c206caaecf9f758910b13fc",
+    "ios/SarweenCamera/Sources/App/SarweenCameraApp.swift": "8e9321572cd0b54e7586d6397ae217097263e7209e775a035db2ae4bc6257308"
+  },
+  "private_state": "Personal calibration/settings, successful recording and signed build are retained locally outside Git.",
+  "remaining_validation": [
+    "Fog/animated maps",
+    "Broader lighting and glare",
+    "Arbitrary digital token artwork resembling physical rings",
+    "Independent exact-cell accuracy and live end-to-end latency"
+  ]
+}

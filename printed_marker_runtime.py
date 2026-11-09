@@ -194,7 +194,9 @@ class PrintedMarkerController:
                     if settings.get("viewportMarkersEnabled") is not True:
                         raise ValueError("Turn on the on-screen placement guides before declaring paper alignment")
                     layout = geometry.guide_aligned_layout(context["view"],
-                        settings.get("viewportMarkerSize"), settings.get("viewportMarkerInset"))
+                        settings.get("viewportMarkerSize"), settings.get("viewportMarkerInset"),
+                        pattern_size=settings.get("viewportMarkerPatternSize"),
+                        margin=settings.get("viewportMarkerMargin"))
                 else:
                     layout = geometry.calibrate_layout(corners, ids, context["view"])
                 if geometry.solve_homography(corners, ids, layout, context["view"], warp_size) is None:

@@ -1,0 +1,85 @@
+SARWEEN — WORKING V1
+Saved 9 November 2026 (Asia/Bangkok)
+
+GitHub branch: codex/working-v1
+Recovery tag:  working-v1-2026-11-09
+
+The user confirmed: "it worked! every move was picked up!"
+This is the first user-confirmed working static-map, six-mini token-following
+checkpoint after removing the global TV-redraw wait. The successful recording
+contains seven accepted moves. Fog-of-war acceptance is still future work.
+
+QUICK RECOVERY
+
+Ask Codex: "Restore Working V1 from working-v1-2026-11-09."
+
+To make a separate recovery checkout yourself, first quit Sarween, then run
+these commands from an existing clone:
+
+    git fetch origin --tags
+    git worktree add ../Sarween-Working-V1 working-v1-2026-11-09
+    cd ../Sarween-Working-V1
+    conda activate py_arm
+    python main.py --dev-no-login
+
+The recovery checkout is separate from ongoing development. Current Mac
+calibration and hardware profiles normally remain available automatically in
+~/Library/Application Support/Sarween, independently of the Git checkout.
+If the checkout already exists, open it instead of running worktree add again.
+
+If a future Foundry module change also needs reverting, restore module.js,
+module.json, capture_logic.mjs, movement_logic.mjs and viewport_markers/ from
+this tag to FoundryVTT/Data/modules/sarween, keeping a backup of the installed
+module first. Then reload Foundry. The module at this checkpoint matches the
+one installed during the successful live test.
+
+PRIVATE RECOVERY BACKUP ON THE CAPTURE MAC
+
+    /Users/shafqat/Batcave/Sarween-Python/artifacts/recovery/working-v1-2026-11-09/
+
+This Git-ignored folder contains:
+
+- sarween-settings/: hardware/calibration profiles, legacy calibration arrays,
+  token mappings, mini samples and startup/display preferences.
+- live-evidence/: the complete successful input recording and movement journal.
+- foundry-module/: the module installed during the successful run.
+- SarweenCamera.app: the signed iPhone build used for testing.
+- python-packages.txt, conda-explicit.txt and manifest.json: local dependency
+  and backup details.
+- source.bundle: an offline Git recovery copy, created after the checkpoint commit.
+
+The private backup is local; GitHub contains source and portable documentation.
+It excludes Keychain sessions and signing private keys. Before restoring settings,
+quit Sarween and save the current settings separately, then restore the selected
+files from sarween-settings/ into ~/Library/Application Support/Sarween/.
+Foundry world/actor databases remain managed separately by Foundry.
+
+WORKING CAMERA / TABLE SETUP
+
+- Sarween Camera on iPhone 13 Pro, USB to Mac.
+- Wide lens, 1x, Detail preset, portrait 2160 x 3840.
+- Torch off; exposure and white balance locked in the successful recording.
+- Camera profile: iPhone · Wide · Sarween Camera.
+- Display profile: TV — 54-inch active screen; 1-inch physical grid.
+- Last reported markers: pattern 80 / white margin 12 / inset 0; CPL LCD index ~20.
+- Six minis with rings; one physical mini moved at a time; fog off.
+
+After recovery, match the phone settings and camera profile. Start session,
+choose six base centers, wait for acquisition and confirm token assignments.
+Starting-click order defines Mini 1–6. Phone controls/UserDefaults and the physical
+CPL angle are not restored by a Git checkout. A development-signed iPhone app may
+need rebuilding/re-signing with Xcode if its signing has expired; source is saved
+under ios/SarweenCamera/.
+
+VALIDATION / FUTURE DEVELOPMENT
+
+The final Python suite ran 1,288 tests: 18 skipped, zero failures/errors. Command-
+driven synthetic feedback tests include 42 sequential moves across all six minis,
+delayed/invisible redraws, retries, output failures and temporal reflections.
+These support the implementation; the user's successful live test is the evidence
+for this working milestone. Exact-square accuracy across all placements, arbitrary
+token artwork, broader lighting setups and fog remain unvalidated.
+
+Keep this branch/tag as the recovery checkpoint. Make future changes on a new
+branch from this commit. Use the tag or exact commit when recovering, rather than
+assuming the latest development branch is still this version.

@@ -6,9 +6,11 @@ import json
 import numpy as np
 import time
 import setup as s
+from copy import deepcopy
 from datetime import datetime
 from app_paths import capture_asset_path, data_path
-from camera_sources import is_phone_camera_index, source_for_index, open_camera_capture, profile_compatible_with_source
+from camera_sources import (is_phone_camera_index, source_for_index, open_camera_capture,
+                            profile_compatible_with_source, require_phone_profile_metadata)
 
 
 def _resource_path(filename: str) -> str:
@@ -19,7 +21,7 @@ def _resource_path(filename: str) -> str:
 DB_CSV = _resource_path("mini_database.csv")
 
 # ── Lazy camera calibration (avoid I/O at import) ─────────────────────────────
-def get_camera_params(image_size=None, *, camera_index=None):
+def get_camera_params(image_size=None, *, camera_index=None, source_metadata=None):
     from camera_profile_runtime import camera_params
     selection = s.load_last_selection() or {}
     selected_index = selection.get("webcam_index")
@@ -34,7 +36,8 @@ def get_camera_params(image_size=None, *, camera_index=None):
         if not profile_compatible_with_source(profile, source):
             return None, None
         if is_phone_camera_index(camera_index):
-            return camera_params(image_size, profiles=profiles, profile_id=profile_id)
+            require_phone_profile_metadata(profile, source, source_metadata)
+            return camera_params(image_size, profiles=profiles, profile_id=profile_id, source_metadata=source_metadata)
     return camera_params(image_size, profile_id=profile_id)
 
 
@@ -244,18 +247,21 @@ def _capture_live_frame(camera_index=None, *, warmup_reads=0, settle_seconds=0):
         ret, frame = cap.read()
         if (not ret or frame is None) and is_phone_camera_index(camera_index):
             print("❌ No fresh iPhone frame. Keep Sarween Camera open and resumed, check the USB cable, then retry capture.")
-        return ret, frame, camera_index
+        metadata = getattr(cap, "last_frame_metadata", None) if is_phone_camera_index(camera_index) else None
+        metadata = deepcopy(metadata) if isinstance(metadata, dict) else None
+        return ret, frame, camera_index, metadata
     finally:
         cap.release()
 
 
 def capture_background(camera_index=None):
     print("📸 Capturing background (blur)...")
-    ret, frame, camera_index = _capture_live_frame(camera_index, warmup_reads=10, settle_seconds=1)
+    ret, frame, camera_index, metadata = _capture_live_frame(camera_index, warmup_reads=10, settle_seconds=1)
     if not ret or frame is None:
         print("❌ Could not capture background.")
         return None
-    camera_matrix, dist_coeffs = get_camera_params((frame.shape[1], frame.shape[0]), camera_index=camera_index)
+    params = {"source_metadata": metadata} if is_phone_camera_index(camera_index) else {}
+    camera_matrix, dist_coeffs = get_camera_params((frame.shape[1], frame.shape[0]), camera_index=camera_index, **params)
     if camera_matrix is not None and dist_coeffs is not None:
         frame = cv2.undistort(frame, camera_matrix, dist_coeffs)
     gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -264,11 +270,12 @@ def capture_background(camera_index=None):
 
 def capture_background_full(camera_index=None):
     print("📸 Capturing background (bgr+blur)...")
-    ret, frame, camera_index = _capture_live_frame(camera_index, warmup_reads=10, settle_seconds=1)
+    ret, frame, camera_index, metadata = _capture_live_frame(camera_index, warmup_reads=10, settle_seconds=1)
     if not ret or frame is None:
         print("❌ Could not capture background.")
         return None
-    camera_matrix, dist_coeffs = get_camera_params((frame.shape[1], frame.shape[0]), camera_index=camera_index)
+    params = {"source_metadata": metadata} if is_phone_camera_index(camera_index) else {}
+    camera_matrix, dist_coeffs = get_camera_params((frame.shape[1], frame.shape[0]), camera_index=camera_index, **params)
     if camera_matrix is not None and dist_coeffs is not None:
         frame = cv2.undistort(frame, camera_matrix, dist_coeffs)
     gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -649,11 +656,12 @@ def capture_mini(
     mini_id=None,
     name=None
 ):
-    ret, frame_bgr, camera_index = _capture_live_frame(camera_index, warmup_reads=5)
+    ret, frame_bgr, camera_index, metadata = _capture_live_frame(camera_index, warmup_reads=5)
     if not ret or frame_bgr is None:
         print("❌ Could not capture mini.")
         return None
-    camera_matrix, dist_coeffs = get_camera_params((frame_bgr.shape[1], frame_bgr.shape[0]), camera_index=camera_index)
+    params = {"source_metadata": metadata} if is_phone_camera_index(camera_index) else {}
+    camera_matrix, dist_coeffs = get_camera_params((frame_bgr.shape[1], frame_bgr.shape[0]), camera_index=camera_index, **params)
     frame_bgr = cv2.undistort(frame_bgr, camera_matrix, dist_coeffs) if (camera_matrix is not None and dist_coeffs is not None) else frame_bgr
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (21, 21), 0)

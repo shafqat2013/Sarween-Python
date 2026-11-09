@@ -167,12 +167,100 @@ class SingleMoverTests(unittest.TestCase):
         move, = state.update(frame, 2.3)
         self.assertEqual(move["first_visible_time"], 2)
 
+    def slow_layout(self, state):
+        origins = [candidate(20, 20), candidate(80, 20)]
+        for index in range(10):
+            self.assertEqual(state.update(origins, index * .6), [])
+
+    def test_regular_slow_capture_confirms_each_move_from_distinct_observations(self):
+        state = self.make()
+        self.slow_layout(state)
+        self.assertEqual(state.update([candidate(80, 20), candidate(45, 60)], 6.0), [])
+        first, = state.update([candidate(80, 20), candidate(45, 60)], 6.6)
+        self.assertEqual((first["mini"], first["from_xy"], first["to_xy"], first["samples"]),
+                         ("one", (20, 20), (45, 60), 2))
+        self.assertEqual(state.update([candidate(45, 60), candidate(105, 60)], 7.2), [])
+        second, = state.update([candidate(45, 60), candidate(105, 60)], 7.8)
+        self.assertEqual((second["mini"], second["from_xy"], second["to_xy"]),
+                         ("two", (80, 20), (105, 60)))
+
+    def test_legacy_policy_reproduces_slow_capture_confirmation_starvation(self):
+        state = SingleMover({"one": (20, 20), "two": (80, 20)}, 25,
+                            timing_policy="fixed-gap-v1")
+        self.slow_layout(state)
+        for index in range(7):
+            self.assertEqual(state.update([candidate(80, 20), candidate(45, 60)], 6 + index * .6), [])
+            self.assertEqual(state.status["pending"]["samples"], 1)
+        self.assertNotIn("timing", state.status)
+
+    def test_a_sudden_gap_cannot_train_the_limit_that_checks_it(self):
+        state = self.make()
+        origins = [candidate(20, 20), candidate(80, 20)]
+        for index in range(10):
+            state.update(origins, index * .1)
+        frame = [candidate(80, 20), candidate(45, 60)]
+        state.update(frame, 1.0)
+        self.assertEqual(state.update(frame, 1.8), [])
+        move, = state.update(frame, 2.0)
+        self.assertEqual(move["first_visible_time"], 1.8)
+
+    def test_slow_cadence_does_not_bridge_a_real_outage(self):
+        state = self.make()
+        self.slow_layout(state)
+        frame = [candidate(80, 20), candidate(45, 60)]
+        state.update(frame, 6.0)
+        self.assertEqual(state.update(frame, 7.3), [])
+        move, = state.update(frame, 7.9)
+        self.assertEqual(move["first_visible_time"], 7.3)
+        self.assertEqual(move["samples"], 2)
+
+    def test_repeated_stills_never_advance_slow_cadence_confirmation(self):
+        state = self.make()
+        self.slow_layout(state)
+        frame = [candidate(80, 20), candidate(45, 60)]
+        state.update(frame, 6.0)
+        for _ in range(10):
+            self.assertEqual(state.update(frame, 6.0), [])
+            self.assertEqual(state.status["pending"]["samples"], 1)
+        move, = state.update(frame, 6.6)
+        self.assertEqual(move["samples"], 2)
+
+    def test_sparse_stills_do_not_expand_the_hard_gap_bound(self):
+        state = self.make()
+        frame = [candidate(80, 20), candidate(45, 60)]
+        for now in (0, 2, 4, 6, 8, 10):
+            self.assertEqual(state.update(frame, now), [])
+            self.assertLessEqual(state.maximum_observation_gap, 1)
+            self.assertIsNone(state.status["timing"]["cadence_seconds"])
+
+    def test_zero_settling_duration_still_needs_two_new_observations(self):
+        state = SingleMover({"one": (20, 20), "two": (80, 20)}, 25, settle_seconds=0)
+        frame = [candidate(80, 20), candidate(45, 60)]
+        self.assertEqual(state.update(frame, 0), [])
+        self.assertEqual(state.update(frame, 0), [])
+        move, = state.update(frame, .1)
+        self.assertEqual(move["samples"], 2)
+
+    def test_slow_cadence_masking_and_obstructions_still_reset_destinations(self):
+        for hidden, obstructed in (({"one"}, False), (set(), True)):
+            with self.subTest(hidden=hidden, obstructed=obstructed):
+                state = self.make()
+                self.slow_layout(state)
+                frame = [candidate(80, 20), candidate(45, 60)]
+                state.update(frame, 6.0)
+                self.assertEqual(state.update(frame, 6.6, unavailable=hidden, obstructed=obstructed), [])
+                self.assertEqual(state.update(frame, 7.2), [])
+                move, = state.update(frame, 7.8)
+                self.assertEqual(move["first_visible_time"], 7.2)
+
     def test_invalid_input_is_rejected(self):
         for initial, grid, settle in (({}, 25, .2), ({"a": (0, 0)}, 0, .2),
                                       ({"a": (0, 0)}, 25, -.2),
                                       ({"a": (0, 0), "b": (0, 0)}, 25, .2)):
             with self.assertRaises(ValueError):
                 SingleMover(initial, grid, settle)
+        with self.assertRaisesRegex(ValueError, "timing policy"):
+            SingleMover({"a": (0, 0)}, 25, timing_policy="unbounded")
         state = self.make()
         for item in ({"cx": math.nan, "cy": 0}, {"cx": 0},
                      candidate(0, 0, uncertainty_px=-1), candidate(0, 0, confidence=2)):

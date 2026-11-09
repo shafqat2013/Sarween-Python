@@ -90,9 +90,32 @@ class HardwareProfileTests(unittest.TestCase):
         self.assertEqual(self.store.active_profile("display")["targetDisplayId"], "external-tv")
         self.assertEqual(self.store.active_profile("display")["settings"]["displayDiagonalInches"], 54)
         self.assertEqual(self.store.list_profiles("camera"), [])
-        for invalid in ({}, {"viewportMarkerSize": 71}, {"physicalGridAutoApply": 1},
+        for invalid in ({}, {"viewportMarkerSize": 0}, {"physicalGridAutoApply": 1},
                         {"displayDiagonalInches": "54"}, {"unknown": 1}, {"targetGridInches": float("nan")}):
             with self.assertRaises(ValueError):
+                self.store.upsert_profile("display", {"name": "Invalid", "settings": invalid})
+
+    def test_small_legacy_profiles_stay_readable_and_new_fields_round_trip(self):
+        legacy = self.store.upsert_profile("display", {"name": "Small legacy markers",
+            "settings": {"viewportMarkerSize": 36, "viewportMarkerInset": 8}})
+        before = self.path.read_bytes()
+        self.assertEqual(self.store.get_profile("display", legacy["id"])["settings"]["viewportMarkerSize"], 36)
+        self.assertEqual(before, self.path.read_bytes())
+        updated = self.store.upsert_profile("display", {"settings": {"viewportMarkerMargin": 0}},
+                                            profile_id=legacy["id"])
+        self.assertEqual(updated["settings"], {"viewportMarkerPatternSize": 24,
+            "viewportMarkerMargin": 0, "viewportMarkerInset": 8})
+        self.assertEqual(self.store.get_profile("display", legacy["id"])["settings"], updated["settings"])
+
+    def test_marker_pattern_and_margin_ranges_do_not_reintroduce_72_pixel_floor(self):
+        for pattern, margin in ((1, 0), (48, 12), (240, 12)):
+            saved = self.store.upsert_profile("display", {"name": f"{pattern}-{margin}", "settings": {
+                "viewportMarkerPatternSize": pattern, "viewportMarkerMargin": margin}})
+            self.assertEqual(saved["settings"]["viewportMarkerPatternSize"], pattern)
+        for invalid in ({"viewportMarkerPatternSize": 0}, {"viewportMarkerPatternSize": 241},
+                        {"viewportMarkerMargin": -1}, {"viewportMarkerMargin": 13},
+                        {"viewportMarkerPatternSize": True}, {"viewportMarkerMargin": float("nan")}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 self.store.upsert_profile("display", {"name": "Invalid", "settings": invalid})
 
     def test_calibration_requires_explicit_selection_verified_binding_and_exact_final_feed(self):

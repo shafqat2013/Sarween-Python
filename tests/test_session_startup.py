@@ -77,6 +77,12 @@ class Button:
     def configure(self, **options):
         self.options.update(options)
 
+    def pack(self, **_options):
+        self.packed = True
+
+    def pack_forget(self):
+        self.packed = False
+
 
 class Progress:
     def __init__(self):

@@ -55,7 +55,7 @@ class CameraCorrection:
         self.applied = False
         self.reason = "No camera profile selected; lens correction is off."
 
-    def resolve(self, image_size):
+    def resolve(self, image_size, *, source_metadata=None):
         size = tuple(int(value) for value in image_size)
         try:
             revision = self.profiles.revision() if self.profile_id else None
@@ -64,6 +64,17 @@ class CameraCorrection:
             self.matrix, self.dist_coeffs, self.applied = None, None, False
             self.reason = f"Camera calibration unavailable: {exc}"
             return None, None
+        if self.profile_id:
+            from camera_sources import PHONE_PROFILE_HINT, PHONE_SOURCE, phone_profile_mismatch_reason
+            selected = self.profiles.get_profile("camera", self.profile_id)
+            if selected and selected.get("sourceHint") == PHONE_PROFILE_HINT:
+                reason = phone_profile_mismatch_reason(selected,
+                    {"type": PHONE_SOURCE, "deviceId": selected.get("deviceLabel")}, source_metadata)
+                if reason:
+                    self._size, self._revision = size, None
+                    self.matrix, self.dist_coeffs, self.applied = None, None, False
+                    self.reason = reason
+                    return None, None
         if size == self._size and revision == self._revision:
             return self.matrix, self.dist_coeffs
         self._size, self._revision = size, revision
@@ -88,8 +99,8 @@ class CameraCorrection:
                               "frameSize": list(self._size) if self._size else None})
 
 
-def camera_params(image_size=None, *, profiles=None, profile_id=_ACTIVE_PROFILE):
+def camera_params(image_size=None, *, profiles=None, profile_id=_ACTIVE_PROFILE, source_metadata=None):
     """Compatibility helper for one-shot mini captures; never load legacy NPYs."""
     if image_size is None:
         return None, None
-    return CameraCorrection(profiles=profiles, profile_id=profile_id).resolve(image_size)
+    return CameraCorrection(profiles=profiles, profile_id=profile_id).resolve(image_size, source_metadata=source_metadata)

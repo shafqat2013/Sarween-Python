@@ -135,6 +135,8 @@ class InlineHomeLifecycleTests(unittest.TestCase):
              patch.object(v3_tracking, "begin_session", return_value=None) as begin, \
              patch.object(v3_tracking, "close_pending_recording"):
             app.start_session(observer=True)
+            # Foundry startup must remain able to unpause before the runner.
+            guard.assert_not_called()
             startup = app._startup
             draft = startup.selection_data
             startup.options["on_ready"](startup)
@@ -156,13 +158,12 @@ class InlineHomeLifecycleTests(unittest.TestCase):
             self.assertIsNone(app._startup)
             self.assertEqual(begin.call_count, 1)
             startup.dispose.assert_called_once()
-            self.assertEqual([call.args[0] for call in guard.call_args_list],
-                             [True, True, True, False])
+            self.assertFalse(guard.call_args_list[-1].args[0])
         app.root.withdraw.assert_not_called()
         app.root.destroy.assert_not_called()
         self.assertIs(app._startup_factory.call_args.kwargs["runtime_parent"], app.runtime_host)
 
-    def test_camera_failure_keeps_hardware_draft_and_observer_guard_until_cancel(self):
+    def test_camera_failure_keeps_draft_and_releases_guard_before_setup_retry(self):
         app = home_double()
         app.run_observer.side_effect = RuntimeError("Selected camera is unavailable")
         with patch.object(main.fo, "set_observation_only") as guard, \
@@ -176,13 +177,13 @@ class InlineHomeLifecycleTests(unittest.TestCase):
             self.assertTrue(app.busy)
             startup.show_error.assert_called_once_with("Selected camera is unavailable")
             startup.dispose.assert_not_called()
-            self.assertEqual([call.args[0] for call in guard.call_args_list], [True])
+            self.assertEqual([call.args[0] for call in guard.call_args_list], [True, False])
             self.assertIn("needs attention", app.status.get())
             self.assertIn("camera is unavailable", app.diagnostic.get())
             startup.cancel()
             startup.dispose.assert_called_once()
             self.assertFalse(app.busy)
-            self.assertEqual([call.args[0] for call in guard.call_args_list], [True, False])
+            self.assertFalse(guard.call_args_list[-1].args[0])
         app.root.withdraw.assert_not_called()
         app.root.destroy.assert_not_called()
 
@@ -231,7 +232,7 @@ class InlineHomeLifecycleTests(unittest.TestCase):
             app.start_session(observer=True)
         self.assertFalse(app.busy)
         self.assertIsNone(app._startup)
-        self.assertEqual([call.args[0] for call in guard.call_args_list], [True, False])
+        guard.assert_not_called()
         self.assertIn("Hardware inventory unavailable", app.diagnostic.get())
 
 

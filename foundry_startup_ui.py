@@ -56,7 +56,8 @@ class FoundryStartupControls(ttk.LabelFrame):
         label.grid(row=6, column=0, columnspan=2, sticky="ew", pady=4)
         label.bind("<Configure>", lambda event, label=label: label.configure(wraplength=max(100, event.width)))
         note = ttk.Label(self, text="Uses your normal Foundry login. Passwords are never saved. "
-                         "For automatic login, close Foundry once and launch it here.", wraplength=450, justify="left")
+                         "Already open? Join your world normally; Sarween will reconnect and finish setup. "
+                         "Automatic login is available when Sarween launches Foundry.", wraplength=450, justify="left")
         note.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(2, 8))
         note.bind("<Configure>", lambda event, note=note: note.configure(wraplength=max(100, event.width)))
         advanced = ttk.LabelFrame(self, text="Application and local connection", padding=6)

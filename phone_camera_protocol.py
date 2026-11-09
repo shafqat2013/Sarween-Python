@@ -11,6 +11,7 @@ import math
 import socket
 import struct
 import time
+import uuid
 
 PROTOCOL_VERSION = 1
 PHONE_PORT = 52781
@@ -18,6 +19,8 @@ MAX_HEADER_BYTES = 64 * 1024
 MAX_JPEG_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_PIXELS = 32 * 1024 * 1024
 MAX_IMAGE_SIDE = 8192
+PHONE_REQUEST_ACTIONS = frozenset({"calibration.capture", "calibration.finish", "calibration.cancel",
+                                   "cpl.reference", "cpl.target", "cpl.reset"})
 
 
 class ProtocolError(ValueError):
@@ -49,7 +52,7 @@ def _header(header):
     if header.get("protocolVersion") != PROTOCOL_VERSION or type(header.get("protocolVersion")) is not int:
         raise ProtocolError("Unsupported camera protocol version")
     kind = header.get("type")
-    if not isinstance(kind, str) or kind not in {"hello", "frame", "start", "stop", "ping", "pong", "ack", "status", "error"}:
+    if not isinstance(kind, str) or kind not in {"hello", "frame", "start", "stop", "ping", "pong", "ack", "status", "error", "feedback", "request"}:
         raise ProtocolError("Unknown camera packet type")
     size = integer(header.get("payloadBytes"), "payloadBytes", 0, MAX_JPEG_BYTES)
     if kind != "frame" and size:
@@ -136,6 +139,8 @@ def validate_hello(header):
     name = header.get("deviceName")
     if not isinstance(name, str) or not name or len(name) > 256:
         raise ProtocolError("Invalid deviceName")
+    if "hostFeedback" in header and type(header["hostFeedback"]) is not bool:
+        raise ProtocolError("Invalid hostFeedback capability")
     if "sourceId" in header and (not isinstance(header["sourceId"], str)
                                   or not header["sourceId"] or len(header["sourceId"]) > 512):
         raise ProtocolError("Invalid sourceId")
@@ -146,7 +151,95 @@ def validate_hello(header):
     fps = fmt.get("fps")
     if isinstance(fps, bool) or not isinstance(fps, (float, int)) or not 0 < fps <= 120:
         raise ProtocolError("Invalid capture frame rate")
+    if "lens" in fmt and (not isinstance(fmt["lens"], str) or fmt["lens"] not in {"wide", "ultra-wide", "telephoto"}):
+        raise ProtocolError("Unsupported phone camera lens")
+    if "nativeFieldOfViewDegrees" in fmt:
+        fov = fmt["nativeFieldOfViewDegrees"]
+        if type(fov) not in (int, float) or not math.isfinite(fov) or not 0 < fov < 180:
+            raise ProtocolError("Invalid phone camera field of view")
     return dict(fmt)
+
+
+def validate_request(header):
+    if (header.get("type") != "request" or not isinstance(header.get("action"), str)
+            or header["action"] not in PHONE_REQUEST_ACTIONS):
+        raise ProtocolError("Unsupported phone request")
+    request_id = header.get("requestId")
+    try:
+        if not isinstance(request_id, str) or len(request_id) != 36:
+            raise ValueError()
+        uuid.UUID(request_id)
+    except (ValueError, AttributeError) as exc:
+        raise ProtocolError("Invalid phone requestId") from exc
+    return {"requestId": request_id, "action": header["action"]}
+
+
+def validate_feedback(value):
+    """Allow only small documented UI values, never arbitrary remote commands."""
+    if not isinstance(value, dict) or value.get("kind") not in ("preview", "tracking", "calibration"):
+        raise ProtocolError("Invalid phone feedback kind")
+    if set(value) - {"kind", "sourceSeq", "markers", "calibration", "cpl"}:
+        raise ProtocolError("Unknown phone feedback field")
+    result = {"kind": value["kind"]}
+    if "sourceSeq" in value:
+        result["sourceSeq"] = integer(value["sourceSeq"], "feedback sourceSeq")
+    for section in ("markers", "calibration", "cpl"):
+        if section not in value:
+            continue
+        item = value[section]
+        if not isinstance(item, dict):
+            raise ProtocolError(f"Invalid {section} feedback")
+        allowed = ({"ids", "requiredIds", "count", "required", "locked"} if section == "markers" else
+                   {"active", "captured", "required", "title", "message", "reason", "mode", "canFinish", "countdownSeconds"}
+                   if section == "calibration" else {"state", "index", "target", "message"})
+        if set(item) - allowed:
+            raise ProtocolError(f"Unknown {section} feedback field")
+        output = {}
+        for key, field in item.items():
+            if key in ("ids", "requiredIds"):
+                if not isinstance(field, list) or len(field) > 4:
+                    raise ProtocolError("Invalid feedback marker IDs")
+                output[key] = [integer(i, "marker ID", 0, 249) for i in field]
+                if len(set(output[key])) != len(output[key]):
+                    raise ProtocolError("Duplicate feedback marker IDs")
+            elif key in ("locked", "active", "canFinish"):
+                if type(field) is not bool:
+                    raise ProtocolError(f"Invalid feedback {key}")
+                output[key] = field
+            elif key in ("count", "captured", "required"):
+                output[key] = integer(field, f"feedback {key}", 0, 500)
+            elif key in ("index", "target", "countdownSeconds"):
+                if type(field) not in (int, float) or not math.isfinite(field) or not 0 <= field <= 10000:
+                    raise ProtocolError(f"Invalid feedback {key}")
+                output[key] = field
+            else:
+                if not isinstance(field, str) or len(field) > (300 if key == "message" else 120):
+                    raise ProtocolError(f"Invalid feedback {key}")
+                if key == "mode" and field not in ("sweep", "manual", "timed", "steady"):
+                    raise ProtocolError("Invalid feedback calibration mode")
+                output[key] = field
+        if section == "markers":
+            if (not {"ids", "requiredIds", "count", "required"}.issubset(output)
+                    or len(output["requiredIds"]) != 4 or output["required"] != 4
+                    or not set(output["ids"]).issubset(output["requiredIds"])
+                    or output["count"] != len(output["ids"])):
+                raise ProtocolError("Inconsistent feedback marker count")
+        result[section] = output
+    if len(json.dumps(result, allow_nan=False).encode()) > 4096:
+        raise ProtocolError("Phone feedback exceeds limit")
+    return result
+
+
+def validate_frame_optics(header, capture_format):
+    """Optical changes require a new hello, even at the same image size.
+
+    Older v1 frames omitted these redundant fields; compare them when sent.
+    The negotiated hello remains the authoritative calibration identity.
+    """
+    for key in ("cameraPosition", "lens", "zoom", "stabilization",
+                "geometricDistortionCorrection", "hdr", "nativeFieldOfViewDegrees"):
+        if key in header and (key not in capture_format or header[key] != capture_format[key]):
+            raise ProtocolError(f"Phone camera {key} changed without a new handshake")
 
 
 def validate_frame(header, *, session_id, previous_seq=-1, previous_capture_ns=-1):

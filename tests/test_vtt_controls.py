@@ -161,29 +161,53 @@ class VTTControlTests(unittest.TestCase):
 
     def test_settings_preserve_drafts_then_clear_after_acknowledgement(self):
         controls = self.controls()
-        controls.variables["viewportMarkerSize"].set("160")
-        controls._edited("viewportMarkerSize")
+        controls.variables["viewportMarkerPatternSize"].set("160")
+        controls._edited("viewportMarkerPatternSize")
         remote = {**ready_status()["settings"], "viewportMarkerInset": 16}
         controls.refresh(ready_status(settings=remote))
-        self.assertEqual(controls.variables["viewportMarkerSize"].get(), "160")
+        self.assertEqual(controls.variables["viewportMarkerPatternSize"].get(), "160")
         self.assertEqual(controls.variables["viewportMarkerInset"].get(), 16.0)
         controls._read_status.side_effect = [ready_status(settings=remote), ready_status(pending=True, settings=remote)]
-        self.assertTrue(controls.apply_settings(("viewportMarkerSize", "viewportMarkerInset")))
+        self.assertTrue(controls.apply_settings(("viewportMarkerPatternSize", "viewportMarkerInset")))
         controls._request.assert_called_once_with("settings.set", {"settings": {
-            "viewportMarkerSize": 160.0, "viewportMarkerInset": 16.0}})
-        controls.refresh(ready_status(settings={**remote, "viewportMarkerSize": 160}))
+            "viewportMarkerPatternSize": 160.0, "viewportMarkerInset": 16.0}})
+        controls.refresh(ready_status(settings={**remote, "viewportMarkerPatternSize": 160}))
         self.assertEqual(controls._dirty, set())
 
     def test_failed_setting_keeps_draft_and_disconnection_message_remains_visible(self):
         controls = self.controls()
-        controls.variables["viewportMarkerSize"].set("160")
-        controls._edited("viewportMarkerSize")
+        controls.variables["viewportMarkerPatternSize"].set("160")
+        controls._edited("viewportMarkerPatternSize")
         controls._request.return_value = False
-        self.assertFalse(controls.apply_settings(("viewportMarkerSize",)))
-        self.assertEqual(controls.variables["viewportMarkerSize"].get(), "160")
+        self.assertFalse(controls.apply_settings(("viewportMarkerPatternSize",)))
+        self.assertEqual(controls.variables["viewportMarkerPatternSize"].get(), "160")
         controls._notice = "Old validation message"
         controls.refresh(ready_status(connected=False, message="Connect Foundry to use VTT controls."))
         self.assertEqual(controls.message.get(), "Connect Foundry to use VTT controls.")
+
+    def test_margin_field_reports_total_without_resizing_the_pattern(self):
+        controls = self.controls()
+        controls.marker_total = Variable()
+        controls.variables["viewportMarkerPatternSize"].set("48")
+        for margin, total in ((0, 48), (6, 60), (12, 72)):
+            controls.variables["viewportMarkerMargin"].set(str(margin))
+            controls._update_marker_total()
+            self.assertIn(f"Total width: {total} pixels", controls.marker_total.get())
+            self.assertEqual(controls.variables["viewportMarkerPatternSize"].get(), "48")
+
+    def test_small_width_and_zero_margin_are_allowed_and_invalid_margin_rejected(self):
+        self.assertEqual(parse_settings({"viewportMarkerPatternSize": "24", "viewportMarkerMargin": "0"},
+                         ("viewportMarkerPatternSize", "viewportMarkerMargin")),
+                         {"viewportMarkerPatternSize": 24, "viewportMarkerMargin": 0})
+        for value in (-1, 13, float("nan"), True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse_settings({"viewportMarkerMargin": value}, ("viewportMarkerMargin",))
+
+    def test_legacy_module_size_is_converted_for_new_controls(self):
+        controls = self.controls()
+        controls._sync_settings({"viewportMarkerSize": 72}, False)
+        self.assertEqual(controls.variables["viewportMarkerPatternSize"].get(), 48)
+        self.assertEqual(controls.variables["viewportMarkerMargin"].get(), 12)
 
     def test_assignment_request_supports_new_mini_and_duplicate_token_names(self):
         controls = self.controls()

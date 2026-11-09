@@ -1,6 +1,7 @@
 """Small, stateful capture gate for a live ChArUco calibration preview.
 
-This gate selects steady, sharp, different board views. Its conservative quality
+This gate selects sharp, different board views, with optional steady capture.
+Sweep mode accepts clear views during slow continuous movement. Its quality
 thresholds are heuristics, not a guarantee of a good lens calibration: the final
 solver error and corrected-image review still matter. Sharpness is measured on
 the board ROI so an OBS canvas's black sidebars do not bias the result.
@@ -18,15 +19,20 @@ class CalibrationCaptureGate:
     def __init__(self, total=10, *, automatic=True, start_delay=5.0, hold_seconds=1.0,
                  cooldown_seconds=2.0, board_columns=6, board_rows=4,
                  min_corners=10, min_sharpness=35.0, stable_motion=0.025,
-                 max_similar_tilt=3, min_motion_pixels=6.0, max_motion_pixels=8.0):
+                 max_similar_tilt=3, min_motion_pixels=6.0, max_motion_pixels=8.0,
+                 mode="steady", sweep_spacing_seconds=0.35):
         if total < 1 or board_columns < 2 or board_rows < 2 or min_corners < 4 or max_similar_tilt < 1:
             raise ValueError("Capture and board counts must be positive.")
         if any(not math.isfinite(value) or value < 0 for value in
                (start_delay, hold_seconds, cooldown_seconds, min_sharpness, stable_motion,
-                min_motion_pixels, max_motion_pixels)):
+                min_motion_pixels, max_motion_pixels, sweep_spacing_seconds)):
             raise ValueError("Capture thresholds must be finite and non-negative.")
         if max_motion_pixels < min_motion_pixels:
             raise ValueError("Maximum motion tolerance must be at least the minimum.")
+        if mode not in {"steady", "sweep"}:
+            raise ValueError("Choose steady or sweep calibration capture.")
+        self.mode = mode
+        self.sweep_spacing_seconds = float(sweep_spacing_seconds)
         self.total = int(total)
         self.automatic = bool(automatic)
         self.start_delay = float(start_delay)
@@ -248,11 +254,12 @@ class CalibrationCaptureGate:
             self._reset_hold(reason)
             return self._status(now, message, reason, sharpness=sharpness)
 
-        if self._anchor is None:
-            self._anchor, self._stable_since = view, now
-        elif self._motion(view):
-            self._reset_hold("motion")
-            self._anchor, self._stable_since = view, now
+        if self.mode == "steady":
+            if self._anchor is None:
+                self._anchor, self._stable_since = view, now
+            elif self._motion(view):
+                self._reset_hold("motion")
+                self._anchor, self._stable_since = view, now
         if view["grossOutliers"]:
             return self._status(now, "Wait for a clearer board detection; an isolated corner is misplaced.",
                                 "corner_outlier", sharpness=sharpness)
@@ -262,9 +269,14 @@ class CalibrationCaptureGate:
             return self._status(now, "Press C to capture this view.", "manual", ready=True, sharpness=sharpness)
         if now - self._started < self.start_delay:
             seconds = max(1, math.ceil(self.start_delay - (now - self._started)))
-            return self._status(now, f"Starting in {seconds}… Show the board and hold still.", "starting", sharpness=sharpness)
-        if self._last_capture is not None and now - self._last_capture < self.cooldown_seconds:
-            return self._status(now, "Move to the next view, then hold still.", "cooldown", sharpness=sharpness)
+            prompt = "Move slowly with the board in view." if self.mode == "sweep" else "Show the board and hold still."
+            return self._status(now, f"Starting in {seconds}… {prompt}", "starting", sharpness=sharpness)
+        spacing = self.sweep_spacing_seconds if self.mode == "sweep" else self.cooldown_seconds
+        if self._last_capture is not None and now - self._last_capture < spacing:
+            prompt = "Keep moving slowly to a new angle." if self.mode == "sweep" else "Move to the next view, then hold still."
+            return self._status(now, prompt, "cooldown", sharpness=sharpness)
+        if self.mode == "sweep":
+            return self._accept(now, view)
         if now - self._stable_since < self.hold_seconds:
             return self._status(now, "Hold this view still…", "holding", ready=True, sharpness=sharpness)
         return self._accept(now, view)
@@ -273,6 +285,65 @@ class CalibrationCaptureGate:
         self._poses.append(view)
         self._last_capture = now
         self._reset_hold()
+        next_view = "Keep moving slowly and tilt to a new angle." if self.mode == "sweep" else "Move or tilt the camera, then hold still."
         message = ("All calibration views captured." if self.count >= self.total else
-                   f"Captured {self.count}/{self.total}. Move or tilt the camera, then hold still.")
+                   f"Captured {self.count}/{self.total}. {next_view}")
         return self._status(now, message, "captured", capture=True, sharpness=view["sharpness"])
+
+
+class CalibrationViewArchive:
+    """Bounded audit of selected views only, separate from the saved calibration.
+
+    JPEGs retain the full feed dimensions; exact corner arrays used by the solver
+    are stored alongside them. No rejected frames or continuous video are saved.
+    A write error remains visible in ``error`` without claiming the archive saved.
+    """
+    def __init__(self, profile_id, *, total=10, root=None):
+        from pathlib import Path
+        from uuid import uuid4
+        from datetime import datetime, timezone
+        from app_paths import data_path
+        self.total = int(total)
+        if self.total < 1:
+            raise ValueError("The view archive must have a positive bound.")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        self.path = (Path(root) if root is not None else data_path("Calibration/views")) / (stamp + "_" + uuid4().hex[:12])
+        self.profile_id, self.created_at = profile_id, datetime.now(timezone.utc).isoformat()
+        self.views, self.error = [], None
+
+    def record(self, frame, corners, ids, *, capture_seconds, state, source_metadata=None):
+        if self.error or len(self.views) >= self.total:
+            return False
+        from app_paths import atomic_write_bytes, atomic_write_json
+        import hashlib
+        try:
+            ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 96])
+            if not ok:
+                raise OSError("Could not encode the selected calibration view.")
+            index = len(self.views) + 1
+            image_name, data_name = f"view-{index:02d}.jpg", f"view-{index:02d}.json"
+            payload = encoded.tobytes()
+            atomic_write_bytes(self.path / image_name, payload, backup=False)
+            record = {"index": index, "file": image_name, "imageSHA256": hashlib.sha256(payload).hexdigest(),
+                      "hostMonotonicSeconds": float(capture_seconds), "imageSize": [frame.shape[1], frame.shape[0]],
+                      "charucoCorners": np.asarray(corners).reshape(-1, 2).tolist(),
+                      "charucoIds": np.asarray(ids).reshape(-1).tolist(),
+                      "source": source_metadata,
+                      "quality": {key: state.get(key) for key in ("sharpness", "validCorners", "poseCorners", "grossCornerOutliers", "captureMode")}}
+            atomic_write_json(self.path / data_name, record, backup=False)
+            self.views.append({"index": index, "image": image_name, "corners": data_name})
+            return self.finish("capturing")
+        except (OSError, ValueError, TypeError, cv2.error) as exc:
+            self.error = str(exc)
+            return False
+
+    def finish(self, outcome):
+        from app_paths import atomic_write_json
+        try:
+            atomic_write_json(self.path / "manifest.json", {"schemaVersion": 1,
+                "createdAt": self.created_at, "profileId": self.profile_id, "outcome": outcome,
+                "targetViews": self.total, "selectedViews": self.views, "error": self.error}, backup=False)
+            return self.error is None
+        except (OSError, ValueError, TypeError) as exc:
+            self.error = str(exc)
+            return False

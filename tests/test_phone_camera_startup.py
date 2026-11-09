@@ -15,6 +15,7 @@ from tests import test_camera_calibration_flow as calibration_models
 DEVICE = "test-iphone-usb-serial"
 INDEX = sources.phone_camera_index(DEVICE)
 SOURCE = {"type": sources.PHONE_SOURCE, "deviceId": DEVICE}
+WIDE_METADATA = {"deviceId": DEVICE, "format": {"lens": "wide", "width": 1080, "height": 1920}}
 
 
 class SourceTests(unittest.TestCase):
@@ -45,13 +46,13 @@ class SourceTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             store = HardwareProfiles(Path(directory) / "profiles.json")
             obs = store.upsert_profile("camera", {"name": "OBS", "sourceHint": "OBS"}, select=True)
-            phone = sources.create_phone_profile(store, SOURCE)
+            phone = sources.create_phone_profile(store, SOURCE, metadata=WIDE_METADATA)
             self.assertEqual(store.active_profile("camera")["id"], obs["id"])
             self.assertIsNone(phone["calibration"])
             self.assertTrue(sources.profile_matches_phone(phone, SOURCE))
             self.assertFalse(sources.profile_matches_phone(obs, SOURCE))
             self.assertFalse(sources.profile_matches_phone(phone, {**SOURCE, "deviceId": "other"}))
-            self.assertNotEqual(sources.create_phone_profile(store, SOURCE)["name"], phone["name"])
+            self.assertNotEqual(sources.create_phone_profile(store, SOURCE, metadata=WIDE_METADATA)["name"], phone["name"])
 
     def test_stream_key_changes_on_reconnect_but_not_each_frame(self):
         data = {"deviceId": DEVICE, "sessionId": "one", "connectionGeneration": 1,
@@ -70,6 +71,7 @@ class PhoneStartupTests(unittest.TestCase):
     def phone_model(self):
         ui = self.model(mode="self_hosted")
         ui.selector.draft.update(webcam_index=INDEX, camera_source=SOURCE)
+        ui.selector.draft["camera_profile_id"] = None
         capture = Mock()
         capture.status = {"fresh": False, "message": "Open Sarween Camera on your iPhone"}
         self.factory = self.stack.enter_context(patch.object(sources, "open_camera_capture", return_value=capture))
@@ -142,7 +144,7 @@ class PhoneCalibrationTests(unittest.TestCase):
 
     def test_waiting_phone_calibration_can_be_cancelled_without_saving(self):
         with self.flow(keys=[ord('q')]) as value:
-            profile = sources.create_phone_profile(value["store"], SOURCE)
+            profile = sources.create_phone_profile(value["store"], SOURCE, metadata=WIDE_METADATA)
             capture = value["capture"]
             capture.read.return_value = False, None
             capture.status = {"message": "Waiting for camera"}
@@ -157,13 +159,13 @@ class PhoneCalibrationTests(unittest.TestCase):
 
     def test_reconnect_during_calibration_aborts_before_saving_mixed_views(self):
         with self.flow() as value:
-            profile = sources.create_phone_profile(value["store"], SOURCE)
+            profile = sources.create_phone_profile(value["store"], SOURCE, metadata=WIDE_METADATA)
             capture = value["capture"]
             image = capture.read.return_value[1]
             sessions = iter(("one", "two"))
             def read():
                 capture.last_frame_metadata = {"deviceId": DEVICE, "sessionId": next(sessions),
-                    "connectionGeneration": 1, "format": {"width": 320, "height": 240}}
+                    "connectionGeneration": 1, "format": {"width": 320, "height": 240, "lens": "wide"}}
                 return True, image
             capture.read.side_effect = read
             with patch.object(sources, "source_for_index", return_value=SOURCE), \

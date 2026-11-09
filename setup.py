@@ -15,7 +15,8 @@ from screeninfo import get_monitors
 from app_paths import atomic_write_json, data_path, initialize_user_data, resource_path, saved_map_path
 from camera_sources import (PHONE_SOURCE, create_phone_profile, is_phone_camera_index,
                             open_camera_capture, phone_camera_inventory,
-                            profile_compatible_with_source, source_for_index)
+                            profile_compatible_with_source, source_for_index, PhoneMetadataProbe,
+                            matching_phone_profiles, phone_camera_lens, PHONE_LENS_LABELS)
 
 
 def _get_persistent_root() -> tk.Tk:
@@ -76,10 +77,13 @@ _UNCHANGED_SOURCE = object()
 
 
 def save_last_selection(display_index=None, webcam_index=None, mode=None, map_path=_UNCHANGED_MAP,
-                        camera_profile_id=_UNCHANGED_PROFILE, camera_source=_UNCHANGED_SOURCE):
+                        camera_profile_id=_UNCHANGED_PROFILE, camera_source=_UNCHANGED_SOURCE,
+                        display_name=None):
     data = load_last_selection()
     if display_index is not None:
         data["display_index"] = int(display_index)
+    if display_name is not None:
+        data["display_name"] = str(display_name)
     if webcam_index is not None:
         data["webcam_index"] = int(webcam_index)
         # Native selection must not retain a different phone's saved identity.
@@ -259,9 +263,27 @@ def detect_webcams_passive():
 # GUI SELECTION
 # ===========================
 
+def _phone_preview_feedback_context(controller):
+    """Use active registered paper geometry as well as current screen mode."""
+    import foundryoutput as fo
+    config = controller.configuration()
+    paper = config.get("mode") == "printed" or config.get("blocked") or config.get("pending")
+    marker_ids = (20, 21, 22, 23) if paper else (10, 11, 12, 13)
+    registration = {"mode": "printed" if paper else "screen", "printedMarkerLayout": config.get("layout"),
+                    "profileId": config.get("profileId"), "blocked": bool(config.get("blocked")),
+                    "pending": bool(config.get("pending")), "message": config.get("message", "")}
+    context = controller.view_context()
+    view = context.get("view") if context.get("ready") else fo.get_view_transform_payload()
+    return marker_ids, registration, view, fo.get_scene_visual_revision()
+
+
 def _preview_phone_camera(device_index, *, camera_source=None):
     """An explicit, cancellable preview; discovery never reaches this function."""
     cap = open_camera_capture(device_index, source=camera_source)
+    from phone_camera_feedback import PhoneCameraFeedback
+    from printed_marker_runtime import get_printed_marker_controller
+    controller = get_printed_marker_controller()
+    feedback = PhoneCameraFeedback(cap)
     window = "iPhone Preview — press any key to close"
     opened_window = False
     try:
@@ -273,6 +295,18 @@ def _preview_phone_camera(device_index, *, camera_source=None):
         cv2.moveWindow(window, 0, 0)
         while True:
             ok, pixels = cap.read()
+            try:
+                if ok:
+                    controller.heartbeat(feedback)
+                marker_ids, registration, view, revision = _phone_preview_feedback_context(controller)
+                feedback.marker_ids = marker_ids
+            except Exception:
+                registration = {"blocked": True, "message": "Marker registration configuration is unavailable"}
+                view = revision = None
+            status_feedback = feedback.publish(pixels if ok else None,
+                getattr(cap, "last_frame_metadata", None) if ok else None,
+                view_key=view, scene_revision=revision, registration=registration)
+            feedback.take_requests()
             if not ok:
                 pixels = np.zeros((720, 1280, 3), np.uint8)
                 status = cap.status
@@ -281,6 +315,16 @@ def _preview_phone_camera(device_index, *, camera_source=None):
                             .65, (220, 220, 220), 1, cv2.LINE_AA)
                 cv2.putText(pixels, "Press any key to cancel", (25, 385), cv2.FONT_HERSHEY_SIMPLEX,
                             .65, (180, 180, 180), 1, cv2.LINE_AA)
+            elif status_feedback is not None:
+                pixels = pixels.copy()
+                count = status_feedback.get("markers", {}).get("count", 0)
+                cpl = status_feedback.get("cpl", {})
+                cv2.putText(pixels, f"Visible markers: {count}/4", (25, 45),
+                            cv2.FONT_HERSHEY_SIMPLEX, .8, (255, 255, 255), 2, cv2.LINE_AA)
+                label = (f"Relative LCD index: {cpl['index']:.1f} (reference 100)" if "index" in cpl
+                         else cpl.get("message", ""))
+                cv2.putText(pixels, label[:105], (25, 80), cv2.FONT_HERSHEY_SIMPLEX,
+                            .6, (255, 255, 255), 1, cv2.LINE_AA)
             cv2.imshow(window, pixels)
             if cv2.waitKey(1) & 0xFF != 255:
                 break
@@ -290,6 +334,7 @@ def _preview_phone_camera(device_index, *, camera_source=None):
             except cv2.error:
                 break
     finally:
+        controller.camera_stopped(feedback)
         cap.release()
         if opened_window:
             try:
@@ -390,8 +435,8 @@ def _validate_selection(selection, displays, webcams, *, store=None, map_files=N
 class HardwareSelectionPanel(ttk.Frame):
     """Embedded choices. Construction and selection never scan or open hardware.
 
-    The caller supplies inventory and owns refresh. Only explicit Preview and
-    Calibrate actions open the selected camera.
+    The caller supplies inventory and owns refresh. Explicit Preview, Calibrate
+    and Create iPhone profile actions may open the selected camera.
     """
 
     def __init__(self, parent, *, access=None, changed=None, store=None, defaults=None, map_files=None):
@@ -400,6 +445,7 @@ class HardwareSelectionPanel(ttk.Frame):
         self.store = _profile_store(store)
         self.displays, self.webcams = [], []
         self._has_inventory, self._enabled, self._notifying = False, True, False
+        self._phone_profile_probe = None
         self.map_files = list(_list_map_files() if map_files is None else map_files)
         self._defaults = dict(defaults or {})
         self.status = tk.StringVar(self, "Refresh hardware to choose a camera and display.")
@@ -444,6 +490,8 @@ class HardwareSelectionPanel(ttk.Frame):
         self.webcam_combo.bind("<<ComboboxSelected>>", self._camera_changed)
         self.mode_combo.bind("<<ComboboxSelected>>", self._update_state)
         self.map_combo.bind("<<ComboboxSelected>>", self._update_state)
+        self.bind("<Destroy>", lambda event: self._cancel_phone_profile_probe(update=False)
+                  if event.widget is self else None)
         self._update_state()
 
     @staticmethod
@@ -495,6 +543,8 @@ class HardwareSelectionPanel(ttk.Frame):
         self._update_state()
 
     def selection(self):
+        if self._phone_profile_probe is not None:
+            raise ValueError("Waiting for the iPhone's physical lens. Cancel the connection to change hardware.")
         pos = self.map_combo.current()
         return _validate_selection({"display_index": self._index(self.display_combo, self.displays),
             "webcam_index": self._index(self.webcam_combo, self.webcams),
@@ -513,31 +563,69 @@ class HardwareSelectionPanel(ttk.Frame):
             return False
 
     def _profile_changed(self, _profile=None):
+        self._cancel_phone_profile_probe(update=False)
         self.profile_confirmed.set(False)
         self._update_state()
 
     def _camera_changed(self, _event=None):
+        self._cancel_phone_profile_probe(update=False)
         self.profile_picker.select_id(None, persist=False, notify=False)
         self.profile_confirmed.set(False)
         self._update_state()
 
     def create_iphone_profile(self):
+        if self._phone_profile_probe is not None:
+            self._cancel_phone_profile_probe()
+            self.status.set("iPhone profile connection cancelled. Camera off.")
+            return False
         try:
             self._require_access()
             index = self._index(self.webcam_combo, self.webcams)
             if not is_phone_camera_index(index):
                 raise ValueError("Choose a USB iPhone first.")
             source = source_for_index(index, inventory=self.webcams)
-            profile = create_phone_profile(self.store, source)
-            self.profile_picker.refresh()
-            self.profile_picker.select_id(profile["id"], persist=False, notify=False)
-            self.profile_confirmed.set(False)
+            def guard():
+                self._require_access()
+                if self._index(self.webcam_combo, self.webcams) != index:
+                    raise ValueError("The selected camera changed. Retry with the intended iPhone.")
+            self._phone_profile_probe = PhoneMetadataProbe(index, source, schedule=self.after,
+                cancel_schedule=self.after_cancel, guard=guard, capture_factory=open_camera_capture,
+                complete=lambda metadata: self._phone_profile_ready(source, metadata),
+                failed=self._phone_profile_failed)
             self._update_state()
-            self.status.set("New iPhone profile created. Calibrate camera for this feed, or confirm the profile to continue without lens correction.")
-            return profile
+            self.status.set("Connecting to identify the current iPhone lens… Open Sarween Camera. Click Cancel connection to stop.")
+            return True
         except (ValueError, OSError, PermissionError) as exc:
             self.status.set(str(exc))
             return False
+
+    def _cancel_phone_profile_probe(self, *, update=True):
+        probe, self._phone_profile_probe = self._phone_profile_probe, None
+        if probe is not None:
+            probe.cancel()
+            if update:
+                self._update_state()
+
+    def _phone_profile_failed(self, message):
+        self._phone_profile_probe = None
+        self._update_state()
+        self.status.set(message)
+
+    def _phone_profile_ready(self, source, metadata):
+        self._phone_profile_probe = None
+        self._require_access()
+        matches = matching_phone_profiles(self.store, source, metadata)
+        if len(matches) > 1:
+            self._update_state()
+            self.status.set("Several profiles match this iPhone lens and frame size. Choose the intended saved profile.")
+            return
+        profile = matches[0] if matches else create_phone_profile(self.store, source, metadata=metadata)
+        self.profile_picker.refresh()
+        self.profile_picker.select_id(profile["id"], persist=False, notify=False)
+        self.profile_confirmed.set(False)
+        self._update_state()
+        lens = PHONE_LENS_LABELS[phone_camera_lens(metadata)]
+        self.status.set(f"{lens} profile {'selected' if matches else 'created'}. Confirm this profile, or calibrate this physical lens. Wide, Ultra Wide and Telephoto use separate calibrations.")
 
     def refresh_profiles(self):
         previous = self.profile_picker.selected_profile()
@@ -548,6 +636,8 @@ class HardwareSelectionPanel(ttk.Frame):
 
     def set_enabled(self, enabled):
         self._enabled = bool(enabled)
+        if not self._enabled:
+            self._cancel_phone_profile_probe(update=False)
         self._update_state()
 
     def _update_state(self, _event=None):
@@ -570,7 +660,8 @@ class HardwareSelectionPanel(ttk.Frame):
                 profile_compatible = profile_compatible_with_source(self.profile_picker.selected_profile(), source)
             except ValueError:
                 profile_compatible = False
-        self.create_phone_profile_button.configure(state="normal" if enabled and phone_selected else "disabled")
+        self.create_phone_profile_button.configure(state="normal" if enabled and phone_selected else "disabled",
+            text="Cancel connection" if self._phone_profile_probe is not None else "Create iPhone profile")
         self.preview_button.configure(state="normal" if enabled and camera_ready else "disabled")
         self.calibrate_button.configure(state="normal" if enabled and camera_ready
                                         and self._index(self.display_combo, self.displays) is not None
@@ -705,6 +796,7 @@ def apply_selection(selection, displays, webcams, *, access=None):
         source_options = {"camera_source": sel["camera_source"]} if "camera_source" in sel else {}
         save_last_selection(
             display_index=sel["display_index"], webcam_index=sel["webcam_index"],
+            display_name=next(d.get("name", "") for d in displays if d["index"] == sel["display_index"]),
             camera_profile_id=sel["camera_profile_id"], mode=sel["mode"], map_path=sel["map_path"], **source_options)
     except Exception:
         if profile_changed:

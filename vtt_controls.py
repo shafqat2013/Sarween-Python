@@ -10,10 +10,12 @@ from guided_capture import MAX_CAPTURE_MINIS
 
 
 NUMBER_SETTINGS = {
-    "viewportMarkerSize": ("Marker size (pixels)", 72, 240, 4, 120),
+    "viewportMarkerPatternSize": ("ArUco pattern width (pixels)", 1, 240, 1, 80),
+    "viewportMarkerMargin": ("White margin per side (pixels)", 0, 12, 1, 12),
     "viewportMarkerInset": ("Marker inset (pixels)", 0, 80, 2, 8),
     "defaultMovementSpeed": ("Fallback speed (feet)", 0, 120, 5, 30),
 }
+LEGACY_NUMBER_SETTINGS = {"viewportMarkerSize": ("Legacy total marker width (pixels)", 1, 240, 1, 120)}
 BOOL_SETTINGS = {
     "viewportMarkersEnabled": ("Show ArUco corner markers", True),
     "gridLabelsVisible": ("Show grid cell labels on the map", False),
@@ -32,8 +34,10 @@ def parse_settings(values, names):
         if name in BOOL_SETTINGS:
             if not isinstance(value, bool):
                 raise ValueError(f"Choose on or off for {BOOL_SETTINGS[name][0].lower()}.")
-        elif name in NUMBER_SETTINGS:
-            label, low, high, _step, _default = NUMBER_SETTINGS[name]
+        elif name in NUMBER_SETTINGS or name in LEGACY_NUMBER_SETTINGS:
+            label, low, high, _step, _default = (NUMBER_SETTINGS.get(name) or LEGACY_NUMBER_SETTINGS[name])
+            if isinstance(value, bool):
+                raise ValueError(f"Enter a number for {label.lower()}.")
             try:
                 value = float(value)
             except (TypeError, ValueError):
@@ -73,7 +77,7 @@ def _read_status():
 
 def _request(action, values=None):
     import foundryoutput
-    return foundryoutput.request_vtt_command(action, values)
+    return foundryoutput.request_vtt_command(action, values, return_request_id=True)
 
 
 def _scroll_page(notebook, title):
@@ -157,6 +161,13 @@ class VTTControls(ttk.Frame):
         self._choice_scene_id = None
         self._choice_token_ids = {}
         self._assignment_request = None
+        self._tracking_context = None
+        self._tracking_rows = []
+        self._tracking_read_only = False
+        self._tracking_confirmed = {}
+        self._tracking_acknowledged = {}
+        self._tracking_queue = []
+        self._tracking_pending = None
         self._display_busy = False
         self.variables = {}
         self.connection = tk.StringVar(self, "Foundry: disconnected")
@@ -280,10 +291,15 @@ class VTTControls(ttk.Frame):
         self._settings_button(overlays, names, 2)
         markers = self._section(parent, "ArUco markers")
         markers.pack(before=self.grid_controls, fill="x", pady=(0, 8))
-        names = ("viewportMarkerSize", "viewportMarkerInset")
+        names = ("viewportMarkerPatternSize", "viewportMarkerMargin", "viewportMarkerInset")
         for row, name in enumerate(names):
             self._setting(markers, name, row)
-        self._settings_button(markers, names, 2)
+        self.marker_total = tk.StringVar(self)
+        _wrapped_label(markers, textvariable=self.marker_total).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        for name in names[:2]:
+            self.variables[name].trace_add("write", lambda *_args: self._update_marker_total())
+        self._update_marker_total()
+        self._settings_button(markers, names, 4)
         from printed_marker_controls import PrintedMarkerControls
         self.printed_markers = PrintedMarkerControls(parent, require_access=self._require_access,
             controller=self._printed_marker_controller, store=self._profile_store,
@@ -397,6 +413,10 @@ class VTTControls(ttk.Frame):
 
     def _build_assignment(self, parent):
         section = self._section(parent, "Mini → Foundry token")
+        self._legacy_assignment_section = section
+        self._tracking_assignment_section = ttk.LabelFrame(parent, text="Player minis → Foundry tokens", padding=10)
+        self._tracking_assignment_section.columnconfigure(1, weight=1)
+        self._tracking_assignment_message = tk.StringVar(self, "Choose starting positions to assign the player minis.")
         section.columnconfigure(0, weight=0)
         section.columnconfigure(1, weight=1)
         self.assignment_mini = tk.StringVar(self)
@@ -416,6 +436,181 @@ class VTTControls(ttk.Frame):
         self._button(actions, "Cancel assignment", "assignment.cancel").pack(side="left", padx=(6, 0))
         _wrapped_label(section, textvariable=self.assignment_message).grid(
             row=3, column=0, columnspan=2, sticky="ew", pady=3)
+
+    def set_tracking_minis(self, minis, generation, scene_id, *, read_only=False):
+        """Bind the existing Assignment page to one explicit starting layout.
+
+        Saved assignments are hints only. A fresh generation must confirm every
+        token through acknowledged Foundry commands before output can use them.
+        """
+        rows = []
+        for number, item in enumerate(minis, 1):
+            row = {"miniId": item, "name": f"Mini {number}"} if isinstance(item, str) else dict(item)
+            identity = row.get("miniId") or row.get("id")
+            if not isinstance(identity, str) or not identity or len(identity) > 128:
+                raise ValueError("Choose valid player mini identities.")
+            rows.append({**row, "miniId": identity, "name": row.get("name") or f"Mini {number}"})
+        if len(rows) > 6 or len({row["miniId"] for row in rows}) != len(rows):
+            raise ValueError("Choose one to six different player minis.")
+        if rows and (generation is None or not isinstance(scene_id, str) or not scene_id):
+            raise ValueError("Player assignments need the current scene and starting positions.")
+        context = (scene_id, str(generation), tuple(row["miniId"] for row in rows)) if rows else None
+        if context == getattr(self, "_tracking_context", None) and read_only == getattr(self, "_tracking_read_only", False):
+            return
+        self._tracking_context = context
+        self._tracking_read_only = bool(read_only)
+        self._tracking_confirmed = {}
+        self._tracking_acknowledged = {}
+        self._tracking_pending = None
+        self._tracking_queue = []
+        self._build_tracking_rows(rows)
+        if context is None:
+            self._tracking_assignment_section.pack_forget()
+            self._legacy_assignment_section.pack(fill="x", pady=(0, 8))
+        else:
+            self._legacy_assignment_section.pack_forget()
+            options = {"fill": "x", "pady": (0, 8)}
+            if hasattr(self, "token_creation"):
+                options["before"] = self.token_creation
+            self._tracking_assignment_section.pack(**options)
+            self._tracking_assignment_message.set("Observation only — assignments cannot move Foundry tokens." if read_only else
+                "Choose a different Foundry token for each mini, then confirm assignments.")
+        self._sync_tracking_assignments(self._last_status)
+        self._update_enabled()
+
+    def _build_tracking_rows(self, rows):
+        section = self._tracking_assignment_section
+        for widget in section.winfo_children():
+            widget.destroy()
+        self._tracking_rows = []
+        bindings = self._last_status.get("miniBindings") or {}
+        for number, row in enumerate(rows):
+            token_id = row.get("tokenId") or bindings.get(row["miniId"])
+            variable = tk.StringVar(self, next((label for label, identity in self._token_labels.items()
+                                               if identity == token_id), ""))
+            ttk.Label(section, text=row["name"]).grid(row=number, column=0, sticky="w", padx=(0, 8), pady=3)
+            combo = ttk.Combobox(section, textvariable=variable, state="readonly", values=tuple(self._token_labels))
+            combo.grid(row=number, column=1, sticky="ew", pady=3)
+            entry = {**row, "token": variable, "combo": combo, "selected_id": token_id}
+            combo.bind("<<ComboboxSelected>>", lambda _event, entry=entry: self._tracking_assignment_edited(entry))
+            self._tracking_rows.append(entry)
+        self._tracking_confirm_button = ttk.Button(section, text="Confirm assignments", command=self.confirm_tracking_assignments)
+        self._tracking_confirm_button.grid(row=len(rows), column=0, columnspan=2, sticky="w", pady=(8, 4))
+        _wrapped_label(section, textvariable=self._tracking_assignment_message).grid(
+            row=len(rows) + 1, column=0, columnspan=2, sticky="ew")
+
+    def _tracking_assignment_edited(self, row):
+        row["selected_id"] = self._token_labels.get(row["token"].get())
+        self._tracking_confirmed = {}
+        self._tracking_acknowledged = {}
+        self._tracking_pending = None
+        self._tracking_queue = []
+        self._tracking_assignment_message.set("Assignment changed. Confirm all assignments before moving tokens.")
+
+    def _tracking_assignment_failure(self, message):
+        self._tracking_confirmed = {}
+        self._tracking_acknowledged = {}
+        self._tracking_pending = None
+        self._tracking_queue = []
+        self._tracking_assignment_message.set(str(message))
+
+    def confirm_tracking_assignments(self):
+        if not self._tracking_context or self._tracking_read_only or self._tracking_pending or self._tracking_queue:
+            return False
+        try:
+            if self._require_access is not None:
+                self._require_access()
+            status = self._read_status()
+            self._last_status = dict(status)
+            if not self._allowed("assignment.save") or status.get("sceneId") != self._tracking_context[0]:
+                raise ValueError("Connect the same Foundry scene before confirming assignments.")
+            if not isinstance(status.get("miniBindings"), dict):
+                raise ValueError("Reload Foundry with the updated Sarween module to confirm player assignments.")
+            assignments = [(row["miniId"], self._token_labels.get(row["token"].get())) for row in self._tracking_rows]
+            if any(token_id not in self._tokens for _mini_id, token_id in assignments):
+                raise ValueError("Choose a Foundry token for every player mini.")
+            if len({token_id for _mini_id, token_id in assignments}) != len(assignments):
+                raise ValueError("Choose a different Foundry token for each player mini.")
+            for row, (_mini_id, token_id) in zip(self._tracking_rows, assignments):
+                row["selected_id"] = token_id
+            self._tracking_confirmed = {}
+            self._tracking_acknowledged = {}
+            self._tracking_queue = list(assignments)
+            self._send_next_tracking_assignment(status)
+            self._update_enabled()
+            return True
+        except Exception as exc:
+            self._tracking_assignment_failure(str(exc))
+            return False
+
+    def _send_next_tracking_assignment(self, status):
+        if self._tracking_pending or not self._tracking_queue or status.get("pending") or status.get("blocked"):
+            return
+        if not self._enabled or self._tracking_read_only:
+            self._tracking_assignment_failure("Assignment confirmation is paused. Confirm assignments again when access is available.")
+            return
+        mini_id, token_id = self._tracking_queue.pop(0)
+        try:
+            if self._require_access is not None:
+                self._require_access()
+            request_id = self._request("assignment.save", {"miniId": mini_id, "tokenId": token_id})
+        except Exception as exc:
+            self._tracking_assignment_failure(str(exc))
+            return
+        if not isinstance(request_id, str) or not request_id:
+            self._tracking_assignment_failure("Foundry did not accept the assignment. Confirm assignments again.")
+            return
+        self._tracking_pending = {"requestId": request_id, "miniId": mini_id, "tokenId": token_id,
+                                  "context": self._tracking_context, "started": time.monotonic()}
+        self._tracking_assignment_message.set(
+            f"Confirming assignments: {len(self._tracking_acknowledged)}/{len(self._tracking_rows)} confirmed…")
+
+    def _sync_tracking_assignments(self, status):
+        if getattr(self, "_tracking_context", None) is None:
+            return
+        scene_id = status.get("sceneId")
+        if not status.get("connected") or not status.get("supported") or scene_id != self._tracking_context[0]:
+            self._tracking_assignment_failure("Foundry disconnected or the scene changed. Confirm assignments again on the selected scene.")
+            return
+        choices = tuple(self._token_labels)
+        for row in self._tracking_rows:
+            row["combo"].configure(values=choices)
+            selected = row.get("selected_id")
+            if selected:
+                row["token"].set(next((label for label, identity in self._token_labels.items() if identity == selected), ""))
+        pending = self._tracking_pending
+        if pending:
+            result = status.get("lastResult") or {}
+            if pending["context"] != self._tracking_context:
+                self._tracking_assignment_failure("Starting positions changed. Confirm assignments again.")
+                return
+            if result.get("requestId") == pending["requestId"]:
+                bindings = status.get("miniBindings") or {}
+                if (result.get("success") is not True or result.get("sceneId") != scene_id
+                        or bindings.get(pending["miniId"]) != pending["tokenId"]):
+                    self._tracking_assignment_failure(result.get("message") or "Foundry did not confirm the assignment.")
+                    return
+                self._tracking_acknowledged[pending["miniId"]] = pending["tokenId"]
+                self._tracking_pending = None
+            elif time.monotonic() - pending["started"] >= 15:
+                self._tracking_assignment_failure("Foundry assignment confirmation timed out. Confirm assignments again.")
+                return
+        if self._tracking_pending is None and self._tracking_queue:
+            self._send_next_tracking_assignment(status)
+        if not self._tracking_pending and not self._tracking_queue and self._tracking_acknowledged:
+            if len(self._tracking_acknowledged) == len(self._tracking_rows):
+                self._tracking_confirmed = dict(self._tracking_acknowledged)
+                self._tracking_assignment_message.set(f"{len(self._tracking_confirmed)}/{len(self._tracking_rows)} assignments confirmed for this starting layout.")
+        bindings = status.get("miniBindings") or {}
+        if self._tracking_confirmed and any(bindings.get(mini) != token or token not in self._tokens
+                                            for mini, token in self._tracking_confirmed.items()):
+            self._tracking_assignment_failure("A token or assignment changed. Confirm assignments again.")
+
+    def get_confirmed_tracking_assignments(self):
+        self._sync_tracking_assignments(self._last_status)
+        if not self._enabled or getattr(self, "_tracking_read_only", False):
+            return {}
+        return dict(getattr(self, "_tracking_confirmed", {}))
 
     def _build_advanced(self, parent):
         section = self._section(parent, "Foundry interface")
@@ -506,8 +701,25 @@ class VTTControls(ttk.Frame):
             widget.configure(state="readonly" if self._allowed(action) else "disabled")
         self.connect_button.configure(state="normal" if self._service is not None and
                                       (self._enabled or self._service.running) else "disabled")
+        if getattr(self, "_tracking_context", None) is not None:
+            available = bool(not self._tracking_read_only and self._allowed("assignment.save")
+                             and self._last_status.get("sceneId") == self._tracking_context[0])
+            busy = bool(self._tracking_pending or self._tracking_queue)
+            for row in self._tracking_rows:
+                row["combo"].configure(state="readonly" if available and not busy else "disabled")
+            self._tracking_confirm_button.configure(state="normal" if available and not busy else "disabled")
 
     def _sync_settings(self, settings, pending):
+        from marker_geometry import normalized_marker_settings
+        try:
+            # Old modules only report the whole tile. Show a matching pattern
+            # width and a margin within the new control range until Apply.
+            canonical = dict(settings)
+            if "viewportMarkerPatternSize" in canonical:
+                canonical.pop("viewportMarkerSize", None)
+            settings = normalized_marker_settings(canonical)
+        except ValueError:
+            pass
         self._syncing = True
         try:
             for name, variable in self.variables.items():
@@ -528,6 +740,16 @@ class VTTControls(ttk.Frame):
                     variable.set(value)
         finally:
             self._syncing = False
+
+    def _update_marker_total(self):
+        try:
+            values = parse_settings({name: self.variables[name].get() for name in
+                ("viewportMarkerPatternSize", "viewportMarkerMargin")},
+                ("viewportMarkerPatternSize", "viewportMarkerMargin"))
+            pattern, margin = values["viewportMarkerPatternSize"], values["viewportMarkerMargin"]
+            self.marker_total.set(f"Total width: {pattern + 2 * margin:g} pixels ({pattern:g} pattern + 2 × {margin:g} margin)")
+        except (ValueError, tk.TclError):
+            self.marker_total.set("Total width: enter a valid pattern width and margin.")
 
     def _sync_choices(self, status):
         selections = {"movement": self.movement_choice, "assignment": self.assignment_token,
@@ -598,6 +820,7 @@ class VTTControls(ttk.Frame):
         queued = f" · {pending['pendingCount']} waiting" if pending.get("pendingCount", 0) > 1 else ""
         self.assignment_message.set(f"Assignment requested for {pending['miniId']}{queued}" if pending else
                                     "Put the token on the active Foundry scene first.")
+        self._sync_tracking_assignments(status)
 
     def refresh(self, status=None):
         now = time.monotonic()

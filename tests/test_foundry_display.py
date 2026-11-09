@@ -247,6 +247,57 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(calls[-1], ("AXFullScreen", True))
         self.assertEqual(sum(name == "AXPosition" for name, _value in calls), 3)
 
+    def test_fullscreen_frame_becomes_settable_after_exit_and_transition(self):
+        backend = MacFoundryDisplayBackend()
+        full, calls, transitions = {"value": True}, [], {"remaining": 1}
+
+        def settable(_window, name):
+            calls.append(("check", name, full["value"]))
+            if name == "AXFullScreen":
+                return True
+            if full["value"]:
+                return False
+            if transitions["remaining"]:
+                transitions["remaining"] -= 1
+                return False
+            return True
+
+        def set_attribute(_window, name, value):
+            calls.append(("set", name, value))
+            if name == "AXFullScreen":
+                full["value"] = value
+
+        ax = SimpleNamespace(true=True, false=False, settable=settable, set=set_attribute,
+            boolean=lambda _window, name: name == "AXFullScreen" and full["value"],
+            point=lambda _window: (-1920, -280),
+            geometry=lambda _window, name, _kind, _value: calls.append(("geometry", name)))
+        backend._accessibility = ax
+        backend._visit_windows = lambda callback: callback((12, 100), "window")
+        with patch("foundry_display.time.sleep") as sleep:
+            self.assertTrue(backend.place((12, 100), DISPLAYS[1], lambda: False))
+        # Geometry checks must never reject the still-full-screen window.
+        self.assertNotIn(("check", "AXPosition", True), calls)
+        self.assertNotIn(("check", "AXSize", True), calls)
+        self.assertEqual(calls[1], ("set", "AXFullScreen", False))
+        sleep.assert_called_once_with(0.1)
+        self.assertEqual(calls[-1], ("set", "AXFullScreen", True))
+
+    def test_fullscreen_transition_cancellation_does_not_move_window(self):
+        backend = MacFoundryDisplayBackend()
+        full, cancelled, moves = {"value": True}, {"value": False}, []
+        def set_attribute(_window, name, value):
+            if name == "AXFullScreen":
+                full["value"] = value
+                cancelled["value"] = True
+        backend._accessibility = SimpleNamespace(true=True, false=False,
+            settable=lambda _window, name: name == "AXFullScreen" or not full["value"],
+            set=set_attribute,
+            boolean=lambda _window, name: name == "AXFullScreen" and full["value"],
+            geometry=lambda *_args: moves.append(_args))
+        backend._visit_windows = lambda callback: callback((12, 100), "window")
+        self.assertFalse(backend.place((12, 100), DISPLAYS[1], lambda: cancelled["value"]))
+        self.assertEqual(moves, [])
+
     def test_cancellation_between_frame_updates_prevents_fullscreen(self):
         backend = MacFoundryDisplayBackend()
         cancelled, calls = {"value": False}, []

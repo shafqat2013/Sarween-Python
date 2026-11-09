@@ -218,6 +218,11 @@ class NativeObserverEntryLayoutTests(unittest.TestCase):
 
     def test_real_home_header_fits_default_and_minimum_and_entry_obeys_auth(self):
         try:
+            self.root.update()
+            self.assertEqual(self.app.start_button.cget("text"), "Start session")
+            for name in ("observer_button", "recording_button", "demo_button"):
+                self.assertFalse(getattr(self.app, name).winfo_ismapped())
+            self.app.tabs.select(self.app.diagnostics_tab)
             self.widgets_fit("860x620")
             self.widgets_fit("700x460")
             self.app.observer_button.invoke()

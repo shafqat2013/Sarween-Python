@@ -12,6 +12,7 @@ import math
 from pathlib import Path
 
 from app_paths import resource_path
+from marker_geometry import marker_geometry
 
 MM = 72 / 25.4
 PAGE = (210 * MM, 297 * MM)
@@ -26,36 +27,53 @@ def parameters_from_context(profile, context):
     if not context.get("ready") or not context.get("view"):
         raise ValueError("Connect Foundry fullscreen on the selected TV before creating a matching print sheet.")
     view, settings = context["view"], context.get("settings") or {}
+    geometry = marker_geometry(settings)
     parameters = {"diagonal_inches": profile["settings"].get("displayDiagonalInches"),
                   "viewport_width": view.get("viewportWidth"), "viewport_height": view.get("viewportHeight"),
-                  "marker_size_px": settings.get("viewportMarkerSize"),
                   "marker_inset_px": settings.get("viewportMarkerInset")}
+    if "viewportMarkerPatternSize" in settings or "viewportMarkerMargin" in settings:
+        parameters.update(pattern_size_px=geometry["patternSize"], marker_margin_px=geometry["margin"])
+    else:
+        # Recordings and existing print sheets retain their original total-size
+        # interpretation, including the former proportional white border.
+        parameters["marker_size_px"] = settings.get("viewportMarkerSize")
     dimensions(**parameters)
-    size, inset = parameters["marker_size_px"], parameters["marker_inset_px"]
-    expected = {"left": inset + size / 6, "top": inset + size / 6,
-                "right": parameters["viewport_width"] - inset - size / 6,
-                "bottom": parameters["viewport_height"] - inset - size / 6}
+    quiet, inset = geometry["margin"], parameters["marker_inset_px"]
+    expected = {"left": inset + quiet, "top": inset + quiet,
+                "right": parameters["viewport_width"] - inset - quiet,
+                "bottom": parameters["viewport_height"] - inset - quiet}
     actual = view.get("registration") or {}
     if any(abs(float(actual.get(key, float("inf"))) - value) > .1 for key, value in expected.items()):
         raise ValueError("Foundry marker settings and viewport disagree. Wait for the current view, then print again.")
     return parameters
 
 
-def dimensions(diagonal_inches, viewport_width, viewport_height, marker_size_px, marker_inset_px=8):
-    values = (diagonal_inches, viewport_width, viewport_height, marker_size_px, marker_inset_px)
+def dimensions(diagonal_inches, viewport_width, viewport_height, marker_size_px=None, marker_inset_px=8,
+               *, pattern_size_px=None, marker_margin_px=None):
+    values = (diagonal_inches, viewport_width, viewport_height, marker_inset_px)
     if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in values):
         raise ValueError("Marker printing needs finite display dimensions and marker settings.")
     if not (10 <= diagonal_inches <= 150 and min(viewport_width, viewport_height) >= 100
-            and 72 <= marker_size_px <= 240 and 0 <= marker_inset_px <= 80):
+            and 0 <= marker_inset_px <= 80):
         raise ValueError("Choose a display profile and valid fullscreen marker settings.")
+    settings = {"viewportMarkerSize": marker_size_px} if marker_size_px is not None else {}
+    if pattern_size_px is not None:
+        settings["viewportMarkerPatternSize"] = pattern_size_px
+    if marker_margin_px is not None:
+        settings["viewportMarkerMargin"] = marker_margin_px
+    if not settings:
+        raise ValueError("Choose an ArUco pattern width and white margin before printing.")
+    geometry = marker_geometry(settings)
     per_pixel = diagonal_inches * 25.4 / math.hypot(viewport_width, viewport_height)
-    plate = marker_size_px * per_pixel
+    plate = geometry["totalSize"] * per_pixel
     if plate > 170:
         raise ValueError("These markers are too large for A4. Reduce their onscreen size before printing.")
     return {"diagonalInches": float(diagonal_inches), "viewportWidth": int(viewport_width),
-            "viewportHeight": int(viewport_height), "markerSizePx": float(marker_size_px),
+            "viewportHeight": int(viewport_height), "markerSizePx": geometry["totalSize"],
+            "markerPatternSizePx": geometry["patternSize"], "markerMarginPx": geometry["margin"],
             "markerInsetPx": float(marker_inset_px), "plateMm": plate,
-            "blackSquareMm": plate * 2 / 3, "whiteBorderMm": plate / 6,
+            "blackSquareMm": geometry["patternSize"] * per_pixel,
+            "whiteBorderMm": geometry["margin"] * per_pixel,
             "screenInsetMm": marker_inset_px * per_pixel}
 
 
@@ -126,8 +144,10 @@ class _VectorPDF:
 
 
 def build_sheet(path, *, diagonal_inches, viewport_width, viewport_height,
-                marker_size_px, marker_inset_px=8, engine="auto"):
-    spec = dimensions(diagonal_inches, viewport_width, viewport_height, marker_size_px, marker_inset_px)
+                marker_size_px=None, marker_inset_px=8, pattern_size_px=None,
+                marker_margin_px=None, engine="auto"):
+    spec = dimensions(diagonal_inches, viewport_width, viewport_height, marker_size_px, marker_inset_px,
+                      pattern_size_px=pattern_size_px, marker_margin_px=marker_margin_px)
     cells = _cells()
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,7 +169,7 @@ def build_sheet(path, *, diagonal_inches, viewport_width, viewport_height,
         canvas.setFont("Helvetica-Bold", 20)
         canvas.drawString(18 * MM, 280 * MM, "Sarween printed corner markers")
         canvas.setFont("Helvetica", 10)
-        lines = [f"Matches {diagonal_inches:g}-inch LCD | fullscreen {viewport_width} x {viewport_height} | {marker_size_px:g}px markers",
+        lines = [f"Matches {diagonal_inches:g}-inch LCD | fullscreen {viewport_width} x {viewport_height} | {spec['markerPatternSizePx']:g}px pattern + {spec['markerMarginPx']:g}px margin/side",
                  f"Paper card {plate:.2f}mm | black square {spec['blackSquareMm']:.2f}mm | dictionary 6x6/250",
                  "Print A4 at 100% / Actual Size. Turn off Fit to Page. Check the ruler below.",
                  "Use matte paper. Cut along the outline and keep the complete white border.",
@@ -183,7 +203,7 @@ def build_sheet(path, *, diagonal_inches, viewport_width, viewport_height,
             canvas.line(x * MM, 23 * MM, x * MM, 27 * MM)
         canvas.setFont("Helvetica", 9)
         canvas.drawString(20 * MM, 18 * MM, "This line must measure exactly 50mm after printing.")
-        canvas.drawString(20 * MM, 10 * MM, "If the fullscreen viewport, display size or marker size changes, generate a new sheet.")
+        canvas.drawString(20 * MM, 10 * MM, "If the viewport, display size, pattern width or white margin changes, generate a new sheet.")
         canvas.showPage()
     canvas.save()
     return {**spec, "path": str(path.resolve()), "pages": len(groups), "markerIds": list(IDS)}

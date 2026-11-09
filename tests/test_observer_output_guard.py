@@ -236,7 +236,8 @@ class ObserverStartupGuardTests(GuardSetup, unittest.TestCase):
 
 
 class ObserverSessionIntegrationTests(GuardSetup, unittest.TestCase):
-    def run_fake_session(self, *, construction_error=False, closed=False, update_error=False, preenabled=False):
+    def run_fake_session(self, *, construction_error=False, closed=False, update_error=False, preenabled=False,
+                         live=False, repeated_timestamp=False):
         pixels = np.zeros((90, 160, 3), np.uint8)
         flags_between_frames = []
         session = SimpleNamespace(is_recording=False, warp_w=160, warp_h=90,
@@ -246,7 +247,7 @@ class ObserverSessionIntegrationTests(GuardSetup, unittest.TestCase):
 
         def frames():
             for index in range(3):
-                session.frame_time = index / 8
+                session.frame_time = (max(0, index - 1) if repeated_timestamp else index) / 8
                 yield SimpleNamespace(locked=True, last_missing_ids=[], last_marker_count=4,
                                       frame_idx=index, warp_bgr=pixels, cam_bgr=pixels)
                 flags_between_frames.append(fo.observation_only())
@@ -265,7 +266,16 @@ class ObserverSessionIntegrationTests(GuardSetup, unittest.TestCase):
                                                        tapped_mini="red", moves=[])
         observer = MagicMock()
         observer.closed = closed
-        observer.update.side_effect = RuntimeError("Simulated observer failure") if update_error else lambda *a, **kw: None
+        observer.engine = None
+        observer.binding_generation = None
+        observer.folder = Path("/tmp/observer-guard-test/run")
+        observer.is_recording = False
+        observer.journal = None
+        observer.last_processed_timestamp = None
+        def update(*args, **kwargs):
+            observer.last_processed_timestamp = args[2]
+            return None
+        observer.update.side_effect = RuntimeError("Simulated observer failure") if update_error else update
         callback = Mock()
         with ExitStack() as patchers:
             replacements = ((tracking, "initialize_user_data", Mock()),
@@ -283,6 +293,8 @@ class ObserverSessionIntegrationTests(GuardSetup, unittest.TestCase):
                             (fo, "set_grid_params", Mock()),
                             (fo, "update_camera_lock", Mock()),
                             (fo, "get_scene_params", Mock(return_value={"sceneId": "observer-test"})),
+                            (fo, "get_view_transform_payload", Mock(return_value={"sceneId": "observer-test"})),
+                            (fo, "get_scene_visual_change", Mock(return_value={"revision": 0})),
                             (fo, "pop_capture_command", Mock(return_value=None)),
                             (fo, "guided_capture_active", Mock(return_value=False)),
                             (fo, "get_latest_rendered_reference", Mock(return_value=None)))
@@ -293,10 +305,14 @@ class ObserverSessionIntegrationTests(GuardSetup, unittest.TestCase):
                 side_effect=RuntimeError("Simulated missing window") if construction_error else None,
                 return_value=observer))
             retry = patchers.enter_context(patch.object(fo, "retry_failed_moves"))
-            result = tracking.begin_session(callback, show_windows=False, observation_only=preenabled)
-            retry.assert_not_called()
+            result = tracking.begin_session(callback, show_windows=False, observation_only=not live)
+            if live:
+                self.assertEqual(retry.call_count, 2)
+            else:
+                retry.assert_not_called()
         self.assertIsNone(result)
         factory.assert_called_once()
+        self.assertEqual(factory.call_args.kwargs["observation_only"], not live)
         old_engine.step.assert_not_called()
         callback.assert_not_called()
         session.close.assert_called_once()
@@ -327,6 +343,19 @@ class ObserverSessionIntegrationTests(GuardSetup, unittest.TestCase):
     def test_home_preenabled_observer_mode_opens_without_the_session_button_action(self):
         observer, _panel = self.run_fake_session(preenabled=True)
         self.assertEqual(observer.update.call_count, 3)
+
+    def test_normal_foundry_session_uses_shared_tracker_and_frame_delivery_evidence(self):
+        observer, panel = self.run_fake_session(live=True)
+        self.assertEqual(observer.update.call_count, 3)
+        self.assertTrue(panel.set_tracking_minis.called)
+        for call in observer.update.call_args_list:
+            self.assertEqual(call.kwargs["metadata"]["scene_visual_revision"], 0)
+            self.assertEqual(call.kwargs["metadata"]["scene_visual_change"], {"revision": 0})
+
+    def test_duplicate_camera_timestamp_is_skipped_without_resetting_bindings(self):
+        observer, _panel = self.run_fake_session(live=True, repeated_timestamp=True)
+        self.assertEqual(observer.update.call_count, 2)
+        observer.reset.assert_not_called()
 
 
 if __name__ == "__main__":

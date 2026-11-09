@@ -6,10 +6,13 @@ import tkinter as tk
 from tkinter import ttk
 
 from foundry_grid_controls import GRID_FIELDS
+from marker_geometry import normalized_marker_settings
 
 
 DISPLAY_SETTINGS = tuple(field[0] for field in GRID_FIELDS) + (
-    "viewportMarkersEnabled", "viewportMarkerSize", "viewportMarkerInset", "physicalGridAutoApply")
+    "viewportMarkersEnabled", "viewportMarkerPatternSize", "viewportMarkerMargin",
+    "viewportMarkerInset", "physicalGridAutoApply")
+_READABLE_DISPLAY_SETTINGS = (*DISPLAY_SETTINGS, "viewportMarkerSize")
 CAMERA_FIELDS = (
     ("name", "Profile name"), ("deviceLabel", "Camera device label"),
     ("sourceHint", "Input source / connection"), ("lens", "Lens"), ("zoom", "Zoom"),
@@ -73,14 +76,18 @@ def camera_form_values(values):
 
 
 def display_settings(values, *, complete=False):
-    if not values or set(values) - set(DISPLAY_SETTINGS):
+    if not values or set(values) - set(_READABLE_DISPLAY_SETTINGS):
         raise ValueError("Save at least one known display setting.")
-    if complete and set(values) != set(DISPLAY_SETTINGS):
-        raise ValueError("Foundry has not supplied all display settings yet.")
+    values = dict(values)
+    if "viewportMarkerPatternSize" in values and "viewportMarkerMargin" in values:
+        values.pop("viewportMarkerSize", None)
     result = {}
     for name, label, low, high in (
             *((name, label, low, high) for name, label, low, high, *_rest in GRID_FIELDS),
-            ("viewportMarkerSize", "Marker size", 72, 240), ("viewportMarkerInset", "Marker inset", 0, 80)):
+            ("viewportMarkerSize", "Legacy marker total width", 1, 240),
+            ("viewportMarkerPatternSize", "ArUco pattern width", 1, 240),
+            ("viewportMarkerMargin", "White margin per side", 0, 12),
+            ("viewportMarkerInset", "Marker inset", 0, 80)):
         if name not in values:
             continue
         try:
@@ -97,7 +104,22 @@ def display_settings(values, *, complete=False):
             if not isinstance(values[name], bool):
                 raise ValueError("Choose on or off for the display options.")
             result[name] = values[name]
+    result = normalized_marker_settings(result)
+    if complete and set(result) != set(DISPLAY_SETTINGS):
+        raise ValueError("Foundry has not supplied all display settings yet.")
     return result
+
+
+def marker_total_text(values):
+    """A read-only summary, so editing a margin never changes pattern width."""
+    try:
+        pattern = float(values.get("viewportMarkerPatternSize", ""))
+        margin = float(values.get("viewportMarkerMargin", ""))
+        if not math.isfinite(pattern + margin) or not 1 <= pattern <= 240 or not 0 <= margin <= 12:
+            raise ValueError()
+    except (TypeError, ValueError):
+        return "Total marker width: —"
+    return f"Total marker width: {pattern + 2 * margin:g} pixels ({pattern:g} + 2 × {margin:g})"
 
 
 class CameraProfilePicker(ttk.Frame):
@@ -270,7 +292,7 @@ class DisplayProfilePicker(ttk.LabelFrame):
                 if result.get("success") is True and result.get("sceneId") == pending["sceneId"]:
                     try:
                         current = self.store.get_profile("display", pending["profileId"])
-                        if (current is None or current.get("settings") != pending["settings"]
+                        if (current is None or display_settings(current.get("settings") or {}) != pending["settings"]
                                 or current.get("targetDisplayId") != pending["targetDisplayId"]):
                             self.message.set("Prior saved settings applied; the profile changed. Apply it again.")
                             self._update_enabled()
@@ -391,10 +413,15 @@ class HardwareProfilesPanel(ttk.Frame):
         self._entry(display, self.display_values, "name", "Profile name", 1)
         for row, (_name, label, _lo, _hi, _step, _default, _places) in enumerate(GRID_FIELDS, 2):
             self._entry(display, self.display_values, _name, label, row)
-        self._entry(display, self.display_values, "viewportMarkerSize", "Marker size (pixels)", 5)
-        self._entry(display, self.display_values, "viewportMarkerInset", "Marker inset (pixels)", 6)
+        self._entry(display, self.display_values, "viewportMarkerPatternSize", "ArUco pattern width (pixels)", 5)
+        self._entry(display, self.display_values, "viewportMarkerMargin", "White margin per side (0–12 pixels)", 6)
+        self._entry(display, self.display_values, "viewportMarkerInset", "Marker inset (pixels)", 7)
+        self.marker_total = tk.StringVar(self, "Total marker width: —")
+        self._label(display, self.marker_total, 8)
+        for name in ("viewportMarkerPatternSize", "viewportMarkerMargin"):
+            self.display_values[name].trace_add("write", lambda *_args: self._update_marker_total())
         for row, (name, label) in enumerate((("viewportMarkersEnabled", "Show ArUco markers"),
-                                           ("physicalGridAutoApply", "Keep physical grid size when the view changes")), 7):
+                                           ("physicalGridAutoApply", "Keep physical grid size when the view changes")), 9):
             ttk.Label(display, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=3)
             self.display_values[name] = tk.StringVar(self, "Not saved")
             combo = ttk.Combobox(display, textvariable=self.display_values[name],
@@ -404,16 +431,16 @@ class HardwareProfilesPanel(ttk.Frame):
         self.include_display = tk.BooleanVar(self, False)
         self._target_display_id = None
         check = ttk.Checkbutton(display, text="Save the preferred monitor with this profile", variable=self.include_display)
-        check.grid(row=9, column=0, columnspan=2, sticky="w", pady=3)
+        check.grid(row=11, column=0, columnspan=2, sticky="w", pady=3)
         self._widgets.append(check)
         buttons = ttk.Frame(display)
-        buttons.grid(row=10, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        buttons.grid(row=12, column=0, columnspan=2, sticky="w", pady=(8, 4))
         self._button(buttons, "New", self.new_display)
         self._button(buttons, "Read current VTT settings", self.read_current_display)
         self._button(buttons, "Save profile", self.save_display)
         ttk.Label(display, text="Apply saved grid and marker settings from VTT Controls. The saved monitor "
                   "sets a preference; use Move Foundry to place the window.", wraplength=500).grid(
-                      row=11, column=0, columnspan=2, sticky="w", pady=(6, 0))
+                      row=13, column=0, columnspan=2, sticky="w", pady=(6, 0))
         label = ttk.Label(self, textvariable=self.message, wraplength=600)
         label.pack(fill="x", pady=(6, 0))
         label.bind("<Configure>", lambda event: label.configure(wraplength=max(180, event.width)))
@@ -436,6 +463,10 @@ class HardwareProfilesPanel(ttk.Frame):
         entry = ttk.Entry(parent, textvariable=variables[name], width=32)
         entry.grid(row=row, column=1, sticky="ew", pady=3)
         self._widgets.append(entry)
+
+    def _update_marker_total(self):
+        if hasattr(self, "marker_total"):
+            self.marker_total.set(marker_total_text({key: value.get() for key, value in self.display_values.items()}))
 
     def _button(self, parent, label, command):
         button = ttk.Button(parent, text=label, command=command)
@@ -577,9 +608,10 @@ class HardwareProfilesPanel(ttk.Frame):
         self._display_id = profile["id"]
         self.display_choice.set(profile["name"])
         self.display_values["name"].set(profile["name"])
-        for name, value in profile["settings"].items():
+        settings = display_settings(profile["settings"])
+        for name, value in settings.items():
             self.display_values[name].set(("On" if value else "Off") if isinstance(value, bool) else value)
-        self._display_saved_keys = set(profile["settings"])
+        self._display_saved_keys = set(settings)
         self._target_display_id = profile.get("targetDisplayId")
         self.include_display.set(self._target_display_id is not None)
         self._display_snapshot = self._display_form_snapshot()
@@ -591,7 +623,7 @@ class HardwareProfilesPanel(ttk.Frame):
             if not status.get("connected") or not status.get("supported") or status.get("blocked"):
                 raise ValueError("Connect Foundry and open a scene before reading its display settings.")
             settings = display_settings({key: value for key, value in (status.get("settings") or {}).items()
-                                         if key in DISPLAY_SETTINGS}, complete=True)
+                                         if key in _READABLE_DISPLAY_SETTINGS}, complete=True)
             for name, value in settings.items():
                 self.display_values[name].set(("On" if value else "Off") if isinstance(value, bool) else value)
             if self._display is not None:

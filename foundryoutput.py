@@ -93,6 +93,7 @@ _view_transform_revision = 0
 _view_transform_lock = threading.Lock()
 _scene_visual_revision = 0
 _scene_visual_reason = "initial"
+_scene_visual_changes = deque(maxlen=32)
 _test_sequence: dict | None = None
 
 # Recording metadata is global so it survives CV session handoffs during mini
@@ -231,6 +232,7 @@ def get_delivery_status() -> dict:
     moves = _delivery.snapshot()
     failed = [name for name, move in moves.items() if move["state"] == "failed"]
     assignments = [name for name, move in moves.items() if move["state"] == "assignment"]
+    geometry_waits = [name for name, move in moves.items() if move["state"] == "geometry"]
     pending = [name for name, move in moves.items() if move["state"] != "confirmed"]
     if observation_only():
         message = "Observer mode — Foundry movement off"
@@ -246,6 +248,8 @@ def get_delivery_status() -> dict:
         message = "Move failed: " + ", ".join(failed)
     elif assignments:
         message = "Assignment needed: " + ", ".join(assignments)
+    elif geometry_waits:
+        message = "Waiting for current token geometry: " + ", ".join(geometry_waits)
     elif pending:
         message = f"{len(pending)} move(s) awaiting confirmation"
     else:
@@ -717,12 +721,28 @@ def get_tracking_view_snapshot() -> tuple[int, dict | None]:
         return _view_transform_revision, dict(_view_transform) if _view_transform is not None else None
 
 
-def mark_scene_visual_changed(reason: str = "unknown") -> int:
+def mark_scene_visual_changed(reason: str = "unknown", payload=None) -> int:
     global _scene_visual_revision, _scene_visual_reason
     with _view_transform_lock:
         _scene_visual_revision += 1
         _scene_visual_reason = str(reason)
         revision = _scene_visual_revision
+        payload = payload if isinstance(payload, dict) else {}
+        def identities(key, singular=None):
+            values = payload.get(key)
+            if values is None and singular and payload.get(singular) is not None:
+                values = [payload[singular]]
+            if (not isinstance(values, list) or len(values) > 64
+                    or not all(isinstance(value, str) and 0 < len(value) <= 256 for value in values)):
+                return []
+            return list(dict.fromkeys(values))
+        reasons = identities("reasons")
+        if str(reason) not in reasons:
+            reasons.append(str(reason))
+        _scene_visual_changes.append({"revision": revision, "reason": str(reason),
+            "reasons": reasons, "sceneId": str(payload.get("sceneId") or SCENE_ID),
+            "tokenIds": identities("tokenIds", "tokenId"),
+            "commandIds": identities("commandIds", "commandId")})
     print(
         f"FoundryOutput | Scene visual changed: revision={revision} reason={reason}"
     )
@@ -732,6 +752,19 @@ def mark_scene_visual_changed(reason: str = "unknown") -> int:
 def get_scene_visual_revision() -> int:
     with _view_transform_lock:
         return _scene_visual_revision
+
+
+def get_scene_visual_change() -> dict:
+    """Bounded mutation history; no entry alone certifies a rendered camera frame."""
+    with _view_transform_lock:
+        history = copy.deepcopy(list(_scene_visual_changes))
+        latest = next((item for item in reversed(history)
+                       if item["revision"] == _scene_visual_revision), None)
+        if latest is None:
+            latest = {"revision": _scene_visual_revision, "reason": _scene_visual_reason,
+                      "reasons": [_scene_visual_reason], "sceneId": SCENE_ID,
+                      "tokenIds": [], "commandIds": []}
+        return {**latest, "changes": history}
 
 
 def get_scene_info_payload() -> dict:
@@ -1508,6 +1541,77 @@ def queue_cell_move(mini_id: str, cell_label: str, *, source="tracking") -> None
         _grid_to_pixels(cell_label)
         _delivery.offer(mini_id, cell_label, _scene_context(), source)
 
+
+def clear_pending_moves() -> None:
+    """A new starting-position generation must not release old intentions."""
+    with _capture_lock:
+        _delivery.clear()
+
+
+def _scene_position_bounds():
+    view = _view_transform_snapshot()
+    origin_x = origin_y = 0.
+    if view is not None and view["sceneId"] == SCENE_ID:
+        # Foundry's grid origin includes canvas padding and the grid shift.
+        origin_x = view["gridOriginX"] - SHIFT_X
+        origin_y = view["gridOriginY"] - SHIFT_Y
+    return origin_x, origin_y, origin_x + SCENE_W, origin_y + SCENE_H
+
+
+def queue_position_move(mini_id: str, center_x, center_y, *, source="base-tracker", generation=None,
+                        expected_token_id=None, expected_scene_id=None) -> bool:
+    """Retain an absolute base CENTER, optionally pinned to a confirmed binding."""
+    if (not isinstance(mini_id, str) or not mini_id.strip() or len(mini_id) > 256
+            or not all(type(value) in (int, float) and math.isfinite(value) for value in (center_x, center_y))):
+        raise ValueError("Choose a mini and a finite Foundry base center")
+    with _capture_lock:
+        if _tracking_output_paused or _observation_only:
+            return False
+        if expected_scene_id is not None:
+            if (not isinstance(expected_scene_id, str) or not expected_scene_id or len(expected_scene_id) > 256):
+                raise ValueError("Provide the scene used to measure the base position")
+            if SCENE_ID != expected_scene_id:
+                return False
+        if expected_token_id is not None:
+            if (not isinstance(expected_token_id, str) or not expected_token_id or len(expected_token_id) > 256):
+                raise ValueError("Provide the exact assigned Foundry token ID")
+            if MINI_TO_TOKEN.get(mini_id.strip()) != expected_token_id:
+                return False
+        left, top, right, bottom = _scene_position_bounds()
+        if not left <= center_x <= right or not top <= center_y <= bottom:
+            raise ValueError("The measured base center is outside the active Foundry scene")
+        return _delivery.offer_position(mini_id.strip(), (center_x, center_y), _scene_context(),
+                                        source, generation=generation, expected_token_id=expected_token_id,
+                                        expected_scene_id=expected_scene_id)
+
+
+def _position_to_pixels(center, token_id):
+    """Resolve token dimensions only from current-scene VTT metadata."""
+    with _vtt_lock:
+        state = _vtt_state.get("data") or {}
+        if state.get("sceneId") != SCENE_ID or state.get("ready") is not True:
+            raise LookupError("Waiting for current Foundry token geometry")
+        token = next((item for item in state.get("tokens", []) if item.get("tokenId") == token_id), None)
+        if token is None:
+            raise LookupError("Assigned token is not in the current Foundry scene")
+        width, height = token.get("width"), token.get("height")
+        scene = state.get("scene")
+        grid = scene.get("gridSize", GRID_PX) if isinstance(scene, dict) else GRID_PX
+    if (not all(type(value) in (int, float) and math.isfinite(value) and value > 0
+                for value in (width, height, grid))):
+        raise LookupError("Waiting for valid Foundry token dimensions and grid size")
+    if GRID_PX is not None and grid != GRID_PX:
+        raise LookupError("Waiting for Foundry token geometry at the current grid size")
+    footprint_w, footprint_h = width * grid, height * grid
+    if not all(math.isfinite(value) for value in (footprint_w, footprint_h)):
+        raise LookupError("Waiting for valid Foundry token dimensions and grid size")
+    x, y = int(round(center[0] - footprint_w / 2)), int(round(center[1] - footprint_h / 2))
+    left, top, right, bottom = _scene_position_bounds()
+    if x < left or y < top or x + footprint_w > right or y + footprint_h > bottom:
+        raise ValueError("The assigned token would extend outside the active Foundry scene")
+    return x, y
+
+
 def move_token_to_grid(mini_id: str, cell_label: str, *, source="tracking") -> None:
     """
     API used by main.py:on_mini_moved.
@@ -1602,13 +1706,33 @@ async def send_loop(websocket):
     while True:
         if _connection_ready and not tracking_output_paused():
             for mini_id, move in _delivery.snapshot().items():
-                token_id = _resolve_token_id_for_mini(mini_id)
-                if token_id == DEFAULT_TOKEN_ID:
+                position = move.get("target_kind") == "position"
+                # Clicked observer IDs never inherit a legacy suffix or default
+                # token binding. Their exact assignment is the only authority.
+                token_id = MINI_TO_TOKEN.get(mini_id) if position else _resolve_token_id_for_mini(mini_id)
+                if position and move.get("expected_token_id") is not None and token_id != move["expected_token_id"]:
+                    _delivery.reject_position_binding(mini_id, move["command_id"])
+                    continue
+                if position and move.get("state") == "confirmed":
+                    # Later token resizing is not a new physical movement.
+                    # Only a fresh offer may move an already-confirmed base.
+                    continue
+                if not token_id or (not position and token_id == DEFAULT_TOKEN_ID):
                     if _delivery.waiting_for_assignment(mini_id):
                         request_assignment(mini_id)
                     continue
-                coordinates = _grid_to_pixels(move["cell"])
-                payload = _delivery.prepare(mini_id, move["cell"], token_id, coordinates, time.monotonic())
+                if position:
+                    try:
+                        coordinates = _position_to_pixels(move["center"], token_id)
+                    except (LookupError, ValueError) as exc:
+                        _delivery.wait_for_geometry(mini_id, move["center"], str(exc),
+                            generation=move.get("generation"), failed=isinstance(exc, ValueError))
+                        continue
+                    payload = _delivery.prepare_position(mini_id, move["center"], token_id, coordinates,
+                        time.monotonic(), generation=move.get("generation"))
+                else:
+                    coordinates = _grid_to_pixels(move["cell"])
+                    payload = _delivery.prepare(mini_id, move["cell"], token_id, coordinates, time.monotonic())
                 if payload and not tracking_output_paused():
                     print(f"FoundryOutput | mini={mini_id} cell={move['cell']} -> token={token_id} | Awaiting confirmation.", flush=True)
                     await websocket.send(json.dumps(payload))
@@ -1726,6 +1850,10 @@ async def recv_loop(websocket):
                 continue
 
             if mini_id and token_id:
+                pending = _delivery.snapshot().get(mini_id, {})
+                if (pending.get("target_kind") == "position" and pending.get("expected_token_id") is not None
+                        and pending["expected_token_id"] != str(token_id)):
+                    _delivery.reject_position_binding(mini_id, pending["command_id"])
                 MINI_TO_TOKEN[mini_id] = str(token_id)
                 print(f"FoundryOutput | Assigned mini {mini_id} -> token {token_id}")
                 _save_mapping()
@@ -1740,6 +1868,8 @@ async def recv_loop(websocket):
                 if state is None:
                     continue
                 record_delivery_event({**data, "cell": state["cell"],
+                    "targetKind": state.get("target_kind", "cell"), "center": state.get("center"),
+                    "bindingGeneration": state.get("generation"),
                     "type": "tokenMoveApplied" if state["state"] == "confirmed" else "tokenMoveError",
                     "error": state["error"]})
                 print(f"FoundryOutput | Move {state['state']}: {data['miniId']} {state['error']}", flush=True)
@@ -1793,7 +1923,9 @@ async def recv_loop(websocket):
             record_rendered_reference_status(data)
 
         elif msg_type == "sceneVisualChanged":
-            mark_scene_visual_changed(str(data.get("reason") or "foundry"))
+            if data.get("sceneId") not in (None, SCENE_ID):
+                continue
+            mark_scene_visual_changed(str(data.get("reason") or "foundry"), data)
 
         elif msg_type == "movementSelection":
             mini_id = str(data.get("miniId") or "").strip()

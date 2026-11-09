@@ -59,12 +59,13 @@ def read_event_journal(path):
 
 
 class ObserverEventJournal:
-    def __init__(self, path, run_id, *, recent_limit=100):
+    def __init__(self, path, run_id, *, recent_limit=100, foundry_token_output=False):
         if not isinstance(run_id, str) or not run_id or len(run_id) > 256:
             raise ValueError("Provide an observer run ID")
         if type(recent_limit) is not int or recent_limit < 1:
             raise ValueError("Recent event limit must be positive")
         self.path, self.run_id = Path(path), run_id
+        self.foundry_token_output = bool(foundry_token_output)
         self._recent = deque(maxlen=recent_limit)
         self._pending = deque()
         self._accepted = {}
@@ -88,7 +89,7 @@ class ObserverEventJournal:
             if not self._closed:
                 self._enqueue("run_resumed")
         else:
-            self._enqueue("run_started", foundry_token_output=False)
+            self._enqueue("run_started", foundry_token_output=self.foundry_token_output)
         self.flush()
 
     def _recover(self, existing):
@@ -168,7 +169,7 @@ class ObserverEventJournal:
                 movementSequence=self._move_sequence, event=event, reason=reason,
                 recordingFolder=recording_folder,
                 recordingCoverage="not asserted; consult the input recording manifest",
-                foundry_token_output=False)
+                foundry_token_output=self.foundry_token_output)
             self._accepted[identity] = digest
             self._recent.append(record)
         return self.flush()

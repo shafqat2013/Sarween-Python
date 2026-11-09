@@ -43,6 +43,7 @@ class AppWindow:
         self._startup = self._runtime_panel = None
         self._close_requested = False
         self._observer_startup = False
+        self._observer_guard = False
         self.library = {"minis": {}}
         root.title("Sarween")
         root.geometry(f"860x{min(620, root.winfo_screenheight() - 100)}")
@@ -55,24 +56,16 @@ class AppWindow:
         self.login.pack(fill="both", expand=True)
         self.home = outer = ttk.Frame(root, padding=16)
         self.runtime_host = ttk.Frame(root)
-        header = ttk.Frame(outer)
+        self.header = header = ttk.Frame(outer)
         header.pack(fill="x", pady=(0, 12))
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="Sarween", font=("Helvetica", 20, "bold")).grid(
-            row=0, column=0, rowspan=2, sticky="nw")
-        self.start_button = ttk.Button(header, text="Start live session", command=self.start_session)
-        self.start_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
-        self.observer_button = None
-        if run_observer is not None:
-            self.observer_button = ttk.Button(header, text="Start mini observer",
-                command=lambda: self.start_session(observer=True))
-            self.observer_button.grid(row=0, column=2, sticky="ew")
-        self.recording_button = ttk.Button(header, text="Open your video", command=self.open_recording)
-        self.recording_button.grid(row=1, column=1, sticky="ew", padx=(0, 6), pady=(6, 0))
-        self.demo_button = ttk.Button(header, text="Watch real example", command=self.open_demo)
-        self.demo_button.grid(row=1, column=2, sticky="ew", pady=(6, 0))
+            row=0, column=0, sticky="nw")
+        self.start_button = ttk.Button(header, text="Start session", command=self.start_session)
+        self.start_button.grid(row=0, column=1, sticky="e")
         self.status = tk.StringVar(root, value="Idle - camera off")
-        ttk.Label(outer, textvariable=self.status).pack(anchor="w", pady=(0, 12))
+        self.status_label = ttk.Label(outer, textvariable=self.status)
+        self.status_label.pack(anchor="w", pady=(0, 12))
 
         from auth_ui import AuthPanel
         self.auth = (auth_panel_factory or AuthPanel)(
@@ -84,10 +77,21 @@ class AppWindow:
         self.tabs.pack(fill="both", expand=True)
         self.session_tab = ttk.Frame(self.tabs, padding=4)
         self.tabs.add(self.session_tab, text="Session")
-        self.session_intro = ttk.Label(self.session_tab,
-            text="Start a live session or mini observer to choose hardware and connect here.",
-            wraplength=640, justify="left")
-        self.session_intro.pack(anchor="w", padx=8, pady=12)
+        self.session_intro = ttk.Frame(self.session_tab, padding=12)
+        self.session_intro.pack(fill="both", expand=True)
+        ttk.Label(self.session_intro, text="Set up your table", font=("Helvetica", 15, "bold")).pack(anchor="w")
+        intro = ttk.Label(self.session_intro,
+            text="Start session brings your TV, camera and Foundry setup together here. Your saved settings are filled in for you.",
+            wraplength=610, justify="left")
+        intro.pack(fill="x", pady=(8, 18))
+        intro.bind("<Configure>", lambda event: intro.configure(wraplength=max(100, event.width)))
+        for title, detail in (("1  TV and camera", "Choose your devices and confirm the camera profile."),
+                              ("2  Foundry and display", "Choose the world, TV profile and map overlays."),
+                              ("3  Connect", "See startup progress here, then enter your session.")):
+            ttk.Label(self.session_intro, text=title, font=("Helvetica", 12, "bold")).pack(anchor="w", pady=(0, 3))
+            label = ttk.Label(self.session_intro, text=detail, wraplength=610, justify="left")
+            label.pack(fill="x", pady=(0, 14))
+            label.bind("<Configure>", lambda event, widget=label: widget.configure(wraplength=max(100, event.width)))
         library_tab = ttk.Frame(self.tabs, padding=12)
         connections = ttk.Frame(self.tabs, padding=12)
         hardware = ttk.Frame(self.tabs, padding=12)
@@ -133,6 +137,23 @@ class AppWindow:
             changed=self.vtt_controls.display_profiles.refresh_profiles)
         self.hardware_profiles.pack(fill="both", expand=True)
 
+        tools = ttk.LabelFrame(diagnostics, text="Testing and recordings", padding=10)
+        tools.pack(fill="x", pady=(0, 12))
+        tools.columnconfigure(1, weight=1)
+        self.observer_button = None
+        tool_row = 0
+        if run_observer is not None:
+            self.observer_button = ttk.Button(tools, text="Test mini tracking",
+                command=lambda: self.start_session(observer=True))
+            self.observer_button.grid(row=tool_row, column=0, sticky="ew", pady=4, padx=(0, 12))
+            ttk.Label(tools, text="Observation only; Foundry tokens stay still.").grid(row=tool_row, column=1, sticky="w")
+            tool_row += 1
+        self.recording_button = ttk.Button(tools, text="Open recording…", command=self.open_recording)
+        self.recording_button.grid(row=tool_row, column=0, sticky="ew", pady=4, padx=(0, 12))
+        ttk.Label(tools, text="Review a saved video.").grid(row=tool_row, column=1, sticky="w")
+        self.demo_button = ttk.Button(tools, text="Watch example", command=self.open_demo)
+        self.demo_button.grid(row=tool_row + 1, column=0, sticky="ew", pady=4, padx=(0, 12))
+        ttk.Label(tools, text="Open the bundled tracking demonstration.").grid(row=tool_row + 1, column=1, sticky="w")
         self.diagnostic = tk.StringVar(root, value="No active session")
         ttk.Label(diagnostics, textvariable=self.diagnostic, wraplength=610, justify="left").pack(anchor="w")
         ttk.Separator(diagnostics).pack(fill="x", pady=12)
@@ -276,10 +297,7 @@ class AppWindow:
             self.replay.close()
         self.busy = True
         self._observer_startup = observer
-        if observer:
-            import foundryoutput as fo
-            fo.set_observation_only(True)
-        self.status.set("Choose hardware")
+        self.status.set("Set up your table" + (" — tracking test" if observer else ""))
         self._access_changed()
         self.tabs.select(self.session_tab)
         self.session_intro.pack_forget()
@@ -288,8 +306,10 @@ class AppWindow:
         try:
             self._startup = factory(self.session_tab, service=self.service, access=self.auth,
                 runtime_parent=self.runtime_host, observer=observer,
+                display_controller=self.vtt_controls.display_controller,
                 on_ready=lambda startup: self._run_inline_session(runner, startup),
                 on_cancel=self._cancel_inline_session, on_runtime=self._show_runtime_panel)
+            self._access_changed()
         except Exception as exc:
             self.diagnostic.set(str(exc))
             self._finish_inline_session("Hardware setup could not open - camera off")
@@ -312,6 +332,12 @@ class AppWindow:
         self.status.set("Starting camera")
         self.root.update_idletasks()
         message = None
+        # Startup must be able to unpause Foundry. Inhibit token output only
+        # while the observation runner owns the session, including errors.
+        if self._observer_startup:
+            import foundryoutput as fo
+            fo.set_observation_only(True)
+            self._observer_guard = True
         try:
             runner(self.service, startup=startup)
             message = "Session stopped - camera off" if self.auth.allowed else self.auth.status()
@@ -334,6 +360,7 @@ class AppWindow:
             import traceback
             traceback.print_exc()
         finally:
+            self._release_observer_guard()
             if message is not None:
                 self._finish_inline_session(message)
 
@@ -348,18 +375,22 @@ class AppWindow:
         self.runtime_host.pack_forget()
         self._runtime_panel = None
         self.root.minsize(700, 460)
-        if self._observer_startup:
-            import foundryoutput as fo
-            fo.set_observation_only(False)
+        self._release_observer_guard()
         self._observer_startup = False
         self.busy = False
         self.status.set(message)
         if self._close_requested:
             self.close()
         elif not self.closed:
-            self.session_intro.pack(anchor="w", padx=8, pady=12)
+            self.session_intro.pack(fill="both", expand=True)
             self._access_changed()
             self.refresh_library()
+
+    def _release_observer_guard(self):
+        if getattr(self, "_observer_guard", False):
+            import foundryoutput as fo
+            fo.set_observation_only(False)
+            self._observer_guard = False
 
     def open_recording(self, path=None, *, demo=False):
         if self.busy or self.closed:
@@ -414,10 +445,10 @@ class AppWindow:
         allowed = self.auth.allowed
         self.vtt_controls.set_enabled(allowed)
         self.hardware_profiles.set_enabled(allowed)
-        if allowed and not self.home.winfo_manager():
+        if allowed and not self.home.winfo_manager() and self._runtime_panel is None:
             self.login.pack_forget()
             self.home.pack(fill="both", expand=True)
-            self.demo_button.focus_set()
+            self.start_button.focus_set()
         elif not allowed and not self.login.winfo_manager():
             self.home.pack_forget()
             self.login.pack(fill="both", expand=True)
@@ -428,6 +459,7 @@ class AppWindow:
         for button in buttons:
             button.state(["!disabled"] if allowed and not self.busy else ["disabled"])
         self.connect_button.state(["!disabled"] if allowed or self.service.running else ["disabled"])
+        self._sync_setup_layout()
         if not allowed:
             if getattr(self, "inline_startup", False) and self.busy:
                 if self._runtime_panel is not None:
@@ -440,3 +472,17 @@ class AppWindow:
                 self.replay = None
             if self.service.running:
                 self.service.stop()
+
+    def _sync_setup_layout(self):
+        """Give setup the window space; keep its next/back/cancel actions fixed."""
+        focused = bool(self.inline_startup and self.busy and self._startup is not None
+                       and self._runtime_panel is None)
+        for widget in (self.header, self.status_label, getattr(self.auth, "account", None)):
+            if widget is None:
+                continue
+            if focused:
+                widget.pack_forget()
+            else:
+                widget.pack(fill="x", pady=(0, 12), before=self.tabs)
+        for tab in self.tabs.tabs():
+            self.tabs.tab(tab, state="normal" if not focused or tab == str(self.session_tab) else "disabled")

@@ -11,7 +11,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from collections import deque
 from collections.abc import Mapping
+from statistics import median
+
+
+TIMING_POLICIES = ("fixed-gap-v1", "bounded-cadence-v1")
 
 
 def _distance(a, b):
@@ -53,11 +58,15 @@ class SingleMover:
     """
 
     def __init__(self, initial_positions: dict[str, tuple[float, float]],
-                 grid_px: float, settle_seconds: float = 0.20):
+                 grid_px: float, settle_seconds: float = 0.20, *,
+                 timing_policy: str = "bounded-cadence-v1"):
         self.grid_px = _finite(grid_px, "Grid spacing")
         self.settle_seconds = _finite(settle_seconds, "Settling duration")
         if self.grid_px <= 0 or self.settle_seconds < 0:
             raise ValueError("Grid spacing must be positive and settling duration nonnegative")
+        if timing_policy not in TIMING_POLICIES:
+            raise ValueError("Unsupported observer timing policy")
+        self.timing_policy = timing_policy
         if not isinstance(initial_positions, Mapping) or not initial_positions:
             raise ValueError("Provide at least one initial identity/position binding")
         self.positions = {}
@@ -71,7 +80,14 @@ class SingleMover:
         self.move_threshold = self.grid_px * 0.40
         self.duplicate_gate = self.grid_px * 0.18
         self.settle_radius = self.grid_px * 0.15
-        self.maximum_observation_gap = max(0.5, self.settle_seconds * 2.5)
+        # Settling is a minimum observation duration, not an assumed frame
+        # rate. Learn regular slower capture cadence without allowing a single
+        # outage to increase its own validity window. Legacy recordings retain
+        # their original fixed-gap behavior when explicitly replayed that way.
+        self.maximum_observation_gap = (max(0.5, self.settle_seconds * 2.5)
+                                        if timing_policy == "fixed-gap-v1" else 0.5)
+        self._cadence_intervals = deque(maxlen=9)
+        self._cadence_gap_cap = 1.0
         self.minimum_confidence = 0.45
         self.last_seen = {mini: None for mini in self.positions}
         self._last_timestamp = None
@@ -128,6 +144,27 @@ class SingleMover:
                             for mini in missing if mini in self._missing_since},
             "unresolved_departures": sorted(self._unresolved),
         }
+        if self.timing_policy == "bounded-cadence-v1":
+            self.status["timing"] = {
+                "policy": self.timing_policy,
+                "maximum_observation_gap": self.maximum_observation_gap,
+                "cadence_seconds": (float(median(self._cadence_intervals))
+                                    if len(self._cadence_intervals) >= 3 else None),
+            }
+
+    def _observe_capture_time(self, now):
+        if self.timing_policy == "bounded-cadence-v1":
+            # Only earlier intervals influence this frame's limit. In
+            # particular, the first delayed frame cannot excuse its own gap.
+            self.maximum_observation_gap = (max(0.5, min(self._cadence_gap_cap,
+                1.5 * median(self._cadence_intervals))) if len(self._cadence_intervals) >= 3 else 0.5)
+        gap = None if self._last_timestamp is None else now - self._last_timestamp
+        if gap is not None and gap > self.maximum_observation_gap:
+            self._pending = None
+        if (self.timing_policy == "bounded-cadence-v1" and gap is not None
+                and 0 < gap <= self._cadence_gap_cap):
+            self._cadence_intervals.append(gap)
+        self._last_timestamp = now
 
     def _observe_destination(self, extras, now):
         """Cache fresh geometry without assigning an identity while ambiguous."""
@@ -165,12 +202,7 @@ class SingleMover:
         if not hidden.issubset(self.positions):
             raise ValueError("Unavailable identities must belong to the initial layout")
         measured = self._measurements(candidates)
-        if (self._last_timestamp is not None
-                and now - self._last_timestamp > self.maximum_observation_gap):
-            # Two isolated stills do not demonstrate a continuously settled
-            # base during an unobserved capture gap.
-            self._pending = None
-        self._last_timestamp = now
+        self._observe_capture_time(now)
         if obstructed:
             self._pending = None
             # During a broad unobserved interval, no identity may be removed
@@ -268,7 +300,8 @@ class SingleMover:
             self._pending = None
             self._set_status("uncertain", "insufficient_displacement", missing, hidden, extras, now)
             return []
-        if now - self._pending["started"] + 1e-9 < self.settle_seconds:
+        if (now - self._pending["started"] + 1e-9 < self.settle_seconds
+                or (self.timing_policy == "bounded-cadence-v1" and len(self._pending["samples"]) < 2)):
             self._set_status("settling", "one_mover_settling", missing, hidden, extras, now)
             return []
 

@@ -8,6 +8,7 @@ engine does not establish that changing map artwork is a physical miniature.
 
 from __future__ import annotations
 
+from collections import deque
 from copy import deepcopy
 import json
 import math
@@ -17,9 +18,14 @@ import numpy as np
 
 from poc_ring_detector import RingDetector
 from poc_scene_reference import SceneReference
-from single_mover_state import SingleMover
+from single_mover_state import SingleMover, TIMING_POLICIES
 
-DISPLAY_TRANSITION_POLICIES = ("disabled", "hold-known-display-changes-v1")
+EXPECTED_DISPLAY_RECOVERY_POLICIES = ("recover-expected-display-changes-v1",
+                                     "recover-expected-display-changes-v2",
+                                     "recover-expected-display-changes-v3")
+CONTINUOUS_DISPLAY_POLICY = "continuous-static-map-v1"
+DISPLAY_TRANSITION_POLICIES = ("disabled", "hold-known-display-changes-v1",
+                               *EXPECTED_DISPLAY_RECOVERY_POLICIES, CONTINUOUS_DISPLAY_POLICY)
 _UNKNOWN_REVISION = object()
 
 
@@ -114,8 +120,12 @@ class ObserverEngine:
     """
 
     def __init__(self, geometry, initial_positions, initial_cells=None, *, geometry_key=None,
-                 detector_factory=None, watermark_mode="provided", display_transition_policy="disabled"):
+                 detector_factory=None, watermark_mode="provided", display_transition_policy="disabled",
+                 timing_policy="bounded-cadence-v1"):
         self.geometry = geometry
+        if timing_policy not in TIMING_POLICIES:
+            raise ValueError("Unsupported observer timing policy")
+        self.timing_policy = timing_policy
         if watermark_mode not in ("provided", "board-template-v1"):
             raise ValueError("Unsupported observer watermark mode")
         self.watermark_mode = watermark_mode
@@ -131,7 +141,7 @@ class ObserverEngine:
         if geometry is not None:
             self.geometry = geometry
         geometry = self.geometry
-        mover = SingleMover(initial_positions, geometry.grid_px)
+        mover = SingleMover(initial_positions, geometry.grid_px, timing_policy=self.timing_policy)
         for xy in mover.positions.values():
             if not (0 <= xy[0] < geometry.width and 0 <= xy[1] < geometry.height):
                 raise ValueError("Initial base centers must be inside the board image")
@@ -157,6 +167,13 @@ class ObserverEngine:
         self._invalid_reason = None
         self._display_baseline_revision = _UNKNOWN_REVISION
         self._display_observed_revision = None
+        self._expected_display_commands = {}
+        self._known_display_commands = {}
+        self._confirmed_display_commands = set()
+        self._notified_display_commands = set()
+        self._resolved_display_commands = set()
+        self._superseded_display_commands = {}
+        self._display_recovery = None
         self.events = []
         self.last_record = None
         # Clicks declare identity and approximate location. They are not visual
@@ -182,9 +199,10 @@ class ObserverEngine:
                 "detector": {"module": type(self.detector).__module__,
                              "class": type(self.detector).__name__},
                 "watermark": {"mode": self.watermark_mode},
+                "timing_policy": self.timing_policy,
                 "display_transitions": {"policy": self.display_transition_policy,
                     "notification_is_not_camera_render_synchronization": True,
-                    "automatic_recovery": False},
+                    "automatic_recovery": self.display_transition_policy in EXPECTED_DISPLAY_RECOVERY_POLICIES},
                 "acquisition": {"settle_seconds": self.acquisition_settle_seconds,
                                 "window_seconds": self.acquisition_window_seconds,
                                 "minimum_measurements": 2},
@@ -195,6 +213,274 @@ class ObserverEngine:
     def final_positions(self):
         return {mini: self.geometry.describe(xy, self.position_uncertainty[mini])
                 for mini, xy in self.mover.positions.items()}
+
+    def expect_display_change(self, command_id, scene_id, token_id):
+        """Register local provenance, separately from physical observations."""
+        continuous = self.display_transition_policy == CONTINUOUS_DISPLAY_POLICY
+        if self.display_transition_policy not in EXPECTED_DISPLAY_RECOVERY_POLICIES and not continuous:
+            raise ValueError("This observer does not recover token display changes")
+        if not all(isinstance(value, str) and value and len(value) <= 256
+                   for value in (command_id, scene_id, token_id)):
+            raise ValueError("Expected display commands need command, scene and token IDs")
+        if scene_id != self.geometry.view.get("sceneId"):
+            raise ValueError("Expected display command belongs to a different scene")
+        if self.needs_reset or (not continuous and (not self._acquired or self._previous is None)):
+            raise ValueError("Acquire all bases before queuing Foundry movement")
+        specification = {"command_id": command_id, "scene_id": scene_id, "token_id": token_id}
+        existing = self._known_display_commands.get(command_id)
+        if existing is not None and existing["specification"] != specification:
+            raise ValueError("An expected command cannot change its target")
+        if existing is not None:
+            return False
+        if len(self._expected_display_commands) >= 64 and existing is None:
+            raise ValueError("Too many pending Foundry display changes")
+        if not continuous and self._display_recovery is None:
+            self._display_recovery = self._new_display_recovery(self._previous, self._previous_mask)
+        self._expected_display_commands[command_id] = specification
+        self._known_display_commands[command_id] = {"specification": specification, "started": self._last_timestamp}
+        if not continuous:
+            self._known_display_commands[command_id].update(
+                baseline=self._display_recovery["baseline"], mask=self._display_recovery["mask"])
+        while len(self._known_display_commands) > 32:
+            old = next((key for key in self._known_display_commands if key not in self._expected_display_commands), None)
+            if old is None:
+                break
+            self._known_display_commands.pop(old)
+            self._confirmed_display_commands.discard(old)
+            self._notified_display_commands.discard(old)
+            self._resolved_display_commands.discard(old)
+            self._superseded_display_commands.pop(old, None)
+        if not continuous:
+            self.mover._pending = None
+        return True
+
+    def _new_display_recovery(self, baseline, mask):
+        # Keep bounded, lower-resolution display evidence rather than retaining
+        # a full 4K camera image for each command in the relay's recent history.
+        scale = min(1., 1024 / max(baseline.shape[:2]))
+        size = (max(1, round(baseline.shape[1] * scale)), max(1, round(baseline.shape[0] * scale)))
+        baseline = cv2.resize(baseline, size, interpolation=cv2.INTER_AREA)
+        mask = cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST)
+        return {"baseline": baseline, "mask": mask, "started": self._last_timestamp,
+                "seen": set(), "confirmed": set(), "samples": 0,
+                "stable_since": None, "pixel_support": None, "change_observed": False,
+                "last_stable_time": None, "anchor_samples": {},
+                "recent_pixel_changes": deque(maxlen=3), "positive_evidence_since": None}
+
+    def cancel_expected_display_change(self, command_id, replacement_id=None):
+        """Supersede a retry without erasing its possible late renderer notice."""
+        known = self._known_display_commands.get(command_id)
+        if known is None:
+            return False
+        if replacement_id is not None:
+            replacement = self._known_display_commands.get(replacement_id)
+            if replacement is None or replacement_id == command_id:
+                raise ValueError("A superseded display command needs a known replacement")
+            old, new = known["specification"], replacement["specification"]
+            if (old["scene_id"], old["token_id"]) != (new["scene_id"], new["token_id"]):
+                raise ValueError("A retry cannot change scene or token")
+            cursor = replacement_id
+            while cursor in self._superseded_display_commands:
+                cursor = self._superseded_display_commands[cursor]
+                if cursor == command_id:
+                    raise ValueError("Display command replacements cannot form a cycle")
+            self._superseded_display_commands[command_id] = replacement_id
+        self._expected_display_commands.pop(command_id, None)
+        if not self._expected_display_commands:
+            self._display_recovery = None
+        return True
+
+    @staticmethod
+    def _command_ids(values):
+        if (not isinstance(values, (tuple, list, set)) or len(values) > 128
+                or not all(isinstance(value, str) and value and len(value) <= 256 for value in values)):
+            raise ValueError("Display confirmations need bounded command IDs")
+        return set(values)
+
+    def _expected_revision_change(self, revision, change):
+        """Verify every revision, including ones arriving between camera frames."""
+        if not isinstance(change, dict):
+            return False
+        changes = change.get("changes")
+        changes = changes if isinstance(changes, list) else [change]
+        previous = self._display_baseline_revision
+        relevant = [row for row in changes if isinstance(row, dict)
+                    and type(row.get("revision")) is int and previous < row["revision"] <= revision]
+        relevant.sort(key=lambda row: row["revision"])
+        if [row["revision"] for row in relevant] != list(range(previous + 1, revision + 1)):
+            return False
+        seen = set()
+        for row in relevant:
+            commands = row.get("commandIds")
+            tokens = row.get("tokenIds")
+            reasons = row.get("reasons", [row.get("reason")])
+            if (row.get("reason") != "sarweenTokenMove" or not isinstance(reasons, list)
+                    or not reasons or not all(isinstance(value, str) for value in reasons)
+                    or set(reasons) != {"sarweenTokenMove"}
+                    or not isinstance(commands, list) or not commands
+                    or not all(isinstance(value, str) for value in commands)
+                    or not isinstance(tokens, list) or not tokens
+                    or not all(isinstance(value, str) for value in tokens)):
+                return False
+            if not set(commands).issubset(self._known_display_commands):
+                return False
+            expected = [self._known_display_commands[value]["specification"] for value in commands]
+            if (any(row.get("sceneId") != item["scene_id"] for item in expected)
+                    or set(tokens) != {item["token_id"] for item in expected}):
+                return False
+            seen.update(commands)
+        if not relevant:
+            return False
+        self._display_baseline_revision = revision
+        if self.display_transition_policy == CONTINUOUS_DISPLAY_POLICY:
+            # A known command explains relay provenance, not which pixels the
+            # camera has seen. Keep physical association and its pending track
+            # running even if the LCD changes slowly, faintly, or not at all.
+            self._notified_display_commands.update(seen)
+            return True
+        unresolved = seen - self._resolved_display_commands
+        if not unresolved:
+            return True  # Duplicate notifications for an already observed draw.
+        if self._display_recovery is None:
+            first = min((self._known_display_commands[key] for key in unresolved), key=lambda row: row["started"])
+            self._display_recovery = self._new_display_recovery(first["baseline"], first["mask"])
+        newly_seen = unresolved - self._display_recovery["seen"]
+        for command in unresolved:
+            self._expected_display_commands[command] = self._known_display_commands[command]["specification"]
+        self._display_recovery["seen"].update(unresolved)
+        # Each new renderer notification needs its own camera evidence.
+        if newly_seen:
+            self._display_recovery.update(samples=0, stable_since=None, pixel_support=None,
+                                          change_observed=False, last_stable_time=None, anchor_samples={},
+                                          positive_evidence_since=None)
+            self._display_recovery["recent_pixel_changes"].clear()
+        return True
+
+    def _recover_expected_display(self, board, blur, mask, raw_candidates, unavailable,
+                                  obstructed, now, index):
+        recovery = self._display_recovery
+        # Holding Foundry output must not freeze learning of a regular slower
+        # capture cadence. This observes time only; no identity is inferred.
+        self.mover._observe_capture_time(now)
+        expected = set(self._expected_display_commands)
+        ready_commands = expected.issubset(recovery["seen"] & recovery["confirmed"])
+        matches = {} if obstructed else self._anchor_matches(raw_candidates, unavailable)
+        self._acquisition_matches = matches
+        candidates = self.reference.filter(board, raw_candidates, self.mover.positions, mask)
+        all_bases = (not unavailable and len(matches) == len(self.mover.positions)
+                     and len(self.mover._measurements(candidates)) == len(self.mover.positions))
+        if not ready_commands or not all_bases:
+            recovery.update(samples=0, stable_since=None, pixel_support=None, change_observed=False,
+                            last_stable_time=None, anchor_samples={}, positive_evidence_since=None)
+            recovery["recent_pixel_changes"].clear()
+            reason = ("waiting_for_foundry_move_confirmation" if not ready_commands
+                      else "reacquiring_bases_after_token_move")
+        else:
+            height, width = recovery["mask"].shape
+            display_blur = cv2.resize(blur, (width, height), interpolation=cv2.INTER_AREA)
+            display_previous = cv2.resize(self._previous, (width, height), interpolation=cv2.INTER_AREA)
+            display_mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+            valid = (display_mask == 0) & (recovery["mask"] == 0)
+            height, width = valid.shape
+            edge_y, edge_x = max(1, round(height * .08)), max(1, round(width * .08))
+            valid[:edge_y] = valid[-edge_y:] = False
+            valid[:, :edge_x] = valid[:, -edge_x:] = False
+            keep = valid.astype(np.uint8)
+            for x, y in self.mover.positions.values():
+                scale_x, scale_y = width / self.geometry.width, height / self.geometry.height
+                cv2.circle(keep, (round(x * scale_x), round(y * scale_y)),
+                           math.ceil(self.geometry.grid_px * max(scale_x, scale_y)), 0, -1)
+            changed = (np.max(cv2.absdiff(display_blur, recovery["baseline"]), axis=2) > 20) & (keep > 0)
+            previous_delta = np.max(cv2.absdiff(display_blur, display_previous), axis=2)
+            # Quiet bases alone cannot establish a settled animated/fog redraw.
+            # Require the usable board itself to stop changing, and do not
+            # bridge capture outages or base measurements that keep drifting.
+            quiet = np.count_nonzero((previous_delta > 15) & (keep > 0)) <= max(64, np.count_nonzero(keep) * .005)
+            continuous = (recovery["last_stable_time"] is None
+                          or now - recovery["last_stable_time"] <= self.mover.maximum_observation_gap)
+            anchors_still = all(math.dist(item.xy, recovery["anchor_samples"].get(mini, item.xy))
+                                <= self.mover.settle_radius for mini, item in matches.items())
+            if not quiet or not continuous or not anchors_still:
+                recovery.update(samples=0, stable_since=None, pixel_support=None, change_observed=False,
+                                anchor_samples={}, positive_evidence_since=None)
+                recovery["recent_pixel_changes"].clear()
+            minimum_changed = max(64, int(np.count_nonzero(keep) * .00025))
+            if self.display_transition_policy == "recover-expected-display-changes-v3":
+                # Layout continuity and positive redraw evidence have separate
+                # observation counts. A partial redraw can confirm all bases
+                # without starting (or permanently poisoning) the positive
+                # pixel track. Fresh negative evidence always interrupts it.
+                positive = np.count_nonzero(changed) >= minimum_changed
+                if not positive:
+                    recovery["recent_pixel_changes"].clear()
+                    recovery["positive_evidence_since"] = None
+                    recovery["pixel_support"] = changed
+                else:
+                    common = (changed if not recovery["recent_pixel_changes"] else
+                              recovery["pixel_support"] & changed)
+                    if (not recovery["recent_pixel_changes"]
+                            or np.count_nonzero(common) < minimum_changed):
+                        # Start a new candidate from the current positive
+                        # observation if earlier support no longer agrees.
+                        recovery["recent_pixel_changes"].clear()
+                        recovery["positive_evidence_since"] = now
+                        common = changed
+                    recovery["recent_pixel_changes"].append(changed)
+                    recovery["pixel_support"] = common
+            elif self.display_transition_policy == "recover-expected-display-changes-v2":
+                # The first camera frame after a notification can contain only
+                # part of an asynchronous TV redraw. Keep positive evidence
+                # common to the latest three clean observations; an early
+                # incomplete frame must not constrain every later observation.
+                recovery["recent_pixel_changes"].append(changed)
+                recovery["pixel_support"] = np.logical_and.reduce(recovery["recent_pixel_changes"])
+            elif recovery["pixel_support"] is None:
+                recovery["pixel_support"] = changed
+            else:
+                recovery["pixel_support"] &= changed
+            recovery["samples"] += 1
+            recovery["last_stable_time"] = now
+            if not recovery["anchor_samples"]:
+                recovery["anchor_samples"] = {mini: item.xy for mini, item in matches.items()}
+            if recovery["stable_since"] is None:
+                recovery["stable_since"] = now
+            recovery["change_observed"] = np.count_nonzero(recovery["pixel_support"]) >= minimum_changed
+            stable = recovery["samples"] >= 3 and now - recovery["stable_since"] >= .5
+            if self.display_transition_policy == "recover-expected-display-changes-v2":
+                # Quiet old pixels cannot contribute settling time to a later
+                # redraw. Start this clock only after a complete recent window
+                # positively sees the new pixels, and require that evidence to
+                # remain supported for the existing half-second settle period.
+                if len(recovery["recent_pixel_changes"]) == 3 and recovery["change_observed"]:
+                    if recovery["positive_evidence_since"] is None:
+                        recovery["positive_evidence_since"] = now
+                else:
+                    recovery["positive_evidence_since"] = None
+                stable = (stable and recovery["positive_evidence_since"] is not None
+                          and now - recovery["positive_evidence_since"] >= .5)
+            elif self.display_transition_policy == "recover-expected-display-changes-v3":
+                stable = (stable and len(recovery["recent_pixel_changes"]) >= 2
+                          and recovery["positive_evidence_since"] is not None
+                          and now - recovery["positive_evidence_since"] >= .5)
+            reason = ("waiting_for_visible_foundry_redraw" if not recovery["change_observed"]
+                      else "settling_after_foundry_redraw")
+            if stable and recovery["change_observed"]:
+                # All identities have fresh positive evidence at their last
+                # confirmed positions. Only now replace the scene reference.
+                self.reference.update(board, mask)
+                self.mover.update(candidates, now, obstructed=False, unavailable=set())
+                self._resolved_display_commands.update(self._expected_display_commands)
+                self._expected_display_commands.clear()
+                self._display_recovery = None
+                self._previous, self._previous_mask = blur, mask.copy()
+                return self._record(now, index, candidates, len(raw_candidates), set(), False, 0, [],
+                    {**deepcopy(self.mover.status), "phase": "settled", "reason": "expected_display_reacquired"})
+        self._previous, self._previous_mask = blur, mask.copy()
+        state = {"phase": "held", "reason": reason, "pending": None,
+                 "active_mini": None, "missing": [], "unavailable": list(self.mover.positions),
+                 "unassigned": [], "missing_for": {}}
+        return self._record(now, index, candidates, len(raw_candidates), set(self.mover.positions),
+                            obstructed, 0, [], state)
 
     def _anchor_matches(self, candidates, unavailable):
         """Find unique supported measurements, never count one spot twice."""
@@ -290,13 +576,33 @@ class ObserverEngine:
                 "revision_available": self._display_observed_revision is not None,
                 "requires_explicit_rebind": self._invalid_reason in (
                     "display_changed_rebind_required", "display_revision_unavailable"),
-                "automatic_recovery": False,
-                "scope": "Known Foundry changes only; no fog segmentation or TV timing verification"}
+                "automatic_recovery": self.display_transition_policy in EXPECTED_DISPLAY_RECOVERY_POLICIES,
+                "scope": ("Known Foundry changes only; camera changes are experimental evidence, not fog segmentation"
+                          if self.display_transition_policy in EXPECTED_DISPLAY_RECOVERY_POLICIES else
+                          "Known Foundry changes only; no fog segmentation or TV timing verification")}
+            if self.display_transition_policy in EXPECTED_DISPLAY_RECOVERY_POLICIES:
+                recovery = self._display_recovery
+                record["display_transition"].update(
+                    pending_command_ids=sorted(self._expected_display_commands),
+                    confirmed_command_ids=sorted(recovery["confirmed"]) if recovery else [],
+                    notified_command_ids=sorted(recovery["seen"]) if recovery else [],
+                    camera_change_observed=bool(recovery and recovery["change_observed"]),
+                    stable_observations=recovery["samples"] if recovery else 0)
+            elif self.display_transition_policy == CONTINUOUS_DISPLAY_POLICY:
+                record["display_transition"].update(
+                    scope="Static map; physical evidence is independent of own-command delivery and render timing",
+                    physical_tracking_waits_for_render=False,
+                    render_alignment_verified=False,
+                    pending_command_ids=sorted(self._expected_display_commands),
+                    confirmed_command_ids=sorted(self._confirmed_display_commands),
+                    notified_command_ids=sorted(self._notified_display_commands))
         self.last_record = deepcopy(record)
         return record
 
     def process(self, board_bgr, excluded_mask, timestamp, *, frame_index=None,
-                locked=True, geometry_key=None, scene_visual_revision=None):
+                locked=True, geometry_key=None, scene_visual_revision=None,
+                expected_display_commands=(), confirmed_command_ids=(), unchanged_command_ids=(),
+                scene_visual_change=None, superseded_display_commands=()):
         now = float(timestamp)
         if not math.isfinite(now) or (self._last_timestamp is not None and now <= self._last_timestamp):
             raise ValueError("Observer capture timestamps must be finite and strictly increasing")
@@ -309,6 +615,33 @@ class ObserverEngine:
         if self.display_transition_policy != "disabled" and scene_visual_revision is not None:
             if type(scene_visual_revision) is not int or not 0 <= scene_visual_revision < 2**63:
                 raise ValueError("Scene visual revision must be a nonnegative integer or unavailable")
+        confirmed = self._command_ids(confirmed_command_ids)
+        unchanged = self._command_ids(unchanged_command_ids)
+        if not unchanged.issubset(confirmed):
+            raise ValueError("Unchanged commands require successful acknowledgement")
+        if not isinstance(expected_display_commands, (tuple, list)) or len(expected_display_commands) > 64:
+            raise ValueError("Expected display commands must be a bounded list")
+        for item in expected_display_commands:
+            if not isinstance(item, dict) or set(item) != {"command_id", "scene_id", "token_id"}:
+                raise ValueError("Invalid expected display command")
+        for item in expected_display_commands:
+            self.expect_display_change(**item)
+        if not isinstance(superseded_display_commands, (tuple, list)) or len(superseded_display_commands) > 64:
+            raise ValueError("Superseded display commands must be a bounded list")
+        for item in superseded_display_commands:
+            if not isinstance(item, dict) or set(item) != {"command_id", "replacement_id"}:
+                raise ValueError("Invalid superseded display command")
+            self.cancel_expected_display_change(**item)
+        self._confirmed_display_commands.update(confirmed & set(self._known_display_commands))
+        # A successful same-token retry also confirms the earlier attempt's
+        # requested final pose, even if its own acknowledgement was lost.
+        for _ in range(len(self._superseded_display_commands)):
+            for old, replacement in self._superseded_display_commands.items():
+                if replacement in self._confirmed_display_commands:
+                    self._confirmed_display_commands.add(old)
+        if self.display_transition_policy == CONTINUOUS_DISPLAY_POLICY:
+            for command in self._confirmed_display_commands:
+                self._expected_display_commands.pop(command, None)
         mask = np.where(excluded_mask > 0, 255, 0).astype(np.uint8)
         self._watermark_evidence = {"mode": self.watermark_mode, "recognized": False,
                                     "provided_pixels": int(np.count_nonzero(mask))}
@@ -321,11 +654,14 @@ class ObserverEngine:
             self._invalid_reason = self._invalid_reason or "geometry_changed"
         if board_bgr.shape[:2] != (self.geometry.height, self.geometry.width):
             self._invalid_reason = self._invalid_reason or "board_size_changed"
-        if self.display_transition_policy == "hold-known-display-changes-v1":
+        if self.display_transition_policy != "disabled":
             self._display_observed_revision = scene_visual_revision
             if self._display_baseline_revision is _UNKNOWN_REVISION:
                 if scene_visual_revision is not None:
                     self._display_baseline_revision = scene_visual_revision
+                elif (self.display_transition_policy in EXPECTED_DISPLAY_RECOVERY_POLICIES
+                      or self.display_transition_policy == CONTINUOUS_DISPLAY_POLICY):
+                    self._invalid_reason = self._invalid_reason or "display_revision_unavailable"
             elif scene_visual_revision is None:
                 self._invalid_reason = self._invalid_reason or "display_revision_unavailable"
             elif scene_visual_revision != self._display_baseline_revision:
@@ -333,7 +669,17 @@ class ObserverEngine:
                 # seen the new pixels. Never resume just because old pixels are
                 # quiet or resemble the old anchors. Explicit rebinding starts
                 # a new causal experiment after the user sees the new display.
-                self._invalid_reason = self._invalid_reason or "display_changed_rebind_required"
+                if ((self.display_transition_policy not in EXPECTED_DISPLAY_RECOVERY_POLICIES
+                     and self.display_transition_policy != CONTINUOUS_DISPLAY_POLICY)
+                        or not self._expected_revision_change(scene_visual_revision, scene_visual_change)):
+                    self._invalid_reason = self._invalid_reason or "display_changed_rebind_required"
+        if self._display_recovery is not None:
+            self._display_recovery["confirmed"].update(self._confirmed_display_commands & set(self._expected_display_commands))
+            for command in unchanged:
+                if command not in self._display_recovery["seen"]:
+                    self._expected_display_commands.pop(command, None)
+            if not self._expected_display_commands:
+                self._display_recovery = None
         if self.needs_reset:
             state = {"phase": "held", "reason": self._invalid_reason,
                      "pending": None, "active_mini": None, "missing": [],
@@ -367,6 +713,9 @@ class ObserverEngine:
             self._detector_initialized = True
         raw_candidates = self.detector.detect(board_bgr, mask)
         unavailable = masked_anchors(mask, self.mover.positions, self.geometry.grid_px * 0.75)
+        if self._display_recovery is not None:
+            return self._recover_expected_display(board_bgr, blur, mask, raw_candidates,
+                                                   unavailable, obstructed, now, index)
         if not self._acquired:
             acquired = self._acquire(raw_candidates, unavailable, obstructed, now)
             if not acquired:
@@ -408,7 +757,7 @@ class ObserverEngine:
         return self._record(now, index, candidates, len(raw_candidates), unavailable, obstructed, changed, events)
 
 
-def draw_observer_frame(image, record, geometry):
+def draw_observer_frame(image, record, geometry, *, foundry_token_output=False):
     """Render last confirmed positions, with held observations clearly marked."""
     result = cv2.copyMakeBorder(image, 0, 64, 0, 0, cv2.BORDER_CONSTANT, value=(15, 15, 15))
     for item in record["candidates"]:
@@ -425,7 +774,8 @@ def draw_observer_frame(image, record, geometry):
     text = f'{record["capture_seconds"]:5.1f}s | moves {record["move_count"]} | {record["state"]["reason"]}'
     cv2.putText(result, text, (12, image.shape[0] + 23), cv2.FONT_HERSHEY_SIMPLEX,
                 0.55, (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(result, "Green: last confirmed | Amber: held | Gray: candidates | Foundry moves OFF",
+    output = "Foundry session movement" if foundry_token_output else "Foundry moves OFF"
+    cv2.putText(result, "Green: last confirmed | Amber: held | Gray: candidates | " + output,
                 (12, image.shape[0] + 49), cv2.FONT_HERSHEY_SIMPLEX,
                 0.46, (230, 230, 230), 1, cv2.LINE_AA)
     return result

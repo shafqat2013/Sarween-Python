@@ -10,7 +10,7 @@ import hashlib
 from app_paths import data_path, initialize_user_data
 
 from screeninfo import get_monitors
-from calibration_capture import CalibrationCaptureGate
+from calibration_capture import CalibrationCaptureGate, CalibrationViewArchive
 from calibration_diagnostics import CalibrationDiagnostics
 from calibration_visuals import (
     choose_preview_display, close_calibration_windows, render_board_status,
@@ -259,13 +259,18 @@ def display_charuco(display=None, *, displays=None, board=None):
 
 
 def save_camera_calibration_result(profile_id, camera_matrix, dist_coeffs, image_size, *, rms=None, profiles=None,
-                                   expected_binding=None):
+                                   expected_binding=None, source_metadata=None):
     """Persist one complete result to its named camera profile, never globals."""
     if profiles is None:
         from hardware_profiles import HardwareProfiles
         profiles = HardwareProfiles()
     if not profile_id:
         raise ValueError("Choose a named camera profile before calibrating.")
+    from camera_sources import PHONE_PROFILE_HINT, PHONE_SOURCE, require_phone_profile_metadata
+    profile = profiles.get_profile("camera", profile_id)
+    if profile and profile.get("sourceHint") == PHONE_PROFILE_HINT:
+        require_phone_profile_metadata(profile,
+            {"type": PHONE_SOURCE, "deviceId": profile.get("deviceLabel")}, source_metadata)
     return profiles.save_camera_calibration(profile_id, camera_matrix, dist_coeffs, image_size,
                                             rms=rms, expected_binding=expected_binding)
 
@@ -274,14 +279,24 @@ def last_camera_calibration_message():
     return _LAST_CAMERA_CALIBRATION_MESSAGE
 
 
-def _save_calibration_diagnostics(diagnostics, outcome):
+def _save_calibration_diagnostics(diagnostics, outcome, *, archive=None):
     global _LAST_CAMERA_CALIBRATION_MESSAGE
     _LAST_CAMERA_CALIBRATION_MESSAGE = diagnostics.summary()
     try:
         path = diagnostics.save(outcome)
         print(f"Camera calibration | Diagnostics saved to {path}", flush=True)
     except (OSError, ValueError) as exc:
+        _LAST_CAMERA_CALIBRATION_MESSAGE += f" Attempt report could not be saved: {exc}"
         print(f"Camera calibration | Could not save diagnostics: {exc}", flush=True)
+    if archive is not None:
+        archive.finish(outcome)
+        if archive.error:
+            _LAST_CAMERA_CALIBRATION_MESSAGE += f" Selected-view audit incomplete: {archive.error}"
+            print(f"Camera calibration | Selected-view audit incomplete: {archive.error}", flush=True)
+        else:
+            _LAST_CAMERA_CALIBRATION_MESSAGE += f" Selected-view audit: {archive.path}"
+
+
 
 
 def calibrate_webcam(camera_index=None, *, profile_id=None, access=None,
@@ -307,7 +322,8 @@ def calibrate_webcam(camera_index=None, *, profile_id=None, access=None,
     params = cv2.aruco.DetectorParameters()
 
     from camera_sources import (is_phone_camera_index, source_for_index,
-                                open_camera_capture, profile_compatible_with_source, stable_stream_key)
+                                open_camera_capture, profile_compatible_with_source, stable_stream_key,
+                                require_phone_profile_metadata)
     phone_source = is_phone_camera_index(camera_index)
     source_selection = ({"webcam_index": camera_index, "camera_source": camera_source}
                         if camera_source is not None else s.load_last_selection())
@@ -329,28 +345,73 @@ def calibrate_webcam(camera_index=None, *, profile_id=None, access=None,
     captured = 0
     image_size = None
     board_window = preview_window = None
-    gate = CalibrationCaptureGate(NUM_FRAMES, automatic=auto_capture,
+    gate = CalibrationCaptureGate(NUM_FRAMES, automatic=auto_capture, mode="sweep",
                                   board_columns=SQUARES_VERTICALLY - 1,
                                   board_rows=SQUARES_HORIZONTALLY - 1)
+    archive = None
+    last_feedback = {"state": None, "time": None}
+    def feedback(frame=None, metadata=None, *, message, reason, mode=None, countdown=None, active=True):
+        publish = getattr(cap, "send_feedback", None) if phone_source else None
+        if callable(publish):
+            state = {"active": active, "captured": captured, "required": NUM_FRAMES,
+                     "title": "Camera calibration", "message": message, "reason": reason,
+                     "mode": mode or ("sweep" if gate.automatic else "manual"),
+                     "canFinish": captured >= NUM_FRAMES}
+            if countdown is not None:
+                state["countdownSeconds"] = max(0., float(countdown))
+            now_feedback = time.perf_counter()
+            signature = (active, captured, reason, state["mode"], message,
+                         int(countdown + .999) if countdown is not None else None)
+            if (signature == last_feedback["state"] and last_feedback["time"] is not None
+                    and now_feedback - last_feedback["time"] < .5):
+                return
+            # ChArUco IDs overlap the TV-marker IDs. Never claim registration or
+            # LCD dimming from this unrelated board, even if its IDs decode.
+            payload = {"kind": "calibration", "calibration": state,
+                       "markers": {"ids": [], "requiredIds": [10, 11, 12, 13],
+                                   "count": 0, "required": 4, "locked": False},
+                       "cpl": {"state": "unavailable", "message": "Finish camera calibration before measuring LCD dimming."}}
+            if isinstance(metadata, dict) and type(metadata.get("seq")) is int:
+                payload["sourceSeq"] = metadata["seq"]
+            try:
+                publish(payload)
+                last_feedback.update(state=signature, time=now_feedback)
+            except Exception as exc:
+                # Feedback is optional. It must never prevent camera release or
+                # replace a valid error with a socket/phone presentation error.
+                print(f"Camera calibration | Phone feedback unavailable: {exc}", flush=True)
     last_board_status = None
     timed_capture = False
     next_timed_capture = None
     failed_reads = 0
     camera_stream = None
+    camera_metadata = None
     try:
+        archive = CalibrationViewArchive(profile_id, total=NUM_FRAMES)
         target, preview_display = _calibration_displays(display, displays)
         board_image = render_charuco_board(board, target["width"], target["height"])
         board_window = display_charuco(target, displays=displays, board=board)
-        print("Camera calibration | Move or tilt the camera, then hold each new view still.")
+        print("Camera calibration | Slowly sweep and tilt the camera; clear, different views are selected automatically.")
         print("Camera calibration | Starts after five seconds. T: 5-second timer; C/Space: capture now; A: auto/manual; Q/Escape: cancel.")
+        feedback(message="Move slowly and tilt the camera with the whole board in view. Clear, varied frames are selected automatically.", reason="starting")
         while captured < NUM_FRAMES:
             if access is not None:
                 access.require()
+            take_requests = getattr(cap, "take_requests", None) if phone_source else None
+            requests = take_requests() if callable(take_requests) else []
+            requests = requests if isinstance(requests, (list, tuple)) else []
+            actions = {item.get("action") for item in requests
+                       if isinstance(item, dict) and isinstance(item.get("action"), str)}
+            if "calibration.cancel" in actions:
+                return None
+            capture_requested = "calibration.capture" in actions
+            finish_requested = "calibration.finish" in actions
             ret, frame = cap.read()
             if not ret or frame is None:
                 failed_reads += 1
                 if phone_source:
                     message = cap.status.get("message", "Waiting for the iPhone camera…")
+                    feedback(message=message, reason="waiting_camera")
                     cv2.imshow(board_window, render_board_status(board_image, message + "  Q: cancel",
                         count=captured, total=NUM_FRAMES, auto_capture=gate.automatic))
                     if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
@@ -362,7 +423,9 @@ def calibrate_webcam(camera_index=None, *, profile_id=None, access=None,
                 continue
             failed_reads = 0
             if phone_source:
-                stream = stable_stream_key(cap.last_frame_metadata)
+                camera_metadata = cap.last_frame_metadata
+                require_phone_profile_metadata(profile, source, camera_metadata)
+                stream = stable_stream_key(camera_metadata)
                 if camera_stream is not None and stream != camera_stream:
                     raise ValueError("The iPhone stream restarted during calibration. Start a new calibration capture.")
                 camera_stream = stream
@@ -398,8 +461,11 @@ def calibrate_webcam(camera_index=None, *, profile_id=None, access=None,
                 gate.automatic = not gate.automatic
             timer_due = timed_capture and now >= next_timed_capture
             state = gate.observe(now, gray, charuco_corners, charuco_ids, current_size,
-                                 manual=key in (ord('c'), ord('C'), 32) or timer_due)
-            state["captureMode"] = "timed" if timed_capture else "auto" if gate.automatic else "manual"
+                                 manual=key in (ord('c'), ord('C'), 32) or timer_due or capture_requested)
+            state["captureMode"] = "timed" if timed_capture else "sweep" if gate.automatic else "manual"
+            if finish_requested and not state["capture"]:
+                state["reason"] = "need_more_views"
+                state["message"] = f"{captured}/{NUM_FRAMES} clear, different views collected. Keep sweeping and tilting; all {NUM_FRAMES} are needed before saving."
             if timed_capture and state["reason"] == "manual":
                 state["reason"] = "timed_wait"
                 state["message"] = "Timer running. Move to a new angle; each frame is still checked for clarity."
@@ -412,6 +478,8 @@ def calibrate_webcam(camera_index=None, *, profile_id=None, access=None,
                 all_charuco_corners.append(charuco_corners.copy())
                 all_charuco_ids.append(charuco_ids.copy())
                 captured += 1
+                archive.record(frame, charuco_corners, charuco_ids, capture_seconds=now,
+                               state=state, source_metadata=camera_metadata)
                 print(f"Camera calibration | Captured {captured}/{NUM_FRAMES}")
             detected_corners = 0 if charuco_ids is None else len(charuco_ids)
             diagnostics.observe(state, detected_corners=detected_corners, frame_size=current_size,
@@ -425,6 +493,8 @@ def calibrate_webcam(camera_index=None, *, profile_id=None, access=None,
                 countdown = gate.start_delay * (1 - state["startProgress"])
             elif state["reason"] == "holding":
                 countdown = gate.hold_seconds * (1 - state["stableProgress"])
+            feedback(frame, camera_metadata, message=message, reason=state["reason"],
+                     mode=state["captureMode"], countdown=countdown)
             board_status = (message, captured, state["captureMode"],
                             round(countdown, 1) if countdown is not None else None,
                             detected_corners, state.get("poseCorners", state.get("inlierCorners")), state.get("holdResets"),
@@ -449,10 +519,13 @@ def calibrate_webcam(camera_index=None, *, profile_id=None, access=None,
         diagnostics.error = str(exc) or type(exc).__name__
         raise
     finally:
+        outcome = "failed" if diagnostics.error else "captured" if captured == NUM_FRAMES else "cancelled"
+        feedback(message=("Views captured. Sarween is solving and saving on the Mac." if outcome == "captured" else
+                          diagnostics.error or "Calibration cancelled. The saved profile was not replaced."),
+                 reason=outcome, active=False)
         cap.release()
         close_calibration_windows(board_window, preview_window, cv=cv2)
-        _save_calibration_diagnostics(diagnostics, "failed" if diagnostics.error else
-                                      "captured" if captured == NUM_FRAMES else "cancelled")
+        _save_calibration_diagnostics(diagnostics, outcome, archive=archive)
 
     print("🔧 Calibrating camera...")
     try:
@@ -462,15 +535,17 @@ def calibrate_webcam(camera_index=None, *, profile_id=None, access=None,
             access.require()
         saved_profile = save_camera_calibration_result(
             profile_id, camera_matrix, dist_coeffs, image_size, rms=float(retval), profiles=profiles,
-            expected_binding=profile)
+            expected_binding=profile, **({"source_metadata": camera_metadata} if phone_source else {}))
     except BaseException as exc:
         diagnostics.error = str(exc) or type(exc).__name__
-        _save_calibration_diagnostics(diagnostics, "failed")
+        _save_calibration_diagnostics(diagnostics, "failed", archive=archive)
         raise
-    _save_calibration_diagnostics(diagnostics, "saved")
+    _save_calibration_diagnostics(diagnostics, "saved", archive=archive)
     print(f"✅ Calibration complete. Saved camera profile: {saved_profile['name']} ({image_size[0]}×{image_size[1]}).")
 
     return saved_profile
+
+
 
 
 def add_white_border(img, border_thickness):

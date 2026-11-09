@@ -1151,7 +1151,8 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
     profiles = load_profiles_with_curves(_PROFILES_PATH)
     mini_library = ml.load_synced_library(profiles)
 
-    sess = core.CVCoreSession(camera_index=camera_index, camera_capture=camera_capture)
+    sess = core.CVCoreSession(camera_index=camera_index, camera_capture=camera_capture,
+                              tracking_pixels_only=mode == "foundry" or bool(observation_only))
 
     # Re-attach recorder if it was carried over from a previous session
     global _pending_recorder, _pending_record_path
@@ -1202,8 +1203,12 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
 
     engine = TrackingEngine(detect_minis, consensus_n=CONSENSUS_N, consensus_k=CONSENSUS_K)
     observer = None
-    observer_mode = bool(observation_only)
-    observer_requested = bool(observation_only)
+    # The shared six-base tracker supplies normal Foundry decisions as well as
+    # the read-only diagnostic entry. Self-hosted legacy tracking remains local.
+    token_following = mode == "foundry" and not observation_only
+    observer_mode = mode == "foundry" or bool(observation_only)
+    observer_requested = observer_mode
+    token_bridge = None
     if observer_mode:
         fo.set_observation_only(True)
     sess.recording_state_provider = lambda: (
@@ -1262,11 +1267,14 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
                 # Latch before constructing UI; an observer error must never
                 # fall through into the old tracker and issue token commands.
                 observer_mode = True
-                fo.set_observation_only(True)
                 if observer is None or observer.closed:
                     try:
+                        fo.set_observation_only(True)
                         from observer_session import LiveObserverController
-                        observer = LiveObserverController(panel._tk_root, recordings_dir() / "Observer")
+                        from core_token_bridge import CoreTokenBridge
+                        observer = LiveObserverController(panel._tk_root, recordings_dir() / "Observer",
+                                                          observation_only=not token_following)
+                        token_bridge = CoreTokenBridge(fo, panel, observation_only=not token_following)
                         fo.queue_control({"type": "referenceCapture", "enabled": True})
                         display_backend.destroyAllWindows()
                     except Exception as exc:
@@ -1274,7 +1282,20 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
                 else:
                     observer.window.window.deiconify()
                     observer.window.window.lift()
-            if actions.get("retry_moves") and not observer_mode and fresh_camera_frame:
+            if observer_mode:
+                for legacy_action in ("scan_mini", "calibrate_band", "calibrate_minis"):
+                    if actions.pop(legacy_action, None):
+                        panel.set_hint("Choose six starting positions in the tracking view; individual color scans are not needed.")
+                if actions.pop("recapture_bg", None) and observer is not None and not observer.closed:
+                    fo.set_observation_only(True)
+                    observer.window.window.deiconify()
+                    observer.window.start_selection()
+                if actions.pop("toggle_recording", None) and observer is not None and not observer.closed:
+                    try:
+                        observer.toggle_recording()
+                    except ValueError as exc:
+                        panel.set_hint(str(exc))
+            if actions.get("retry_moves") and (not observer_mode or token_following) and fresh_camera_frame:
                 fo.retry_failed_moves()
             if actions.get("scan_mini"):
                 actions["calibrate_band"] = {"name": str(actions["scan_mini"])}
@@ -1481,8 +1502,16 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
             _now_t = time.perf_counter()
             if observer_mode:
                 if observer is not None and not observer.closed:
+                    panel.set_recording_status(observer.is_recording,
+                        str(observer.journal.folder) if observer.journal is not None else "")
+                    previous_timestamp = getattr(observer, "last_processed_timestamp", None)
+                    if (not fresh_camera_frame or
+                            (previous_timestamp is not None and sess.frame_time <= previous_timestamp)):
+                        panel.set_hint("Waiting for a fresh camera frame; no new movement decisions.")
+                        continue
                     try:
                         view = fo.get_view_transform_payload()
+                        delivery_evidence = token_bridge.before_frame(observer, view)
                         reference_status = (fo.get_rendered_reference_status()
                                             if hasattr(fo, "get_rendered_reference_status") else {})
                         if hasattr(fo, "get_latest_rendered_reference"):
@@ -1495,7 +1524,10 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
                             registration=getattr(bundle, "registration_metadata", None),
                             metadata={"reference_status": reference_status,
                                       "camera_source": deepcopy(getattr(bundle, "camera_source_metadata", None)),
-                                      "scene_visual_revision": fo.get_scene_visual_revision()})
+                                      "scene_visual_revision": delivery_evidence["scene_visual_change"]["revision"],
+                                      **delivery_evidence})
+                        follow_message = token_bridge.after_frame(observer, result)
+                        panel.set_hint(follow_message)
                         if result:
                             positions = {}
                             for name, value in result["current_cells"].items():
@@ -1505,14 +1537,14 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
                                     label += " (held)"
                                 positions[name] = label
                             panel.update_positions(positions)
-                            panel.set_hint("Observer: " + result["state"]["reason"].replace("_", " ")
-                                           + " · Foundry movement off")
                     except Exception as exc:
-                        panel.set_hint(f"Observer held: {exc}. Foundry movement remains off.")
+                        panel.set_hint(token_bridge.fail(observer, str(exc)))
                 else:
+                    if not fo.observation_only():
+                        fo.set_observation_only(True)
                     panel.set_hint("Observer closed. Reopen it to continue; Foundry movement remains off.")
-                # The old detector, physical taps and movement emission below
-                # are unreachable throughout this observation-only session.
+                # Shared base tracking supplies all Foundry movement. The old
+                # detector, physical taps and output below remain unreachable.
                 continue
             if not fresh_camera_frame:
                 source = getattr(bundle, "camera_source_metadata", {}) or {}
@@ -1722,6 +1754,8 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
                 observer.close()
             except Exception:
                 pass
+        if token_bridge is not None:
+            token_bridge.close()
         if access is not None and hasattr(access, "usage_state"):
             access.usage_state("tracking", False)
         if fo.guided_capture_active():

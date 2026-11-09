@@ -199,7 +199,7 @@ class ControlPanelLayoutTests(unittest.TestCase):
         self.assertEqual(outer.columns[0]["weight"], 1)
         self.assertEqual(notebook.layout["sticky"], "nsew")
         self.assertEqual([options["text"] for _, options in notebook.tab_items],
-                         ["Session", "Scans", "Diagnostics", "VTT Controls", "Map"])
+                         ["Session", "Diagnostics", "VTT Controls", "Map"])
         self.assertFalse(isinstance(outer, Canvas))
 
     def test_hints_and_access_status_remain_outside_notebook_pages(self):
@@ -241,6 +241,7 @@ class ControlPanelLayoutTests(unittest.TestCase):
                          ["Session", "Scans", "Diagnostics", "Map"])
 
     def test_session_and_scan_actions_preserve_commands(self):
+        self.panel = panel_module.ControlPanel(mode="self_hosted")
         for name in ("Recapture BG", "Stop session", "Dump State", "Calibrate Minis"):
             self.widget_with(text=name).invoke()
         self.widget_with(textvariable=self.panel._rec_btn_var).invoke()
@@ -254,6 +255,13 @@ class ControlPanelLayoutTests(unittest.TestCase):
         self.assertEqual(self.panel.pop_actions()["calibrate_band"], {"name": None, "auto": True})
         self.assertEqual(self.widget_with(text="Mini Library").options["command"],
                          self.panel._show_mini_library)
+
+    def test_foundry_session_offers_rebinding_instead_of_legacy_scan_workflow(self):
+        self.widget_with(text="Choose positions again").invoke()
+        self.assertTrue(self.panel.pop_actions()["recapture_bg"])
+        texts = [widget.options.get("text") for widget in descendants(self.panel.root)]
+        self.assertNotIn("Mini Library", texts)
+        self.assertNotIn("Recapture BG", texts)
         self.panel.set_delivery_status({"message": "Ready", "retryAvailable": True})
         self.panel._retry_moves_btn.invoke()
         self.assertTrue(self.panel.pop_actions()["retry_moves"])
@@ -262,7 +270,8 @@ class ControlPanelLayoutTests(unittest.TestCase):
         canvases = [widget for widget in descendants(self.panel.root) if isinstance(widget, Canvas)]
         self.assertEqual(len(canvases), 1)
         canvas = canvases[0]
-        diagnostics = self.panel.tabs.tab_items[2][0]
+        diagnostics = next(widget for widget, options in self.panel.tabs.tab_items
+                           if options["text"] == "Diagnostics")
         self.assertIs(canvas.parent, diagnostics)
         self.assertNotIn("<MouseWheel>", self.panel.root.bindings)
         canvas.bindings["<Configure>"](SimpleNamespace(width=712))

@@ -8,8 +8,11 @@ cannot silently refer to different camera frames or geometry revisions.
 from __future__ import annotations
 
 from copy import deepcopy
+from collections import deque
 from dataclasses import dataclass
 import math
+from pathlib import Path
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -123,6 +126,54 @@ def movement_text(event):
     return f"{mini}: {origin} → {destination}"
 
 
+def status_text(message):
+    """Keep reference-health diagnostics out of the live tracking headline."""
+    return str(message).partition(" · Reference: ")[0]
+
+
+def _duration(seconds):
+    try:
+        seconds = max(0, int(float(seconds)))
+    except (TypeError, ValueError, OverflowError):
+        seconds = 0
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def _byte_size(value):
+    try:
+        value = max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        value = 0
+    return f"{value / 1_000_000_000:.1f} GB" if value >= 1_000_000_000 else f"{value / 1_000_000:.0f} MB"
+
+
+def recording_text(recording, summary=None, *, path=""):
+    """A short persistent recording state; the complete path lives in Details."""
+    summary = summary or {}
+    limits = summary.get("limits") or {}
+    elapsed = _duration(summary.get("elapsed_seconds", 0))
+    frames = summary.get("frames", 0)
+    amount = _byte_size(summary.get("bytes", 0))
+    if recording:
+        return (f"Recording observer inputs · {elapsed} / {_duration(limits.get('seconds', 300))}\n"
+                f"{frames} frames · {amount} / {_byte_size(limits.get('bytes', 2_000_000_000))}")
+    reason = summary.get("end_reason")
+    if reason:
+        if reason == "recordingLimit":
+            reason = (f"time limit ({_duration(limits.get('seconds', 300))})"
+                      if summary.get("limit_reached") == "seconds" else
+                      f"size limit ({_byte_size(limits.get('bytes', 2_000_000_000))})")
+        else:
+            reason = {"userStopped": "Stop recording action received", "reinitialized": "starting positions reset",
+                      "observerClosed": "observer closed", "recordingError": "recording error",
+                      "observerError": "observer error", "initializationError": "initialization failed"}.get(reason, str(reason))
+        detail = "Save error — open Details" if summary.get("error") else f"{frames} frames · {elapsed} · {amount}"
+        return f"Recording stopped: {reason}\n{detail}"
+    if path:
+        return f"Observer recording folder: {Path(path).name}\nOpen Details for its full location."
+    return "Not recording\nRecording starts after choosing all starting positions."
+
+
 class ObserverWindow:
     """One Tk window, driven by the live session's existing event loop.
 
@@ -153,6 +204,16 @@ class ObserverWindow:
         self._record_path = ""
         self._event_keys = set()
         self._events = []
+        self._status_clock = time.monotonic
+        self._status_started = self._status_clock()
+        self._last_status_at = -float("inf")
+        self._status_after_id = None
+        self._pending_status = None
+        self._status_history = deque(maxlen=200)
+        self._last_full_status = None
+        self._record_summary = {}
+        self._details_window = self._details_text = None
+        self._hide_on_close = False
 
         self.window = tk.Toplevel(parent)
         self.window.title("Sarween — Mini observer")
@@ -166,10 +227,20 @@ class ObserverWindow:
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(3, weight=1)
 
-        ttk.Label(outer, text="Mini observer", font=("Helvetica", 16, "bold")).grid(
-            row=0, column=0, sticky="w")
-        ttk.Label(outer, text="Observation only — Foundry token movement OFF",
-                  foreground="#d59c25").grid(row=1, column=0, sticky="w", pady=(3, 0))
+        heading = ttk.Frame(outer)
+        heading.grid(row=0, column=0, sticky="ew")
+        self.heading = tk.StringVar(self.window, "Mini observer")
+        self.output_status = tk.StringVar(self.window, "Observation only — Foundry token movement OFF")
+        ttk.Label(heading, textvariable=self.heading, font=("Helvetica", 16, "bold")).pack(side="left")
+        ttk.Button(heading, text="Details…", command=self.show_details).pack(side="right")
+        output_area = ttk.Frame(outer, height=38)
+        output_area.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+        output_area.pack_propagate(False)
+        output_label = ttk.Label(output_area, textvariable=self.output_status, justify="left",
+                                 wraplength=720, foreground="#d59c25")
+        output_label.pack(fill="x", anchor="nw")
+        output_label.bind("<Configure>", lambda event: output_label.configure(wraplength=max(100, event.width - 4))
+                          if event.width > 1 and int(output_label.cget("wraplength")) != max(100, event.width - 4) else None)
         ttk.Label(outer, text="Experimental · fog behavior unverified").grid(
             row=2, column=0, sticky="w", pady=(2, 8))
         self.canvas = tk.Canvas(outer, width=760, height=410, background="#111111",
@@ -181,29 +252,37 @@ class ObserverWindow:
 
         buttons = ttk.Frame(outer)
         buttons.grid(row=4, column=0, sticky="ew", pady=(8, 4))
-        self.choose_button = ttk.Button(buttons, text="Choose starting positions", command=self.start_selection,
+        self.choose_button = ttk.Button(buttons, text="Choose starting positions", command=self.start_selection, width=25,
                                         state="disabled")
         self.choose_button.pack(side="left")
-        self.undo_button = ttk.Button(buttons, text="Undo last click", command=self.undo,
+        self.undo_button = ttk.Button(buttons, text="Undo last click", command=self.undo, width=14,
                                       state="disabled")
         self.undo_button.pack(side="left", padx=(6, 0))
-        self.record_button = ttk.Button(buttons, text="Record observer inputs", command=self._record,
+        self.record_button = ttk.Button(buttons, text="Record observer inputs", command=self._record, width=22,
                                         state="disabled")
         self.record_button.pack(side="right")
 
         self.status = tk.StringVar(self.window, "Waiting for the camera and marker lock.")
-        status = ttk.Label(outer, textvariable=self.status, justify="left", wraplength=720)
-        status.grid(row=5, column=0, sticky="ew", pady=(0, 4))
-        status.bind("<Configure>", lambda event: status.configure(wraplength=max(100, event.width)))
+        self._status_area = ttk.Frame(outer, height=44)
+        self._status_area.grid(row=5, column=0, sticky="ew", pady=(0, 4))
+        self._status_area.pack_propagate(False)
+        status = ttk.Label(self._status_area, textvariable=self.status, justify="left", wraplength=720)
+        status.pack(fill="x", anchor="nw")
+        status.bind("<Configure>", lambda event: status.configure(wraplength=max(100, event.width - 4))
+                    if event.width > 1 and int(status.cget("wraplength")) != max(100, event.width - 4) else None)
         self.record_status = tk.StringVar(self.window, "Not recording")
-        label = ttk.Label(outer, textvariable=self.record_status, justify="left", wraplength=720)
-        label.grid(row=6, column=0, sticky="ew", pady=(0, 5))
-        label.bind("<Configure>", lambda event: label.configure(wraplength=max(100, event.width)))
+        self._record_area = ttk.Frame(outer, height=40)
+        self._record_area.grid(row=6, column=0, sticky="ew", pady=(0, 5))
+        self._record_area.pack_propagate(False)
+        label = ttk.Label(self._record_area, textvariable=self.record_status, justify="left", wraplength=720)
+        label.pack(fill="x", anchor="nw")
+        label.bind("<Configure>", lambda event: label.configure(wraplength=max(100, event.width - 4))
+                   if event.width > 1 and int(label.cget("wraplength")) != max(100, event.width - 4) else None)
         ttk.Label(outer, text="Green: last confirmed · Amber: held/uncertain · Gray: candidates").grid(
             row=7, column=0, sticky="w", pady=(0, 5))
         log_frame = ttk.Frame(outer)
         log_frame.grid(row=8, column=0, sticky="ew")
-        self.transcript = tk.Text(log_frame, height=4, wrap="word", state="disabled")
+        self.transcript = tk.Text(log_frame, height=3, wrap="word", state="disabled")
         self.transcript.pack(side="left", fill="both", expand=True)
         scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.transcript.yview)
         scrollbar.pack(side="right", fill="y")
@@ -213,14 +292,56 @@ class ObserverWindow:
     def selecting(self):
         return self.selection.selecting
 
+    def set_output_status(self, enabled, message=""):
+        """The core session owns movement; this window can be hidden safely."""
+        if self.closed:
+            return
+        self._hide_on_close = True
+        self.window.title("Sarween — Mini tracking")
+        self.heading.set("Mini tracking")
+        self.output_status.set(message or ("Foundry movement armed" if enabled else "Foundry movement gated"))
+
     def _resize(self, event):
         # The next supplied frame repaints even while selection is frozen.
         # No Tk update or geometry operation is nested in Cocoa resize events.
         self._canvas_size = (max(1, int(event.width)), max(1, int(event.height)))
 
-    def set_status(self, message):
-        if not self.closed:
-            self.status.set(str(message))
+    def set_status(self, message, *, immediate=True):
+        if self.closed:
+            return
+        message = str(message)
+        if message != self._last_full_status:
+            elapsed = self._status_clock() - self._status_started
+            self._status_history.append(f"{_duration(elapsed)}  {message}")
+            self._last_full_status = message
+            self._update_details()
+        headline = status_text(message)
+        critical = any(word in headline.lower() for word in
+                       ("error", "failed", "could not", "stopped", "limit reached", "lock", "choose starting positions again"))
+        if immediate or critical:
+            self._cancel_status_timer()
+            self._pending_status = None
+            self.status.set(headline)
+            self._last_status_at = self._status_clock()
+        else:
+            self._pending_status = headline
+            remaining = .5 - (self._status_clock() - self._last_status_at)
+            if remaining <= 0:
+                self._flush_status()
+            elif self._status_after_id is None:
+                self._status_after_id = self.window.after(max(1, math.ceil(remaining * 1000)), self._flush_status)
+
+    def _cancel_status_timer(self):
+        if self._status_after_id is not None:
+            self.window.after_cancel(self._status_after_id)
+            self._status_after_id = None
+
+    def _flush_status(self):
+        self._status_after_id = None
+        if not self.closed and self._pending_status is not None and not self.selecting:
+            self.status.set(self._pending_status)
+            self._pending_status = None
+            self._last_status_at = self._status_clock()
 
     def update_frame(self, board_bgr, result=None, *, context=None, status=None):
         if self.closed:
@@ -231,12 +352,12 @@ class ObserverWindow:
         selectable = not isinstance(context, dict) or context.get("locked", True)
         self.choose_button.configure(state="normal" if selectable else "disabled")
         if status is not None and not self.selecting:
-            self.set_status(status)
+            self.set_status(status, immediate=False)
         elif not self.selecting:
             state = self._latest_result.get("state") or {}
             reason = state.get("reason")
             if reason:
-                self.set_status(str(reason).replace("_", " "))
+                self.set_status(str(reason).replace("_", " "), immediate=False)
         self._remember_events(self._latest_result)
         self._paint()
 
@@ -317,14 +438,60 @@ class ObserverWindow:
             except Exception as exc:
                 self.set_status(f"Observer recording could not change: {exc}")
 
-    def set_recording(self, recording, path=""):
+    def set_recording(self, recording, path="", *, summary=None):
         if self.closed:
             return
         self._recording, self._record_path = bool(recording), str(path)
+        self._record_summary = deepcopy(summary or {})
         self.record_button.configure(text="Stop recording" if recording else "Record observer inputs",
                                      state="normal" if self.on_record and (recording or self.initialized) else "disabled")
-        self.record_status.set(("Recording observer inputs: " if recording else "Observer recording folder: ") + str(path)
-                               if path else ("Recording observer inputs" if recording else "Not recording"))
+        self.record_status.set(recording_text(self._recording, self._record_summary, path=self._record_path))
+        self._update_details()
+
+    def update_recording(self, summary):
+        if not self.closed:
+            self._record_summary = deepcopy(summary or {})
+            self.record_status.set(recording_text(self._recording, self._record_summary, path=self._record_path))
+            self._update_details()
+
+    def show_details(self):
+        if self.closed:
+            return
+        if self._details_window is None:
+            self._details_window = tk.Toplevel(self.window)
+            self._details_window.title("Mini observer — Details")
+            self._details_window.geometry("720x420")
+            self._details_window.minsize(460, 250)
+            self._details_window.protocol("WM_DELETE_WINDOW", self._details_window.withdraw)
+            frame = ttk.Frame(self._details_window, padding=12)
+            frame.pack(fill="both", expand=True)
+            self._details_text = tk.Text(frame, wrap="word", state="disabled")
+            scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self._details_text.yview)
+            scrollbar.pack(side="right", fill="y")
+            self._details_text.pack(fill="both", expand=True)
+            self._details_text.configure(yscrollcommand=scrollbar.set)
+        self._update_details()
+        self._details_window.deiconify()
+        self._details_window.lift()
+
+    def _update_details(self):
+        if self._details_text is None:
+            return
+        position = self._details_text.yview()
+        top_line = self._details_text.index("@0,0")
+        text = (f"Recording folder\n{self._record_path or 'No recording yet'}\n\n"
+                f"{recording_text(self._recording, self._record_summary, path=self._record_path)}\n")
+        if self._record_summary.get("error"):
+            text += f"\nSave error: {self._record_summary['error']}\n"
+        text += "\nRecent diagnostics (elapsed since this observer opened)\n" + "\n\n".join(self._status_history)
+        self._details_text.configure(state="normal")
+        self._details_text.delete("1.0", "end")
+        self._details_text.insert("1.0", text)
+        self._details_text.configure(state="disabled")
+        if position and position[-1] < .98:
+            self._details_text.yview(top_line)
+        else:
+            self._details_text.see("end")
 
     def _clear_transcript(self):
         self._event_keys.clear()
@@ -420,9 +587,13 @@ class ObserverWindow:
             suffix = " (held)" if hold_all or mini in held else " (?)" if uncertain else ""
             mark(xy, 18, "#ffd166" if is_held else "#75ef8d", f"{mini}{suffix}")
 
-    def close(self):
+    def close(self, *, force=False):
         if self.closed:
             return
+        if getattr(self, "_hide_on_close", False) and not force:
+            self.window.withdraw()
+            return
+        self._cancel_status_timer()
         self.closed = True
         self._photo = None
         try:
@@ -431,3 +602,6 @@ class ObserverWindow:
             pass
         if self.on_close:
             self.on_close()
+
+    def dispose(self):
+        self.close(force=True)

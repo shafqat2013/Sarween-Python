@@ -13,6 +13,7 @@ import math
 
 import cv2
 import numpy as np
+from marker_geometry import marker_geometry
 
 
 DICTIONARY = "DICT_6X6_250"
@@ -156,21 +157,28 @@ def calibrate_layout(corners, ids, view):
     return _layout(result, width / height, "co-visible")
 
 
-def guide_aligned_layout(view, marker_size, inset):
+def guide_aligned_layout(view, marker_size=None, inset=8, *, pattern_size=None, margin=None):
     """Bind user-declared paper placement over the current digital guide tiles.
 
     This computes the known black-square corners, excluding the white quiet
     margin. It does not prove that the user put the paper in those positions.
     """
     width, height, left, top, right, bottom = viewport(view)
-    size, inset = _number(marker_size, "Marker size"), _number(inset, "Marker inset")
-    if not 72 <= size <= 240 or not 0 <= inset <= 80:
+    inset = _number(inset, "Marker inset")
+    if not 0 <= inset <= 80:
         raise ValueError("Waiting for valid current marker guide settings")
-    quiet = size / 6
+    settings = {"viewportMarkerSize": marker_size} if marker_size is not None else {}
+    if pattern_size is not None:
+        settings["viewportMarkerPatternSize"] = pattern_size
+    if margin is not None:
+        settings["viewportMarkerMargin"] = margin
+    if not settings:
+        raise ValueError("Waiting for valid current marker guide settings")
+    geometry = marker_geometry(settings)
+    quiet, black = geometry["margin"], geometry["patternSize"]
     expected = [inset + quiet, inset + quiet, width - inset - quiet, height - inset - quiet]
     if max(abs(a - b) for a, b in zip((left, top, right, bottom), expected)) > .75:
         raise ValueError("Current marker guide settings and viewport registration do not match")
-    black = size - 2 * quiet
     positions = {20: (left, top), 21: (right - black, top),
                  22: (right - black, bottom - black), 23: (left, bottom - black)}
     corners = {str(marker_id): [[x / width, y / height], [(x + black) / width, y / height],

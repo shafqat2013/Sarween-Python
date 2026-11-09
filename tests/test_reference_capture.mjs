@@ -47,7 +47,7 @@ function installRenderer(h, {resolution = 2, fail = false} = {}) {
   const snapshot = h.created.find(canvas => canvas.draws?.some(row => row.kind === "image"));
   const draw = snapshot.draws.find(row => row.kind === "image").args;
   assert.equal(draw[0].content, "the-visible-stage-with-fog");
-  assert.deepEqual(draw.slice(1), [56, 56, 3728, 2048, 0, 0, 640, 360]);
+  assert.deepEqual(draw.slice(1), [40, 40, 3760, 2080, 0, 0, 640, 360]);
   assert.deepEqual(h.canvas.stage.worldTransform, originalTransform);
   assert.equal(h.pans.length, 0);
   assert.equal(h.writes.length, 0);

@@ -195,6 +195,8 @@ def calibration_mode_label(auto_capture=False, diagnostics=None):
         return "TIMED (5s)"
     if mode == "manual":
         return "MANUAL"
+    if mode == "sweep":
+        return "AUTO SWEEP"
     return "AUTO" if mode == "auto" or auto_capture else "MANUAL"
 
 
@@ -210,6 +212,7 @@ def calibration_diagnostic_lines(detected_corners, *, minimum_corners=10, diagno
               "duplicate": "Move to a new angle", "angle": "Move to a new angle",
               "cooldown": "Move to a new angle", "captured": "View captured",
               "complete": "All views captured", "manual": "Ready for manual capture",
+              "need_more_views": "More views needed",
               "frame_size": "Camera size changed", "timed_wait": "Timer running"}
     valid = _finite_metric(diagnostics.get("validCorners"))
     valid = max(0, int(valid)) if valid is not None else detected
@@ -227,7 +230,8 @@ def calibration_diagnostic_lines(detected_corners, *, minimum_corners=10, diagno
     resets = _finite_metric(diagnostics.get("holdResets"))
     pose = _finite_metric(diagnostics.get("poseCorners"))
     metrics = []
-    if progress is not None:
+    sweep = diagnostics.get("captureMode") == "sweep"
+    if progress is not None and not sweep:
         metrics.append(f"Steady: {min(100, max(0, round(progress * 100)))}%")
     if motion is not None:
         metrics.append(f"Motion: {motion * 100:.1f}%")
@@ -235,7 +239,7 @@ def calibration_diagnostic_lines(detected_corners, *, minimum_corners=10, diagno
         metrics.append(f"Shared: {int(shared)}")
     if pose is not None:
         metrics.append(f"Pose model: {int(pose)}")
-    if resets is not None:
+    if resets is not None and not sweep:
         metrics.append(f"Hold resets: {int(resets)}")
     if metrics:
         lines.append(" | ".join(metrics))
@@ -268,6 +272,7 @@ def render_calibration_preview(frame, *, captured, required, detected_corners=0,
     lines = [f"Views: {captured}/{required} | {mode}", *diagnostic_lines[1:]]
     if countdown is not None:
         lines.append(f"Next capture in {max(0, countdown):.1f}s" if mode == "TIMED (5s)" else
+                     f"Starting in {max(0, countdown):.1f}s - move slowly" if mode == "AUTO SWEEP" else
                      f"Capture in {max(0, countdown):.1f}s - hold still")
     detail = status or prompt or (diagnostics or {}).get("message")
     if detail:

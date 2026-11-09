@@ -45,8 +45,11 @@ def run(harness):
         image[:, 540:] = (220, 100, 20)
         cv2.putText(image, "SYNTHETIC TEST", (50, 400), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 4)
         assert cv2.imwrite(str(jpeg), image)
-        def start(path=jpeg, preset="standard", orientation="portrait"):
-            return subprocess.Popen([str(harness), str(path), preset, orientation], stdout=subprocess.DEVNULL,
+        def start(path=jpeg, preset="standard", orientation="portrait", lens="wide", exercise_feedback=False):
+            args = [str(harness), str(path), preset, orientation, lens]
+            if exercise_feedback:
+                args.append("--exercise-feedback")
+            return subprocess.Popen(args, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL)
         def stop(child):
             child.terminate()
@@ -93,42 +96,71 @@ def run(harness):
             checks.append("Release cancels the production receiver promptly")
             stop(process)
             process = None
+            process = start(exercise_feedback=True)
+            capture = PhoneCameraCapture("SYNTHETIC-NOT-A-USB-DEVICE", transport=SyntheticLocalTransport(),
+                read_timeout=.3, reconnect_delays=(.05,), packet_timeout=2)
+            _, guidance_frame = wait_frame(capture)
+            assert capture.send_feedback({"kind": "calibration", "sourceSeq": guidance_frame["seq"],
+                "markers": {"ids": [], "requiredIds": [10, 11, 12, 13], "count": 0, "required": 4, "locked": False},
+                "calibration": {"active": True, "captured": 2, "required": 10,
+                    "title": "Synthetic calibration test", "message": "No actual calibration is running.",
+                    "reason": "synthetic", "mode": "sweep", "canFinish": False}})
+            requests = []
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline and not requests:
+                requests = capture.take_requests()
+                if not requests:
+                    time.sleep(.02)
+            assert len(requests) == 1 and requests[0]["action"] == "calibration.capture", requests
+            assert requests[0]["sessionId"] == guidance_frame["sessionId"]
+            assert requests[0]["connectionGeneration"] == guidance_frame["connectionGeneration"]
+            _, after_guidance = wait_frame(capture)
+            assert after_guidance["seq"] > guidance_frame["seq"]
+            checks.append("Production Swift parses calibration feedback and sends a session-bound phone button request while frames continue")
+            capture.release()
+            stop(process)
+            process = None
             formats = []
             source_ids = {}
-            for preset, orientation, width, height, fps in (
-                    ("standard", "portrait", 1080, 1920, 15),
-                    ("smooth", "portrait", 1080, 1920, 30),
-                    ("detail", "portrait", 2160, 3840, 15),
-                    ("standard", "landscape", 1920, 1080, 15)):
+            for lens, preset, orientation, width, height, fps in (
+                    ("wide", "standard", "portrait", 1080, 1920, 15),
+                    ("wide", "smooth", "portrait", 1080, 1920, 30),
+                    ("wide", "detail", "portrait", 2160, 3840, 15),
+                    ("wide", "standard", "landscape", 1920, 1080, 15),
+                    ("ultra-wide", "standard", "portrait", 1080, 1920, 15),
+                    ("telephoto", "standard", "portrait", 1080, 1920, 15)):
                 sample = np.zeros((height, width, 3), np.uint8)
                 sample[:, :width // 2] = (30, 50, 220)
                 sample[:, width // 2:] = (220, 100, 20)
                 path = Path(directory) / f"SYNTHETIC-{preset}-{orientation}.jpg"
                 assert cv2.imwrite(str(path), sample)
-                process = start(path, preset, orientation)
+                process = start(path, preset, orientation, lens)
                 capture = PhoneCameraCapture("SYNTHETIC-NOT-A-USB-DEVICE", transport=SyntheticLocalTransport(),
                     read_timeout=.3, reconnect_delays=(.05,), packet_timeout=3)
                 pixels, metadata = wait_frame(capture)
                 assert pixels.shape == (height, width, 3)
                 assert metadata["format"]["fps"] == fps
                 assert metadata["format"]["capturePreset"] == preset
+                assert metadata["format"]["lens"] == lens
                 assert pixels[100, 100, 2] > 180 and pixels[100, width - 100, 0] > 180
                 _, later = wait_frame(capture)
                 assert later["sessionId"] == metadata["sessionId"] and later["seq"] > metadata["seq"]
-                source_ids[preset, orientation] = metadata["sourceId"]
-                formats.append({"preset": preset, "orientation": orientation, "width": width,
+                source_ids[lens, preset, orientation] = metadata["sourceId"]
+                formats.append({"lens": lens, "preset": preset, "orientation": orientation, "width": width,
                                 "height": height, "nominalFPS": fps, "decoded": True})
                 capture.release()
                 stop(process)
                 process = None
-            assert source_ids["standard", "portrait"] == first["sourceId"]
-            assert source_ids["smooth", "portrait"] == first["sourceId"]
-            assert source_ids["detail", "portrait"] != first["sourceId"]
-            assert source_ids["standard", "landscape"] != first["sourceId"]
+            assert source_ids["wide", "standard", "portrait"] == first["sourceId"]
+            assert source_ids["wide", "smooth", "portrait"] == first["sourceId"]
+            assert source_ids["wide", "detail", "portrait"] != first["sourceId"]
+            assert source_ids["wide", "standard", "landscape"] != first["sourceId"]
+            assert len({source_ids[lens, "standard", "portrait"] for lens in ("wide", "ultra-wide", "telephoto")}) == 3
             checks.extend([
                 "Standard, Smooth, Detail and landscape synthetic JPEGs decode at their declared native dimensions",
                 "Preset and nominal FPS metadata survive the production receiver handshake",
                 "FPS-only Standard/Smooth preserve optical identity; resolution/orientation changes do not",
+                "Different physical lenses retain distinct optical identities at identical pixel dimensions",
             ])
             return {"scope": "SYNTHETIC localhost, production Swift server and Python receiver; NOT actual USB/camera",
                     "passed": len(checks), "checks": checks, "syntheticFormats": formats,

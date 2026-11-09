@@ -56,10 +56,14 @@ class FakeWindow:
         self.last_frame = None
         self.invalidations = []
 
-    def set_recording(self, recording, path=""):
+    def set_recording(self, recording, path="", *, summary=None):
         self.recording = bool(recording)
         self.recording_path = str(path)
         self.recording_changes.append((recording, path))
+        self.recording_summary = deepcopy(summary)
+
+    def update_recording(self, summary):
+        self.recording_summary = deepcopy(summary)
 
     def set_status(self, message):
         self.status = str(message)
@@ -264,6 +268,8 @@ class LiveObserverSessionTests(unittest.TestCase):
         self.assertFalse(self.controller.is_recording)
         self.assertFalse(self.controller.window.recording)
         self.assertEqual(journal.manifest["end_reason"], "recordingLimit")
+        self.assertEqual(self.controller.window.recording_summary["end_reason"], "recordingLimit")
+        self.assertEqual(self.controller.window.recording_summary["limit_reached"], "seconds")
         self.assertIn("limit", self.controller.error.lower())
         self.assertIsNotNone(self.controller.engine)
         self.assertFalse(result["needs_reset"])
@@ -276,6 +282,7 @@ class LiveObserverSessionTests(unittest.TestCase):
         self.assertFalse(self.controller.is_recording)
         self.assertIn("disk full", self.controller.error)
         self.assertEqual(journal.manifest["end_reason"], "recordingError")
+        self.assertIn("disk full", self.controller.window.recording_summary["error"])
         self.assertIsNotNone(self.controller.engine)
         self.assertIsNotNone(self.update(1.25))
 

@@ -7,6 +7,20 @@ public enum CameraOrientation: String, CaseIterable, Identifiable {
     public var label: String { self == .portrait ? "Portrait" : "Landscape" }
 }
 
+public enum CameraLens: String, CaseIterable, Identifiable {
+    case wide
+    case ultraWide = "ultra-wide"
+    case telephoto
+    public var id: String { rawValue }
+    public var label: String {
+        switch self {
+        case .wide: return "Wide"
+        case .ultraWide: return "Ultra Wide"
+        case .telephoto: return "Telephoto"
+        }
+    }
+}
+
 public enum CameraCapturePreset: String, CaseIterable, Identifiable {
     case standard
     case smooth
@@ -34,10 +48,10 @@ public enum CameraCapturePreset: String, CaseIterable, Identifiable {
         ["id": rawValue, "label": label, "width": width(for: orientation), "height": height(for: orientation),
          "fps": framesPerSecond, "experimental": experimental]
     }
-    public func opticalSourceID(installationID: String, orientation: CameraOrientation) -> String {
+    public func opticalSourceID(installationID: String, orientation: CameraOrientation, lens: CameraLens = .wide) -> String {
         // Standard and Smooth are offered on the identical retained native format.
         // FPS is temporal metadata, while resolution/orientation change calibration.
-        "sarween-iphone:\(installationID):back-wide:\(width(for: orientation))x\(height(for: orientation)):rotation0:mirror0:zoom1:stabilization-off:gdc-off:hdr-off"
+        "sarween-iphone:\(installationID):back-\(lens.rawValue):\(width(for: orientation))x\(height(for: orientation)):rotation0:mirror0:zoom1:stabilization-off:gdc-off:hdr-off"
     }
 }
 
@@ -51,7 +65,7 @@ public struct CameraFrameRateInterval {
     }
 }
 
-/// Candidates come exclusively from the already-selected physical rear wide camera.
+/// Candidates come exclusively from one already-selected physical rear camera.
 /// Identifiers refer to retained native format objects, never to another camera/lens.
 public struct CameraFormatCandidate {
     public let identifier: Int
@@ -70,7 +84,7 @@ public struct CameraFormatCandidate {
     }
 }
 
-public struct CameraPresetPlan {
+public struct CameraPresetPlan: Equatable {
     public let preset: CameraCapturePreset
     public let formatIdentifier: Int
     public let fieldOfView: Double
@@ -78,6 +92,38 @@ public struct CameraPresetPlan {
     public func sharesOpticalFormat(with other: CameraPresetPlan) -> Bool {
         formatIdentifier == other.formatIdentifier && preset.sensorWidth == other.preset.sensorWidth
             && preset.sensorHeight == other.preset.sensorHeight && fieldOfView == other.fieldOfView
+    }
+}
+
+public struct CameraLensCapability: Equatable {
+    public let lens: CameraLens
+    public let plans: [CameraCapturePreset: CameraPresetPlan]
+    public let torchSupported: Bool
+    public init(lens: CameraLens, plans: [CameraCapturePreset: CameraPresetPlan], torchSupported: Bool) {
+        self.lens = lens; self.plans = plans; self.torchSupported = torchSupported
+    }
+    public var supportedPresets: [CameraCapturePreset] {
+        CameraCapturePreset.allCases.filter { plans[$0] != nil }
+    }
+    public func capabilityJSON(orientation: CameraOrientation) -> [String: Any] {
+        ["lens": lens.rawValue, "label": lens.label, "torchSupported": torchSupported,
+         "availableCapturePresets": supportedPresets.map { preset -> [String: Any] in
+             var result = preset.capabilityJSON(orientation: orientation)
+             result["nativeFieldOfViewDegrees"] = plans[preset]!.fieldOfView
+             return result
+         }]
+    }
+}
+
+public enum CameraLensPlanner {
+    /// Only physical lenses with the baseline mode are selectable. Preserve the
+    /// chosen lens/preset when supported, otherwise choose Wide/Standard explicitly.
+    public static func selection(lens: CameraLens, preset: CameraCapturePreset,
+                                 capabilities: [CameraLensCapability]) -> (lens: CameraLens, preset: CameraCapturePreset)? {
+        let usable = capabilities.filter { $0.plans[.standard] != nil }
+        guard let selected = usable.first(where: { $0.lens == lens })
+                ?? usable.first(where: { $0.lens == .wide }) ?? usable.first else { return nil }
+        return (selected.lens, selected.plans[preset] != nil ? preset : .standard)
     }
 }
 

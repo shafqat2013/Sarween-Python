@@ -242,7 +242,8 @@ class ControlPanel:
         diagnostics_page = ttk.Frame(self.tabs)
         diagnostics_tab = _scrollable_content(diagnostics_page)
         self.tabs.add(session_tab, text="Session")
-        self.tabs.add(scans_tab, text="Scans")
+        if self.mode != "foundry":
+            self.tabs.add(scans_tab, text="Scans")
         self.tabs.add(diagnostics_page, text="Diagnostics")
         if self.mode == "foundry":
             from vtt_controls import VTTControls
@@ -333,7 +334,7 @@ class ControlPanel:
         btn_row = ttk.Frame(session_tab)
         btn_row.pack(fill="x")
         btn_row.columnconfigure(2, weight=1)
-        ttk.Button(btn_row, text="Recapture BG",
+        ttk.Button(btn_row, text="Choose positions again" if self.mode == "foundry" else "Recapture BG",
                    command=self._act_recapture_bg).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(scans_tab, text="Calibrate Minis",
                    command=self._act_calibrate_minis).pack(anchor="w", pady=(8, 0))
@@ -352,17 +353,19 @@ class ControlPanel:
 
         observer_row = ttk.Frame(session_tab)
         observer_row.pack(fill="x", pady=(10, 0))
-        ttk.Button(observer_row, text="Open six-mini observer",
-                   command=self._act_open_observer).pack(side="left", padx=(0, 8))
-        _wrap_label(ttk.Label(observer_row, text="Experimental · Foundry movement off while observing"),
+        self.tracking_view_button = ttk.Button(observer_row, text="Open six-mini tracking view",
+                   command=self._act_open_observer)
+        self.tracking_view_button.pack(side="left", padx=(0, 8))
+        _wrap_label(ttk.Label(observer_row, text="Choose starting positions here; assign tokens in VTT Controls."),
                     400).pack(side="left", fill="x", expand=True)
 
         debug_row = ttk.Frame(diagnostics_tab)
         debug_row.pack(fill="x", pady=(4, 0))
         ttk.Button(debug_row, text="Dump State",
                    command=self._act_dump_state).pack(side="left")
-        ttk.Button(btn_row, text="Mini Library",
-                   command=self._show_mini_library).grid(row=0, column=1, padx=(0, 8))
+        if self.mode != "foundry":
+            ttk.Button(btn_row, text="Mini Library",
+                       command=self._show_mini_library).grid(row=0, column=1, padx=(0, 8))
 
         # Motion threshold
         thresh_box = ttk.Frame(diagnostics_tab)
@@ -589,6 +592,13 @@ class ControlPanel:
 
     def update_map(self, state: dict) -> None:
         self.map_view.set_state(state)
+
+    def set_tracking_minis(self, minis, generation, scene_id, *, read_only=False):
+        if self.vtt_controls is not None:
+            self.vtt_controls.set_tracking_minis(minis, generation, scene_id, read_only=read_only)
+
+    def get_confirmed_tracking_assignments(self):
+        return self.vtt_controls.get_confirmed_tracking_assignments() if self.vtt_controls is not None else {}
 
     def update_positions(self, positions: dict) -> None:
         def _update():

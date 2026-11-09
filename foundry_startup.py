@@ -298,14 +298,35 @@ class FoundryStartupController:
             listener.bind(("127.0.0.1", 0))
             return listener.getsockname()[1]
 
+    @staticmethod
+    def _check_requested_session(status, config):
+        if not status.get("connected"):
+            return
+        world, user = status.get("world") or {}, status.get("user") or {}
+        if world.get("id") and world["id"] != config["worldId"]:
+            raise RuntimeError("A different Foundry world is connected. Select that world in Sarween, or switch "
+                               f"Foundry to '{config['worldId']}' and join as '{config['username']}', then try again. "
+                               "Foundry stays open.")
+        if ((user.get("name") and user["name"] != config["username"])
+                or user.get("isGM") is False):
+            raise RuntimeError(f"Foundry is connected as a different user. Join '{config['worldId']}' as "
+                               f"'{config['username']}' with Gamemaster permissions, then try again. "
+                               "Foundry stays open.")
+
     def _run(self, config, password, pids):
         try:
             deadline = self._clock() + self.timeout
             remote = self._status()
+            unmanaged = bool(pids and (not self._owned or self._owned["pid"] not in pids))
+            if unmanaged:
+                # Existing native windows have no startup channel owned here.
+                # Wait for their ordinary module connection; never attach to
+                # their browser/debugging channel or launch a second instance.
+                password = ""
             # Starting the relay and receiving the already-open world's module
             # handshake are separate asynchronous steps. Give that native window
-            # a chance to reconnect before declaring it unmanaged/unavailable.
-            if pids and (not self._owned or self._owned["pid"] not in pids) and not remote.get("connected"):
+            # a quiet reconnect grace before showing manual-join guidance.
+            if unmanaged and not remote.get("connected"):
                 self._state_set("waiting_module", "Foundry is already open. Waiting for its Sarween module…")
                 reconnect_deadline = min(deadline, self._clock() + self.connection_grace)
                 while not self._stopped() and not remote.get("connected") and self._clock() < reconnect_deadline:
@@ -313,16 +334,10 @@ class FoundryStartupController:
                     remote = self._status()
             if self._stopped():
                 return
+            self._check_requested_session(remote, config)
             connected = remote.get("connected") and (remote.get("world") or {}).get("id") == config["worldId"]
-            if connected and ((remote.get("user") or {}).get("name") != config["username"]
-                              or (remote.get("user") or {}).get("isGM") is not True):
-                raise RuntimeError("Foundry is connected as a different user or an older Sarween module. Join as the selected Gamemaster and reload the module.")
-            if remote.get("connected") and not connected:
-                raise RuntimeError("A different or older Foundry session is connected. Close it or reload its Sarween module before starting this world.")
-            if not connected:
+            if not connected and not remote.get("connected") and not unmanaged:
                 if pids:
-                    if not self._owned or self._owned["pid"] not in pids:
-                        raise RuntimeError("Foundry is already open outside Sarween's startup flow. Close it once, then click Start Foundry; or join normally and use the connected controls.")
                     port = self._owned["port"]
                 else:
                     if self._stopped():
@@ -349,18 +364,18 @@ class FoundryStartupController:
                         return
                     raise TimeoutError("Foundry did not finish starting. Check its window for an update, license, migration or login message, then retry.")
             password = ""
-            self._state_set("waiting_module", "Waiting for the Sarween module and active scene…")
+            waiting_message = (f"Foundry is already open. Join '{config['worldId']}' as '{config['username']}', "
+                               "enable or reload the Sarween module, and open a scene. "
+                               "Sarween will continue automatically when connected."
+                               if unmanaged else "Waiting for the Sarween module and active scene…")
+            self._state_set("waiting_module", waiting_message)
             request_id = None
             while not self._stopped() and self._clock() < deadline:
                 status = self._status()
                 if self._stopped():
                     return
+                self._check_requested_session(status, config)
                 world = status.get("world") or {}
-                if status.get("connected") and world.get("id") and world["id"] != config["worldId"]:
-                    raise RuntimeError("The connected Foundry world changed during startup.")
-                if status.get("connected") and status.get("user") and (
-                        status["user"].get("name") != config["username"] or status["user"].get("isGM") is not True):
-                    raise RuntimeError("The connected Foundry user changed during startup.")
                 ready = (status.get("connected") and status.get("supported") and not status.get("blocked")
                          and world.get("id") == config["worldId"]
                          and (status.get("user") or {}).get("name") == config["username"]
@@ -391,6 +406,10 @@ class FoundryStartupController:
             else:
                 if self._stopped():
                     return
+                if unmanaged:
+                    raise TimeoutError(f"Still waiting for the already-open Foundry. Join '{config['worldId']}' as "
+                                       f"'{config['username']}', enable or reload the Sarween module, and open a scene, "
+                                       "then click Start Foundry again. Foundry stays open.")
                 raise TimeoutError("Foundry opened, but its Sarween module or active scene is not ready. Enable the module, open a scene, then retry.")
             if self._stopped():
                 return

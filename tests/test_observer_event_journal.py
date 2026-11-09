@@ -219,6 +219,7 @@ class ScriptedEngine:
     """Test acceptance source; image recognition is intentionally outside this test."""
     def __init__(self, geometry, positions, cells=None, **_options):
         self.geometry = geometry
+        self.display_transition_policy = _options.get("display_transition_policy", "disabled")
         self.mover = SimpleNamespace(positions=deepcopy(positions))
         self.confirmed_cells = cells or {mini: geometry.describe(xy)["cell"] for mini, xy in positions.items()}
         self.events, self.next_events = [], []

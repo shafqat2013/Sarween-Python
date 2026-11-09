@@ -89,14 +89,87 @@ class StartupTest(unittest.TestCase):
         self.assertNotIn("not-a-saved-secret", saved)
         self.assertNotIn("password", saved.lower())
 
-    def test_existing_unmanaged_native_app_is_not_duplicated(self):
+    def test_owned_existing_launch_keeps_its_scoped_login_flow(self):
+        c = self.controller(backend=Backend(pids=[17]))
+        c._owned = {"pid": 17, "port": 45123}
+        self.current["connected"] = False
+        original = self.backend.prepare_login
+        def login(*args):
+            result = original(*args)
+            self.current["connected"] = result["phase"] == "joined"
+            return result
+        self.backend.prepare_login = login
+        c.start(self.config, password="owned-launch-password")
+        self.assertEqual(self.wait(c)["phase"], "ready")
+        self.assertEqual(self.backend.logins, [(45123, "testing", "owned-launch-password")])
+        self.assertFalse(self.backend.launches)
+        self.assertEqual(self.commands, [("lifecycle.setPaused", {"paused": False})])
+
+    def virtual_wait(self, controller, *, on_wait=None):
+        elapsed, messages = [0.0], []
+        controller._clock = lambda: elapsed[0]
+        def pause(seconds):
+            elapsed[0] += seconds
+            messages.append((elapsed[0], controller.status()))
+            if on_wait is not None:
+                on_wait(elapsed[0])
+        controller._pause = pause
+        return elapsed, messages
+
+    def test_unmanaged_foundry_connects_after_grace_then_unpauses_and_places_without_duplicate_launch(self):
         c = self.controller(backend=Backend(pids=[17]))
         self.current["connected"] = False
+        c.connection_grace = 10
+        duplicate_attempts = []
+        def during_wait(elapsed):
+            if elapsed >= 11 and not duplicate_attempts:
+                duplicate_attempts.append(c.start(self.config))
+            if elapsed >= 12:
+                self.current["connected"] = True
+        elapsed, messages = self.virtual_wait(c, on_wait=during_wait)
+        c.start({**self.config, "placeWindow": True}, password="unused-for-existing-window")
+        status = self.wait(c)
+        self.assertEqual(status["phase"], "ready")
+        self.assertGreaterEqual(elapsed[0], 12)
+        self.assertTrue(any(t >= 10 and "continue automatically" in row["message"] for t, row in messages))
+        self.assertEqual(duplicate_attempts, [False])
+        self.assertFalse(self.backend.launches)
+        self.assertFalse(self.backend.logins)
+        self.assertEqual(self.commands, [("lifecycle.setPaused", {"paused": False})])
+        self.assertTrue(c.take_placement_request())
+        self.assertFalse(c.take_placement_request())
+
+    def test_unmanaged_foundry_timeout_uses_normal_deadline_and_keeps_window_open(self):
+        c = self.controller(backend=Backend(pids=[17]))
+        self.current["connected"] = False
+        c.connection_grace = 10
+        elapsed, messages = self.virtual_wait(c)
         c.start(self.config)
         status = self.wait(c)
         self.assertEqual(status["phase"], "failed")
-        self.assertIn("Close it once", status["message"])
+        self.assertGreaterEqual(elapsed[0], 150)
+        self.assertLess(elapsed[0], 150.21)
+        self.assertIn("already-open Foundry", status["message"])
+        self.assertIn("Gamemaster", status["message"])
+        self.assertIn("Sarween module", status["message"])
+        self.assertNotIn("close", status["message"].lower())
+        self.assertTrue(any(t > 10 and row["busy"] and row["phase"] == "waiting_module" for t, row in messages))
         self.assertFalse(self.backend.launches)
+        self.assertFalse(self.backend.logins)
+        self.assertFalse(self.commands)
+
+    def test_unmanaged_wait_can_be_cancelled_after_grace_without_login_or_placement(self):
+        c = self.controller(backend=Backend(pids=[17]))
+        self.current["connected"] = False
+        c.connection_grace = 10
+        elapsed, _messages = self.virtual_wait(c, on_wait=lambda now: c.cancel() if now >= 12 else None)
+        c.start({**self.config, "placeWindow": True})
+        self.assertEqual(self.wait(c)["phase"], "cancelled")
+        self.assertLess(elapsed[0], 150)
+        self.assertFalse(c.take_placement_request())
+        self.assertFalse(self.backend.launches)
+        self.assertFalse(self.backend.logins)
+        self.assertFalse(self.commands)
 
     def test_different_connected_world_is_not_replaced_or_unpaused(self):
         c = self.controller()
@@ -135,6 +208,40 @@ class StartupTest(unittest.TestCase):
         c.start(self.config)
         self.assertEqual(self.wait(c)["phase"], "failed")
         self.assertFalse(self.commands)
+
+    def test_unmanaged_delayed_wrong_world_or_user_fails_with_actionable_message(self):
+        for identity in ("world", "user"):
+            with self.subTest(identity=identity):
+                c = self.controller(backend=Backend(pids=[17]))
+                self.current["connected"] = False
+                c.connection_grace = 10
+                def connect(now):
+                    if now >= 12:
+                        self.current["connected"] = True
+                        self.current[identity] = ({"id": "different-world"} if identity == "world"
+                                                  else {"name": "Player", "isGM": False})
+                self.virtual_wait(c, on_wait=connect)
+                c.start(self.config)
+                status = self.wait(c)
+                self.assertEqual(status["phase"], "failed")
+                self.assertIn("testing", status["message"])
+                self.assertIn("Gamemaster", status["message"])
+                self.assertIn("Foundry stays open", status["message"])
+                self.assertFalse(self.backend.launches)
+                self.assertFalse(self.backend.logins)
+                self.assertFalse(self.commands)
+
+    def test_connected_module_can_supply_identity_after_socket_connection(self):
+        c = self.controller(backend=Backend(pids=[17]))
+        self.current.update(world={}, user={})
+        def identify(now):
+            if now >= 12:
+                self.current.update(world={"id": "testing"}, user={"name": "Gamemaster", "isGM": True})
+        self.virtual_wait(c, on_wait=identify)
+        c.start(self.config)
+        self.assertEqual(self.wait(c)["phase"], "ready")
+        self.assertFalse(self.backend.launches)
+        self.assertFalse(self.backend.logins)
 
     def test_cancel_during_module_status_read_never_sends_unpause(self):
         c = self.controller()

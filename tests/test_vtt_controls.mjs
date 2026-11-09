@@ -81,7 +81,8 @@ test("state describes all settings, token choices, ring defaults, and extensible
 
 test("settings validate the whole edit before writing, batch marker rendering and grid resizing, and return applied state", async () => {
   const h = await harness();
-  for (const invalid of [{viewportMarkerSize: 71}, {viewportMarkerInset: 81}, {defaultMovementSpeed: 121},
+  for (const invalid of [{viewportMarkerSize: 0}, {viewportMarkerPatternSize: 0}, {viewportMarkerMargin: -1},
+    {viewportMarkerMargin: 13}, {viewportMarkerPatternSize: NaN}, {viewportMarkerInset: 81}, {defaultMovementSpeed: 121},
     {animateTokenMovement: 1}, {physicalTapSelection: "false"}, {foundryUIHidden: null}, {wsUrl: "ws://elsewhere"},
     {autoConnect: false}, {unknown: 1}, {targetGridInches: Infinity}]) {
     const result = await h.command("settings.set", {settings: {debug: true, ...invalid}});
@@ -93,7 +94,9 @@ test("settings validate the whole edit before writing, batch marker rendering an
     physicalGridCalibration: 1.05, viewportMarkerSize: 160, viewportMarkerInset: 20,
     physicalGridAutoApply: false, animateTokenMovement: false, physicalTapSelection: false, defaultMovementSpeed: 40}});
   assert.equal(result.success, true);
-  assert.equal(result.state.settings.viewportMarkerSize, 160);
+  assert.equal(result.state.settings.viewportMarkerPatternSize, 160 * 2 / 3);
+  assert.equal(result.state.settings.viewportMarkerMargin, 12);
+  assert.equal(result.state.settings.viewportMarkerSize, 160 * 2 / 3 + 24);
   assert.equal(result.state.settings.defaultMovementSpeed, 40);
   assert.equal(h.pans.length, 1);
   assert.equal(h.created.filter(element => element.id === "sarween-viewport-markers").length, 1);
@@ -281,6 +284,20 @@ test("assignment requests queue and deduplicate; save/cancel advance choices and
   assert.equal(h.sent.findLast(message => message.type === "assignMiniResult").miniId, "blue");
   assert.equal(h.sent.findLast(message => message.type === "assignMiniResult").cancelled, true);
   assert.equal((await h.command("assignment.save", {miniId: "red10", tokenId: "deleted"})).success, false);
+});
+
+test("player mini assignments are acknowledged without replacing the legacy capture roster", async () => {
+  const h = await harness();
+  h.addToken({id: "player", name: "Paladin"});
+  const saved = await h.command("assignment.save", {miniId: "mini1", tokenId: "player"});
+  assert.equal(saved.success, true);
+  assert.equal(saved.state.miniBindings.mini1, "player");
+  assert.ok(saved.state.minis.every(mini => mini.miniId !== "mini1"));
+  const reply = h.sent.findLast(message => message.type === "assignMiniResult");
+  assert.equal(reply.miniId, "mini1");
+  assert.equal(reply.tokenId, "player");
+  h.scene.tokens.splice(0, 1);
+  assert.equal(Object.hasOwn(h.api.vttState().miniBindings, "mini1"), false);
 });
 
 test("movement selection, budget changes, undo and reset synchronize desktop and preserve state if undo fails", async () => {

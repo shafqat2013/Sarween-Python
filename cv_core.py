@@ -42,7 +42,8 @@ import cv2
 import numpy as np
 from app_paths import data_path
 from camera_profile_runtime import CameraCalibrationChanged, CameraCorrection, camera_params, legacy_offline_camera_params
-from camera_sources import is_phone_camera_index, source_for_index, open_camera_capture, profile_compatible_with_source, stable_stream_key
+from camera_sources import (is_phone_camera_index, source_for_index, open_camera_capture,
+                            profile_compatible_with_source, phone_profile_mismatch_reason, stable_stream_key)
 
 import setup as s
 import mini_tracking as mt
@@ -437,6 +438,7 @@ class CVCoreSession:
         watermark_detector=None,
         printed_marker_controller=None,
         camera_capture=None,
+        tracking_pixels_only: bool = False,
     ):
         sel = s.load_last_selection() or {}
         if camera_index is None:
@@ -458,6 +460,10 @@ class CVCoreSession:
         self.source_frames_undistorted = bool(source_frames_undistorted)
         self.view_settle_seconds = max(0.0, float(view_settle_seconds))
         self.loop_video = bool(loop_video)
+        # The shared base tracker consumes registered color pixels, not the
+        # legacy camera-space motion/shadow masks. Keep that expensive pipeline
+        # as the default for legacy callers and historical replay.
+        self.tracking_pixels_only = bool(tracking_pixels_only)
         self._frame_phase_offset = 0
         self.recording_state_provider = None
         self._checkpoint_kind = None
@@ -474,6 +480,7 @@ class CVCoreSession:
         self._camera_source_metadata = None
         self._phone_gap_invalidated = False
         self._camera_profile_rejection = None
+        self._phone_feedback = None
         if marker_mode is None:
             is_live_foundry = not _src and str(sel.get("mode", "")).lower() == "foundry"
             marker_mode = "viewport" if is_live_foundry else "legacy"
@@ -576,6 +583,10 @@ class CVCoreSession:
                 for _ in range(8):
                     self.cap.read()
                 time.sleep(0.3)  # let the camera buffer refill before capturing background
+            if self._source_is_phone:
+                from phone_camera_feedback import PhoneCameraFeedback
+                self._phone_feedback = PhoneCameraFeedback(self.cap, kind="tracking",
+                    marker_ids=tuple(self.corner_ids[key] for key in ("TL", "TR", "BR", "BL")), detect_interval=1.)
 
         # ── Video recorder (optional) ─────────────────────────────────────────
         self._recorder: Optional[cv2.VideoWriter] = None
@@ -611,6 +622,8 @@ class CVCoreSession:
             self._phone_has_camera_frame = False
         try:
             if not self._source_is_phone or self._phone_has_camera_frame:
+                if self._source_is_phone:
+                    self._validate_phone_profile_metadata(self._camera_source_metadata)
                 frame_bg = self._maybe_undistort(frame_bg)
         except Exception:
             self.cap.release()
@@ -688,7 +701,11 @@ class CVCoreSession:
                     pass
             return cam_bgr
         previous_matrix, previous_distortion = self.cam_mtx, self.cam_dist
-        self.cam_mtx, self.cam_dist = correction.resolve((cam_bgr.shape[1], cam_bgr.shape[0]))
+        if getattr(self, "_source_is_phone", False):
+            self.cam_mtx, self.cam_dist = correction.resolve((cam_bgr.shape[1], cam_bgr.shape[0]),
+                source_metadata=self._camera_source_metadata)
+        else:
+            self.cam_mtx, self.cam_dist = correction.resolve((cam_bgr.shape[1], cam_bgr.shape[0]))
         if getattr(self, "_camera_profile_rejection", None):
             correction.reason = self._camera_profile_rejection
         if (hasattr(self, "BG_cam")
@@ -738,6 +755,20 @@ class CVCoreSession:
         metadata["freshFrame"] = bool(fresh)
         return metadata
 
+    def _validate_phone_profile_metadata(self, metadata):
+        """Reject a physical-lens switch before even one old-matrix correction."""
+        correction = self._camera_correction
+        if correction is None or not correction.profile_id:
+            return
+        profile = correction.profiles.get_profile("camera", correction.profile_id)
+        reason = phone_profile_mismatch_reason(profile, self._camera_source, metadata)
+        if reason:
+            correction.matrix = correction.dist_coeffs = None
+            correction.applied = False
+            correction.reason = self.camera_calibration_status = reason
+            self.cam_mtx = self.cam_dist = None
+            raise CameraCalibrationChanged(reason)
+
     def _sync_phone_stream(self, cam, metadata):
         key = stable_stream_key(metadata)
         if key != self._camera_stream_key:
@@ -764,6 +795,7 @@ class CVCoreSession:
         self.last_aruco_ids = self.last_aruco_corners = None
         self.frame_time = time.perf_counter()
         self._camera_source_metadata = status
+        self._publish_phone_feedback(None, status, locked=False)
         return FrameBundle(frame_idx=self.frame_idx, cam_bgr=cam,
             warp_w=self.warp_w, warp_h=self.warp_h, grid_w=self.grid_w, grid_h=self.grid_h,
             locked=False, H_use=DEFAULT_H.copy(), mask_cam=None, mask_warp=None,
@@ -772,6 +804,28 @@ class CVCoreSession:
             warp_blur=None, warp_bgr=None, bg_warp_u8=None, motion_warp=None, motion_cam=None,
             shadowfree_cam=None, final_mask_cam=None, marker_mode=self.marker_mode,
             registration_metadata=self.registration_metadata_snapshot(), camera_source_metadata=status)
+
+    def _publish_phone_feedback(self, frame, metadata, *, locked):
+        helper = getattr(self, "_phone_feedback", None)
+        if helper is None:
+            return
+        try:
+            helper.marker_ids = tuple(self.corner_ids[key] for key in ("TL", "TR", "BR", "BL"))
+            view = (fo.get_view_transform_payload() if fo is not None else None)
+            revision = (fo.get_scene_visual_revision() if fo is not None else None)
+            markers = None
+            if frame is not None and getattr(self, "_marker_detection_frame", None) == self.frame_idx:
+                markers = {"sourceSeq": metadata.get("seq"), "corners": self.last_aruco_corners,
+                           "ids": self.last_aruco_ids}
+            helper.publish(frame, metadata, markers=markers, locked=bool(locked), view_key=view, scene_revision=revision,
+                           registration=self.registration_metadata_snapshot())
+            # Tracking cannot execute calibration requests. CPL requests are
+            # explicit phone actions and only alter this diagnostic reference.
+            helper.take_requests()
+        except Exception as exc:
+            # Optional phone guidance must never change tracker measurements.
+            # The phone expires old feedback independently when updates stop.
+            self.phone_feedback_error = str(exc)
 
     @staticmethod
     def _printed_registration_token(config, context):
@@ -933,6 +987,9 @@ class CVCoreSession:
         return np.where(mask > 0, 255, 0).astype(np.uint8)
 
     def _watermark_observation(self, image):
+        if self._watermark_free_phone_source():
+            zero = np.zeros(image.shape[:2], np.uint8)
+            return zero, zero.copy()
         if getattr(self, "_watermark_detector", None) is None:
             from watermark_detection import ObsWatermarkDetector
             self._watermark_detector = ObsWatermarkDetector()
@@ -942,6 +999,48 @@ class CVCoreSession:
         if cv2.countNonZero(glyph) and not cv2.countNonZero(exclusion):
             exclusion = cv2.dilate(glyph, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (23, 23)))
         return glyph, cv2.bitwise_or(exclusion, glyph)
+
+    def _watermark_free_phone_source(self):
+        """Only the owned, validated USB source guarantees watermark-free pixels.
+
+        A profile name, image size, native webcam or recorded file is not proof
+        of that source. Unknown/OBS capture paths retain caption detection.
+        """
+        metadata = getattr(self, "_camera_source_metadata", None) or {}
+        return bool(getattr(self, "_source_is_phone", False)
+                    and not getattr(self, "_source_is_file", False)
+                    and metadata.get("source") == "sarween-phone-usb"
+                    and metadata.get("transport") == "usb")
+
+    def _compute_tracking_pixels(self, cam_bgr):
+        """Registered board pixels without unused legacy background/motion work."""
+        warp_bgr = cv2.warpPerspective(cam_bgr, self.H_saved,
+                                      (int(self.warp_w), int(self.warp_h)))
+        if self._watermark_free_phone_source():
+            # Replace the current state explicitly; old exclusions must not
+            # survive a stream transition or be mistaken for current coverage.
+            glyph_cam = exclusion_cam = None
+            glyph_warp = np.zeros((self.warp_h, self.warp_w), np.uint8)
+            exclusion_warp = np.zeros_like(glyph_warp)
+        else:
+            glyph_cam, exclusion_cam = self._watermark_observation(cam_bgr)
+            glyph_warp = cv2.warpPerspective(glyph_cam, self.H_saved,
+                (self.warp_w, self.warp_h), flags=cv2.INTER_NEAREST)
+            exclusion_warp = self._watermark_project_exclusion(exclusion_cam)
+        self._watermark_mask_cam = glyph_cam
+        self._watermark_mask_warp = glyph_warp
+        self._watermark_current_exclusion_cam = exclusion_cam
+        self._watermark_current_exclusion_warp = exclusion_warp
+        roi = self.last_mask_warp
+        area = max(1, cv2.countNonZero(roi))
+        return {"warp_bgr": warp_bgr, "warp_blur": None, "bg_warp_u8": None,
+                "motion_warp": None, "motion_cam": None,
+                "shadowfree_cam": None, "final_mask_cam": None,
+                "raw_motion_ratio": 0.0, "largest_motion_area": 0.0,
+                "watermark_mask_cam": glyph_cam, "watermark_mask_warp": glyph_warp,
+                "watermark_exclusion_warp": exclusion_warp,
+                "watermark_coverage": cv2.countNonZero(cv2.bitwise_and(glyph_warp, roi)) / area,
+                "watermark_excluded_fraction": cv2.countNonZero(cv2.bitwise_and(exclusion_warp, roi)) / area}
 
     def _watermark_project_exclusion(self, mask):
         projected = cv2.warpPerspective(mask, self.H_saved, (self.warp_w, self.warp_h), flags=cv2.INTER_NEAREST)
@@ -1127,6 +1226,7 @@ class CVCoreSession:
 
         if config is not None and (config["pending"] or config["mode"] == "printed"):
             det_corners, det_ids, _rejected = detect_markers(cam_bgr)
+            self._marker_detection_frame = self.frame_idx
             if config["pending"]:
                 self._printed_marker_controller.consume_detections(det_corners, det_ids,
                     self._printed_view_context, (self.warp_w, self.warp_h))
@@ -1138,6 +1238,7 @@ class CVCoreSession:
         H_view, detected_count, seen_ids, det_corners, det_ids = solve_H_from_markers(
             cam_bgr, self.warp_w, self.warp_h, self.corner_ids
         )
+        self._marker_detection_frame = self.frame_idx
 
         if det_ids is not None and det_corners is not None and len(det_ids) > 0:
             self.last_aruco_ids = det_ids
@@ -1482,10 +1583,12 @@ class CVCoreSession:
                             print("CV_CORE | Camera read failed after retries — stopping.", flush=True)
                             break
 
-                cam = self._maybe_undistort(cam)
                 if getattr(self, "_source_is_phone", False):
                     metadata = self._phone_frame_metadata(True)
                     self._camera_source_metadata = metadata
+                    self._validate_phone_profile_metadata(metadata)
+                cam = self._maybe_undistort(cam)
+                if getattr(self, "_source_is_phone", False):
                     self._sync_phone_stream(cam, metadata)
                     self._phone_has_camera_frame = True
                     self._last_camera_frame = cam
@@ -1507,10 +1610,13 @@ class CVCoreSession:
 
                 locked = (self.last_mask_cam is not None) and (self.last_mask_warp is not None)
                 H_use = self.H_saved
+                if getattr(self, "_source_is_phone", False):
+                    self._publish_phone_feedback(cam, self._camera_source_metadata, locked=locked)
 
                 if locked:
                     try:
-                        shared = self._compute_shared_masks(cam)
+                        shared = (self._compute_tracking_pixels(cam) if getattr(self, "tracking_pixels_only", False)
+                                  else self._compute_shared_masks(cam))
                     except Exception:
                         print("CV_CORE | _compute_shared_masks error (frame "
                               f"{self.frame_idx}):", flush=True)

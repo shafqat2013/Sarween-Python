@@ -11,6 +11,7 @@ import setup
 from camera_sources import PHONE_SOURCE, phone_camera_inventory
 from hardware_profiles import HardwareProfiles
 from tests.test_hardware_selection import DISPLAYS, Variable, Widget
+from tests.test_session_startup import Scheduler
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,8 @@ BUNDLE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BUNDLE)
 PHONE = phone_camera_inventory(devices=[{"id": "test-usb-iphone", "transport": "usb", "label": "Test iPhone"}])[0]
 SOURCE = PHONE["camera_source"]
+WIDE_METADATA = {"deviceId": SOURCE["deviceId"], "fresh": True,
+                 "format": {"lens": "wide", "width": 1080, "height": 1920}}
 NATIVE = {"index": 7, "model": "OBS Virtual Camera", "resolution": "Not opened"}
 
 
@@ -78,7 +81,7 @@ class PhoneSetupTests(unittest.TestCase):
     def test_native_input_refuses_phone_profile_even_after_manual_confirmation(self):
         for module in (setup, BUNDLE):
             with self.subTest(module=module.__name__), environment(module) as (store, _):
-                phone_profile = module.create_phone_profile(store, SOURCE)
+                phone_profile = module.create_phone_profile(store, SOURCE, metadata=WIDE_METADATA)
                 with self.assertRaisesRegex(ValueError, "direct USB"):
                     module._validate_selection(selection(7, phone_profile["id"]), DISPLAYS, [NATIVE], store=store)
                 panel = module.HardwareSelectionPanel(Widget(), store=store)
@@ -100,7 +103,7 @@ class PhoneSetupTests(unittest.TestCase):
         spec.loader.exec_module(bundle_calibration)
         for module in (calibration, bundle_calibration):
             with self.subTest(module=module.__name__), environment(setup) as (store, _):
-                profile = setup.create_phone_profile(store, SOURCE)
+                profile = setup.create_phone_profile(store, SOURCE, metadata=WIDE_METADATA)
                 before = store.get_profile("camera", profile["id"])
                 with patch("hardware_profiles.HardwareProfiles", return_value=store), \
                      patch("camera_sources.open_camera_capture", side_effect=AssertionError("No camera may open")) as capture:
@@ -117,7 +120,14 @@ class PhoneSetupTests(unittest.TestCase):
                 self.assertEqual(panel.create_phone_profile_button.options["state"], "normal")
                 self.assertNotIn(str(PHONE["index"]), panel.webcam_combo.options["values"][0])
                 self.assertFalse(panel.ready)
-                created = panel.create_iphone_profile()
+                scheduler = Scheduler()
+                panel.after, panel.after_cancel = scheduler.after, scheduler.after_cancel
+                capture = Mock(status=WIDE_METADATA)
+                with patch.object(module, "open_camera_capture", return_value=capture):
+                    self.assertTrue(panel.create_iphone_profile())
+                    self.assertFalse(panel.ready)
+                    scheduler.next()
+                created = panel.profile_picker.selected_profile()
                 self.assertNotEqual(created["id"], original["id"])
                 self.assertIsNone(created.get("calibration"))
                 self.assertFalse(created["bindingVerified"])
@@ -125,6 +135,8 @@ class PhoneSetupTests(unittest.TestCase):
                 self.assertEqual(panel.profile_picker.selected_id(), created["id"])
                 self.assertEqual(store.active_profile("camera")["id"], original["id"])
                 self.assertFalse(panel.profile_confirmed.get())
+                capture.read.assert_not_called()
+                capture.release.assert_called_once()
                 panel.profile_confirmed.set(True)
                 module.apply_selection(panel.selection(), DISPLAYS, [PHONE, NATIVE])
                 self.assertEqual(store.active_profile("camera")["id"], created["id"])
@@ -153,7 +165,12 @@ class PhoneSetupTests(unittest.TestCase):
                 with patch("calibration.calibrate_webcam", return_value={"saved": True}) as calibrate:
                     self.assertFalse(panel.calibrate_camera())
                     calibrate.assert_not_called()
-                    created = panel.create_iphone_profile()
+                    scheduler = Scheduler()
+                    panel.after, panel.after_cancel = scheduler.after, scheduler.after_cancel
+                    with patch.object(module, "open_camera_capture", return_value=Mock(status=WIDE_METADATA)):
+                        self.assertTrue(panel.create_iphone_profile())
+                        scheduler.next()
+                    created = panel.profile_picker.selected_profile()
                     self.assertTrue(panel.calibrate_camera())
                     calibrate.assert_called_once_with(PHONE["index"], profile_id=created["id"], access=None,
                         display=DISPLAYS[0], displays=DISPLAYS, camera_source=SOURCE)

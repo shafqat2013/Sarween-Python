@@ -17,7 +17,6 @@ const MIN_CANVAS_ZOOM = 0.1;
 const DEFAULT_DISPLAY_DIAGONAL_INCHES = 55;
 const DEFAULT_GRID_INCHES = 1;
 const VIEWPORT_MARKER_IDS = [10, 11, 12, 13];
-const MARKER_QUIET_ZONE_FRACTION = 1 / 6;
 const MAX_GRID_LABELS = 3000;
 const VISUAL_REFRESH_DELAY_MS = 100;
 const VISUAL_FALLBACK_MS = 350;
@@ -65,6 +64,22 @@ function getSetting(key) {
   return game.settings.get(MODULE_ID, key);
 }
 
+function viewportMarkerGeometry() {
+  // Older clients saved the whole tile size with a fixed one-sixth margin.
+  // Internal sentinels let existing preferences migrate without guessing whether
+  // a newly registered Foundry default was explicitly selected by the user.
+  const legacy = Number(getSetting("viewportMarkerSize"));
+  const savedPattern = Number(getSetting("viewportMarkerPatternSize"));
+  const savedMargin = Number(getSetting("viewportMarkerMargin"));
+  const legacySize = Number.isFinite(legacy) && legacy > 0 ? legacy : 120;
+  const patternSize = Number.isFinite(savedPattern) && savedPattern >= 1
+    ? Math.min(240, savedPattern) : Math.min(240, Math.max(1, legacySize * 2 / 3));
+  const margin = Number.isFinite(savedMargin) && savedMargin >= 0
+    ? Math.min(12, savedMargin) : Math.min(12, legacySize / 6);
+  return {patternSize, margin, size: patternSize + 2 * margin,
+          inset: Number(getSetting("viewportMarkerInset"))};
+}
+
 function log(...args) {
   if (getSetting("debug")) console.log("sarween |", ...args);
 }
@@ -84,7 +99,8 @@ const PHYSICAL_GRID_LIMITS = {
 const VTT_SETTING_RULES = {
   ...PHYSICAL_GRID_LIMITS,
   debug: "boolean", physicalGridAutoApply: "boolean",
-  viewportMarkersEnabled: "boolean", viewportMarkerSize: [72, 240], viewportMarkerInset: [0, 80],
+  viewportMarkersEnabled: "boolean", viewportMarkerSize: [1, 240], viewportMarkerInset: [0, 80],
+  viewportMarkerPatternSize: [1, 240], viewportMarkerMargin: [0, 12],
   animateTokenMovement: "boolean", physicalTapSelection: "boolean", defaultMovementSpeed: [0, 120],
   foundryUIHidden: "boolean", gridLabelsVisible: "boolean",
 };
@@ -110,11 +126,16 @@ function vttState() {
     world: {id: game.world?.id ?? null, name: game.world?.title ?? game.world?.name ?? ""},
     user: {id: game.user?.id ?? null, name: game.user?.name ?? "", isGM: Boolean(game.user?.isGM)},
     paused: Boolean(game.paused),
-    settings: Object.fromEntries(Object.keys(VTT_SETTING_RULES).map(key => [key, getSetting(key)])),
+    settings: {...Object.fromEntries(Object.keys(VTT_SETTING_RULES).map(key => [key, getSetting(key)])),
+      viewportMarkerSize: viewportMarkerGeometry().size,
+      viewportMarkerPatternSize: viewportMarkerGeometry().patternSize,
+      viewportMarkerMargin: viewportMarkerGeometry().margin},
     scene: scene ? {id: scene.id, name: scene.name ?? "", gridSize: Number(scene.grid?.size ?? 0),
       gridType: Number(scene.grid?.type ?? 0), tokenVision: Boolean(scene.tokenVision)} : null,
     tokens,
     actors: listWorldActorChoices(),
+    miniBindings: Object.fromEntries([...miniTokenBindings].filter(([_mini, tokenId]) =>
+      tokens.some(token => token.tokenId === tokenId))),
     minis: CAPTURE_MINIS.map(mini => {
       const matches = tokens.filter(token => token.tokenName.toLowerCase() === mini.tokenName.toLowerCase());
       const assigned = miniTokenBindings.get(mini.miniId);
@@ -196,6 +217,15 @@ function validateVttSettings(settings) {
 async function setVttSettings(settings, requireCurrent) {
   validateVttSettings(settings);
   requireIdleCapture();
+  settings = {...settings};
+  if (Object.hasOwn(settings, "viewportMarkerSize")) {
+    if (!Object.hasOwn(settings, "viewportMarkerPatternSize")) {
+      settings.viewportMarkerPatternSize = Math.max(1, settings.viewportMarkerSize * 2 / 3);
+    }
+    if (!Object.hasOwn(settings, "viewportMarkerMargin")) {
+      settings.viewportMarkerMargin = Math.min(12, settings.viewportMarkerSize / 6);
+    }
+  }
   const changed = Object.entries(settings).filter(([key, value]) => getSetting(key) !== value);
   const previous = Object.fromEntries(changed.map(([key]) => [key, getSetting(key)]));
   // Applying a saved display profile also restores the physical zoom after a
@@ -291,7 +321,7 @@ function startGuidedCapture(values) {
     ...guidedCapture, timer: undefined, scenario: values.scenario, notes: values.notes ?? "",
     moduleVersion: game.modules.get(MODULE_ID)?.version,
     sceneVision: {tokenVision: canvas.scene.tokenVision, fogExploration: canvas.scene.fog?.exploration},
-    markerSettings: {size: getSetting("viewportMarkerSize"), inset: getSetting("viewportMarkerInset")},
+    markerSettings: viewportMarkerGeometry(),
   })) {guidedCapture = null; throw new Error("Could not start capture: connection lost.");}
   publishCaptureState();
 }
@@ -672,8 +702,7 @@ function renderViewportMarkers() {
   removeViewportMarkers();
   if (!getSetting("viewportMarkersEnabled")) return;
 
-  const size = Number(getSetting("viewportMarkerSize"));
-  const inset = Number(getSetting("viewportMarkerInset"));
+  const {size, patternSize, margin, inset} = viewportMarkerGeometry();
   markerOverlayEl = document.createElement("div");
   markerOverlayEl.id = "sarween-viewport-markers";
   markerOverlayEl.style.cssText = `
@@ -691,20 +720,42 @@ function renderViewportMarkers() {
     ["bottom", "left"],
   ];
   VIEWPORT_MARKER_IDS.forEach((id, index) => {
+    const plate = document.createElement("div");
+    plate.dataset.markerId = String(id);
+    plate.style.cssText = `
+      position: absolute;
+      width: ${size}px;
+      height: ${size}px;
+      ${corners[index][0]}: ${inset}px;
+      ${corners[index][1]}: ${inset}px;
+      background: #fff;
+    `;
+    const pattern = document.createElement("div");
+    pattern.style.cssText = `
+      position: absolute;
+      left: ${margin}px;
+      top: ${margin}px;
+      width: ${patternSize}px;
+      height: ${patternSize}px;
+      overflow: hidden;
+    `;
     const image = document.createElement("img");
     image.src = `modules/${MODULE_ID}/viewport_markers/marker_${id}.png`;
     image.alt = "";
     image.dataset.markerId = String(id);
     image.style.cssText = `
       position: absolute;
-      width: ${size}px;
-      height: ${size}px;
-      ${corners[index][0]}: ${inset}px;
-      ${corners[index][1]}: ${inset}px;
+      width: ${patternSize * 1.5}px;
+      height: ${patternSize * 1.5}px;
+      max-width: none;
+      left: ${-patternSize / 4}px;
+      top: ${-patternSize / 4}px;
       image-rendering: pixelated;
       background: #fff;
     `;
-    markerOverlayEl.appendChild(image);
+    pattern.appendChild(image);
+    plate.appendChild(pattern);
+    markerOverlayEl.appendChild(plate);
   });
   document.body.appendChild(markerOverlayEl);
 }
@@ -832,7 +883,7 @@ function visibleGridBounds({safeForCapture = false} = {}) {
   if (!Number.isFinite(gridSize) || gridSize <= 0 || !inverse) return null;
 
   const registration = getViewportRegistration();
-  const markerMargin = Number(getSetting("viewportMarkerSize")) + Number(getSetting("viewportMarkerInset")) + 12;
+  const markerMargin = viewportMarkerGeometry().size + Number(getSetting("viewportMarkerInset")) + 12;
   const area = safeForCapture ? {
     left: Math.max(registration.left, markerMargin),
     top: Math.max(registration.top, markerMargin),
@@ -1105,9 +1156,7 @@ async function handleCaptureStatus(data) {
 }
 
 function getViewportRegistration() {
-  const size = Number(getSetting("viewportMarkerSize"));
-  const inset = Number(getSetting("viewportMarkerInset"));
-  const quietZone = size * MARKER_QUIET_ZONE_FRACTION;
+  const {inset, margin: quietZone} = viewportMarkerGeometry();
   return {
     left: inset + quietZone,
     top: inset + quietZone,
@@ -1300,17 +1349,17 @@ function flushSceneVisualChange(change) {
   if (pendingSceneVisualChange !== change) return;
   cancelPendingSceneVisualChange();
   if (!visualChangeIsCurrent(change) || captureIsActive()) return;
-  const reasons = [...change.reasons], tokenIds = [...change.tokenIds];
+  const reasons = [...change.reasons], tokenIds = [...change.tokenIds], commandIds = [...change.commandIds];
   sendToPython({
     type: "sceneVisualChanged", sceneId: change.sceneId,
     reason: reasons.includes("sarweenTokenMove") ? "sarweenTokenMove"
       : reasons.length === 1 ? reasons[0] : "tokenVisualChanged",
-    reasons, tokenIds, ...(tokenIds.length === 1 ? {tokenId: tokenIds[0]} : {}),
+    reasons, tokenIds, commandIds, ...(tokenIds.length === 1 ? {tokenId: tokenIds[0]} : {}),
     sentAt: Date.now(),
   });
 }
 
-function queueSceneVisualChange(reason, {sceneId = canvas?.scene?.id, tokenId = null, socket = ws} = {}) {
+function queueSceneVisualChange(reason, {sceneId = canvas?.scene?.id, tokenId = null, commandId = null, socket = ws} = {}) {
   if (captureIsActive() || !sceneId || socket !== ws || socket?.readyState !== WebSocket.OPEN
       || !canvas?.ready || canvas.scene?.id !== sceneId) return;
   if (pendingSceneVisualChange && !visualChangeIsCurrent(pendingSceneVisualChange)) {
@@ -1318,7 +1367,7 @@ function queueSceneVisualChange(reason, {sceneId = canvas?.scene?.id, tokenId = 
   }
   let created = false;
   if (!pendingSceneVisualChange) {
-    const change = {sceneId, socket, reasons: new Set(), tokenIds: new Set(),
+    const change = {sceneId, socket, reasons: new Set(), tokenIds: new Set(), commandIds: new Set(),
       fallbackTimer: null, refreshTimer: null};
     pendingSceneVisualChange = change;
     created = true;
@@ -1326,6 +1375,7 @@ function queueSceneVisualChange(reason, {sceneId = canvas?.scene?.id, tokenId = 
   const change = pendingSceneVisualChange;
   change.reasons.add(reason);
   if (tokenId) change.tokenIds.add(tokenId);
+  if (typeof commandId === "string" && commandId && commandId.length <= 128) change.commandIds.add(commandId);
   // A later mutation needs its own perception refresh; an earlier refresh is
   // no longer evidence that the final canvas state has been drawn.
   clearTimeout(change.refreshTimer);
@@ -1335,11 +1385,11 @@ function queueSceneVisualChange(reason, {sceneId = canvas?.scene?.id, tokenId = 
   if (created) change.fallbackTimer = setTimeout(() => flushSceneVisualChange(change), VISUAL_FALLBACK_MS);
 }
 
-function tokenVisualChanged(token, reason) {
+function tokenVisualChanged(token, reason, {commandId = null} = {}) {
   const document = tokenDocument(token);
   if (!document?.id) return;
   const sceneId = document.parent?.id ?? document.scene?.id ?? canvas?.scene?.id;
-  queueSceneVisualChange(reason, {sceneId, tokenId: document.id});
+  queueSceneVisualChange(reason, {sceneId, tokenId: document.id, commandId});
 }
 
 function perceptionRefreshed() {
@@ -1697,17 +1747,35 @@ Hooks.once("init", () => {
   });
 
   registerVttSetting("viewportMarkerSize", {
-    name: "Viewport marker size (pixels)",
-    hint: "Displayed size including the white border. Increase this if the far markers are difficult for the camera to read.",
+    name: "Legacy viewport marker tile size (pixels)",
+    hint: "Compatibility setting for older display profiles. Use pattern width and white margin in Sarween.",
     scope: "client",
     config: false,
     type: Number,
-    range: {min: 72, max: 240, step: 4},
+    range: {min: 1, max: 240, step: 1},
     default: 120,
     onChange: () => {
       renderViewportMarkers();
       scheduleViewTransformSend();
     }
+  });
+
+  registerVttSetting("viewportMarkerPatternSize", {
+    name: "ArUco pattern width (pixels)",
+    hint: "Width of the ArUco pattern, excluding the white margin.",
+    scope: "client", config: false, type: Number,
+    range: {min: 1, max: 240, step: 1},
+    default: 0,
+    onChange: () => {renderViewportMarkers(); scheduleViewTransformSend();},
+  });
+
+  registerVttSetting("viewportMarkerMargin", {
+    name: "White margin per side (pixels)",
+    hint: "White space around each ArUco pattern. Total width is pattern width plus twice this margin.",
+    scope: "client", config: false, type: Number,
+    range: {min: 0, max: 12, step: 1},
+    default: -1,
+    onChange: () => {renderViewportMarkers(); scheduleViewTransformSend();},
   });
 
   registerVttSetting("viewportMarkerInset", {
@@ -2039,7 +2107,7 @@ async function handlePythonMessage(data, socket = ws) {
       await scene.updateEmbeddedDocuments(
         "Token",
         [{ _id: tokenId, x, y }],
-        { animate: getSetting("animateTokenMovement"), sarweenSource: data.source }
+        { animate: getSetting("animateTokenMovement"), sarweenSource: data.source, sarweenCommandId: data.commandId }
       );
       moved = true;
     }
@@ -2047,14 +2115,14 @@ async function handlePythonMessage(data, socket = ws) {
     if (applied.x !== x || applied.y !== y) {
       throw new Error("Foundry did not apply the requested position");
     }
-    reply("tokenMoveApplied", {x: applied.x, y: applied.y});
+    reply("tokenMoveApplied", {x: applied.x, y: applied.y, changed: moved});
   } catch (error) {
     warn(`Failed to move token ${tokenId}:`, error);
     reply("tokenMoveError", {error: String(error?.message ?? error)});
     return;
   }
   log(`Moved token ${tokenId} to (${x}, ${y}) in scene ${scene.id}`);
-  if (moved) queueSceneVisualChange("sarweenTokenMove", {sceneId: scene.id, tokenId, socket});
+  if (moved) queueSceneVisualChange("sarweenTokenMove", {sceneId: scene.id, tokenId, commandId: data.commandId, socket});
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2229,7 +2297,7 @@ Hooks.on("controlToken", (token, controlled) => {
 Hooks.on("updateToken", (document, changes, options = {}) => {
   recordSelectedMovement(document, changes, options);
   if (Object.keys(changes).some(key => /^(x|y|rotation|elevation|hidden|width|height|sight|light)(\.|$)/.test(key))) {
-    tokenVisualChanged(document, options.sarweenSource ? "sarweenTokenMove" : "tokenUpdated");
+    tokenVisualChanged(document, options.sarweenSource ? "sarweenTokenMove" : "tokenUpdated", {commandId: options.sarweenCommandId});
   }
   if (Object.keys(changes).some(key => /^(name|actorId|width|height|sight)(\.|$)/.test(key))) {
     sendSceneAndView(); sendVttState();

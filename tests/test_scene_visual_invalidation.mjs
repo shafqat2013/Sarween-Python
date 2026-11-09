@@ -146,14 +146,31 @@ test("move ACK remains immediate, visual changes coalesce, and idempotent retrie
     tokenId: token.id, miniId: "red10", x: 400, y: 500, source: "detection"};
   await h.api.dispatchPythonMessage(request, h.socket);
   assert.equal(h.sent.find(message => message.commandId === "move-1").type, "tokenMoveApplied");
+  assert.equal(h.sent.find(message => message.commandId === "move-1").changed, true);
   assert.equal(changes(h).length, 0);
   refresh(h); await h.advanceTimers(100);
   assert.equal(changes(h).length, 1);
   assert.equal(changes(h)[0].reason, "sarweenTokenMove");
+  assert.deepEqual(changes(h)[0].commandIds, ["move-1"]);
   await h.api.dispatchPythonMessage({...request, commandId: "retry"}, h.socket);
   assert.equal(h.sent.find(message => message.commandId === "retry").type, "tokenMoveApplied");
+  assert.equal(h.sent.find(message => message.commandId === "retry").changed, false);
   refresh(h); await h.advanceTimers(500);
   assert.equal(changes(h).length, 1);
+});
+
+test("own command provenance survives the update hook while coalesced manual changes remain visible", async () => {
+  const h = await harness(); const token = h.addToken({id: "player"});
+  await h.api.dispatchPythonMessage({type: "moveToken", commandId: "player-move", sceneId: h.scene.id,
+    tokenId: token.id, miniId: "mini1", x: 350, y: 450, source: "base-tracker"}, h.socket);
+  // A manual mutation in the same perception interval must not be disguised by
+  // the primary sarweenTokenMove reason or the valid known command ID.
+  await token.update({x: 351});
+  refresh(h); await h.advanceTimers(100);
+  assert.equal(changes(h).length, 1);
+  assert.deepEqual(changes(h)[0].commandIds, ["player-move"]);
+  assert.deepEqual(new Set(changes(h)[0].reasons), new Set(["sarweenTokenMove", "tokenUpdated"]));
+  assert.deepEqual(changes(h)[0].tokenIds, ["player"]);
 });
 
 test("async replies stay bound to their originating socket without undoing a completed move", async () => {

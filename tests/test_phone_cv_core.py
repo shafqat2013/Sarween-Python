@@ -26,7 +26,8 @@ def meta(session="one", generation=1, seq=0):
             "captureTimeNs": 9_000_000_000_000_000 + seq,
             "hostReceivedMonotonic": 100. + seq / 15,
             "hostReceiveAgeSeconds": .001 * seq, "connected": True, "fresh": True,
-            "format": {"width": 32, "height": 24, "fps": 15, "pixelFormat": "jpeg"}}
+            "format": {"width": 32, "height": 24, "fps": 15, "pixelFormat": "jpeg",
+                       "lens": "wide", "cameraPosition": "back", "zoom": 1}}
 
 
 class PhoneCapture:
@@ -72,7 +73,7 @@ class PhoneCoreTests(unittest.TestCase):
         matrix = np.array([[100., 0, 16], [0, 100., 12], [0, 0, 1]])
         return self.store.save_camera_calibration(profile["id"], matrix, np.zeros(5), (32, 24), rms=.1)
 
-    def create(self, capture, *, profile=None, inject=True):
+    def create(self, capture, *, profile=None, inject=True, tracking_pixels_only=False):
         selection = {"webcam_index": INDEX, "mode": "self_hosted", "camera_profile_id": profile["id"] if profile else None,
                      "camera_source": {"type": PHONE_SOURCE, "deviceId": DEVICE}}
         stack = ExitStack()
@@ -88,7 +89,8 @@ class PhoneCoreTests(unittest.TestCase):
         factory = stack.enter_context(patch.object(core, "open_camera_capture", return_value=capture))
         sleep = stack.enter_context(patch.object(core.time, "sleep"))
         session = core.CVCoreSession(camera_index=INDEX, marker_mode="legacy", warp_w=32, warp_h=24,
-                                      grid_w=8, grid_h=6, camera_capture=capture if inject else None)
+                                      grid_w=8, grid_h=6, camera_capture=capture if inject else None,
+                                      tracking_pixels_only=tracking_pixels_only)
         self.addCleanup(session.close)
         return session, factory, native, sleep
 
@@ -219,6 +221,37 @@ class PhoneCoreTests(unittest.TestCase):
         session, *_ = self.create(capture)
         with self.assertRaisesRegex(CameraCalibrationChanged, "Restart the live session"):
             next(session.frames())
+
+    def test_pixels_only_phone_keeps_real_registered_pixels_and_recording_without_legacy_masks(self):
+        pixels = np.arange(24 * 32 * 3, dtype=np.uint8).reshape(24, 32, 3)
+        capture = PhoneCapture([(meta(seq=0), IMAGE), (meta(seq=1), pixels)])
+        session, *_ = self.create(capture, tracking_pixels_only=True)
+        session._watermark_current_exclusion_warp = np.full((24, 32), 255, np.uint8)
+        session._recorder = Mock()
+        with ExitStack() as stack:
+            legacy = self.lock_pipeline(session, stack)
+            feedback = stack.enter_context(patch.object(session, "_publish_phone_feedback"))
+            watermark = stack.enter_context(patch.object(session, "_watermark_observation",
+                side_effect=AssertionError("OBS search ran on owned USB camera")))
+            stack.enter_context(patch.object(core.fo, "record_timeline_frame"))
+            generator = session.frames()
+            bundle = next(generator)
+            generator.close()
+        expected = cv2.warpPerspective(pixels, session.H_saved, (32, 24))
+        np.testing.assert_array_equal(bundle.cam_bgr, pixels)
+        np.testing.assert_array_equal(bundle.warp_bgr, expected)
+        self.assertTrue(bundle.locked)
+        self.assertEqual(bundle.last_marker_count, 4)
+        self.assertTrue(bundle.camera_source_metadata["freshFrame"])
+        self.assertFalse(np.any(session._watermark_current_exclusion_warp))
+        self.assertIsNone(bundle.motion_cam)
+        self.assertIsNone(bundle.motion_warp)
+        self.assertIsNone(bundle.shadowfree_cam)
+        self.assertIsNone(bundle.final_mask_cam)
+        legacy.assert_not_called()
+        watermark.assert_not_called()
+        feedback.assert_called_once()
+        session._recorder.write.assert_called_once()
 
 
 if __name__ == "__main__":

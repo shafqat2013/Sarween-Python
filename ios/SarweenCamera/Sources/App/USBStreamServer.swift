@@ -5,15 +5,20 @@ struct CameraStreamFormat: Equatable {
     let orientation: CameraOrientation
     let preset: CameraCapturePreset
     let supportedPresets: [CameraCapturePreset]
+    let lens: CameraLens
+    let availableCameras: [CameraLensCapability]
     var width: Int { preset.width(for: orientation) }
     var height: Int { preset.height(for: orientation) }
+    var nativeFieldOfViewDegrees: Double? { availableCameras.first { $0.lens == lens }?.plans[preset]?.fieldOfView }
     var json: [String: Any] {
-        ["width": width, "height": height, "fps": preset.framesPerSecond, "pixelFormat": "jpeg",
+        var result: [String: Any] = ["width": width, "height": height, "fps": preset.framesPerSecond, "pixelFormat": "jpeg",
          "capturePreset": preset.rawValue,
          "orientation": orientation.rawValue, "rotationDegrees": 0, "mirrored": false,
-         "cameraPosition": "back", "lens": "wide", "zoom": 1.0,
+         "cameraPosition": "back", "lens": lens.rawValue, "zoom": 1.0,
          "stabilization": "off", "geometricDistortionCorrection": "off",
          "hdr": "off", "jpegQuality": 0.94, "colorSpace": "sRGB"]
+        if let nativeFieldOfViewDegrees { result["nativeFieldOfViewDegrees"] = nativeFieldOfViewDegrees }
+        return result
     }
 }
 
@@ -23,6 +28,8 @@ final class USBStreamServer {
     var onStatus: ((String) -> Void)?
     var onRequested: ((Bool) -> Void)?
     var onFrameSent: ((UInt64) -> Void)?
+    var onSessionChanged: ((String?) -> Void)?
+    var onFeedback: ((CameraHostFeedback, String) -> Void)?
 
     private let queue = DispatchQueue(label: "com.sarween.camera.usb")
     private let installationID: String
@@ -32,15 +39,19 @@ final class USBStreamServer {
     private var connection: NWConnection?
     private var sessionID: String?
     private var localEnabled = false
+    private var localPreviewRunning = false
+    private var lastActionAt: TimeInterval = -.infinity
     private var controls: [Data] = []
     private var sendingControl = false
     private var decoder = CameraPacketDecoder(maximumIncomingPayload: 0)
 
     init(installationID: String, deviceName: String, orientation: CameraOrientation,
-         preset: CameraCapturePreset = .standard, supportedPresets: [CameraCapturePreset] = [.standard]) {
+         preset: CameraCapturePreset = .standard, supportedPresets: [CameraCapturePreset] = [.standard],
+         lens: CameraLens = .wide, availableCameras: [CameraLensCapability] = []) {
         self.installationID = installationID
         self.deviceName = deviceName
-        self.format = CameraStreamFormat(orientation: orientation, preset: preset, supportedPresets: supportedPresets)
+        self.format = CameraStreamFormat(orientation: orientation, preset: preset, supportedPresets: supportedPresets,
+                                         lens: lens, availableCameras: availableCameras)
     }
 
     func start() {
@@ -71,6 +82,20 @@ final class USBStreamServer {
 
     func stop() { queue.async { [weak self] in self?.stopOnQueue() } }
 
+    func setPreviewRunning(_ running: Bool) {
+        queue.async { [weak self] in self?.localPreviewRunning = running }
+    }
+
+    func sendAction(_ action: CameraPhoneAction, expectedSessionID: String) {
+        queue.async { [weak self] in
+            guard let self, self.sessionID == expectedSessionID, self.connection != nil else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            guard now-self.lastActionAt >= 0.3 else { return }
+            self.lastActionAt = now
+            self.sendControl(["type": "request", "requestId": UUID().uuidString, "action": action.rawValue])
+        }
+    }
+
     func setLocalEnabled(_ enabled: Bool) {
         queue.async { [weak self] in
             guard let self else { return }
@@ -82,10 +107,12 @@ final class USBStreamServer {
     }
 
     func setConfiguration(orientation: CameraOrientation, preset: CameraCapturePreset,
-                          supportedPresets: [CameraCapturePreset]) {
+                          supportedPresets: [CameraCapturePreset], lens: CameraLens = .wide,
+                          availableCameras: [CameraLensCapability] = []) {
         queue.async { [weak self] in
             guard let self else { return }
-            let proposed = CameraStreamFormat(orientation: orientation, preset: preset, supportedPresets: supportedPresets)
+            let proposed = CameraStreamFormat(orientation: orientation, preset: preset, supportedPresets: supportedPresets,
+                                               lens: lens, availableCameras: availableCameras)
             guard self.format != proposed else { return }
             self.format = proposed
             self.disconnect()
@@ -96,6 +123,14 @@ final class USBStreamServer {
         queue.async { [weak self] in
             guard let self, let connection = self.connection,
                   self.sessionID == ticket.sessionID, self.gate.isPending(ticket) else { return }
+            // A delayed callback from the removed camera output must not publish
+            // old-lens pixels into a new stream with identical dimensions.
+            guard frame.metadata["lens"] as? String == self.format.lens.rawValue,
+                  frame.metadata["capturePreset"] as? String == self.format.preset.rawValue,
+                  frame.metadata["nativeFieldOfViewDegrees"] as? Double == self.format.nativeFieldOfViewDegrees else {
+                self.gate.cancel(ticket)
+                return
+            }
             guard frame.width == self.format.width, frame.height == self.format.height else {
                 self.sendStatus("formatError", message: "Unexpected camera dimensions. Pause and resume the camera.")
                 self.gate.cancel(ticket)
@@ -149,9 +184,10 @@ final class USBStreamServer {
             guard let self, let incoming, self.connection === incoming else { return }
             switch state {
             case .ready:
+                self.onSessionChanged?(id)
                 self.sendHello()
                 self.receive(incoming)
-                self.report(self.localEnabled ? "Connected. Waiting for Sarween to start the camera." : "Waiting for camera access on your iPhone.")
+                self.report(self.localEnabled ? "Mac connected." : "Camera paused.")
             case .failed, .cancelled: self.disconnect()
             default: break
             }
@@ -197,9 +233,14 @@ final class USBStreamServer {
             }
             gate.acknowledge(sessionID: sessionID!, sequence: sequence)
         case "ping":
-            var response: [String: Any] = ["type": "pong"]
+            var response: [String: Any] = ["type": "pong", "localPreviewRunning": localPreviewRunning]
             if let request = packet.header["requestId"] { response["requestId"] = request }
             sendControl(response)
+        case "feedback":
+            // An optional newer UI message must never corrupt the JPEG stream.
+            guard let fields = packet.header["feedback"] as? [String: Any],
+                  let feedback = CameraHostFeedback(json: fields), let sessionID else { return }
+            onFeedback?(feedback, sessionID)
         default: throw CameraWireError.invalidHeader
         }
     }
@@ -207,10 +248,12 @@ final class USBStreamServer {
     private func sendHello() {
         sendControl([
             "type": "hello", "deviceName": deviceName, "deviceId": installationID,
-            "sourceId": format.preset.opticalSourceID(installationID: installationID, orientation: format.orientation),
+            "sourceId": format.preset.opticalSourceID(installationID: installationID, orientation: format.orientation, lens: format.lens),
             "captureFormat": format.json, "cameraReady": localEnabled,
+            "hostFeedback": true, "localPreviewRunning": localPreviewRunning,
             "availableCapturePresets": format.supportedPresets.map { $0.capabilityJSON(orientation: format.orientation) },
-            "capabilities": ["ackFrames", "fixedOrientation", "physicalWideCamera"]
+            "availableCameras": format.availableCameras.map { $0.capabilityJSON(orientation: format.orientation) },
+            "capabilities": ["ackFrames", "fixedOrientation", "physicalRearCamera"] + (format.lens == .wide ? ["physicalWideCamera"] : [])
         ])
     }
 
@@ -250,8 +293,10 @@ final class USBStreamServer {
         gate.reset(sessionID: nil)
         controls = []
         sendingControl = false
+        lastActionAt = -.infinity
         previous?.cancel()
         onRequested?(false)
+        onSessionChanged?(nil)
         // Permission prompts and backgrounding also disable local capture. Only the
         // view model knows whether the user actually paused; do not invent that state.
         if listener != nil { report("Connect your iPhone to the Mac and open Sarween.") }

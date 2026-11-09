@@ -43,9 +43,17 @@ def geometry_key(view, shape, calibration=None, registration=None):
     return key
 
 
+def watermark_mode(context):
+    """The owned USB app encodes camera pixels without its on-screen controls."""
+    source = ((context or {}).get("metadata") or {}).get("camera_source") or {}
+    return ("provided" if isinstance(source, dict) and source.get("source") == "sarween-phone-usb"
+            and source.get("transport") == "usb"
+            else "board-template-v1")
+
+
 class LiveObserverController:
     def __init__(self, parent, output_root, *, window_factory=None, mini_count=6,
-                 event_journal_factory=None):
+                 event_journal_factory=None, observation_only=True):
         if window_factory is None:
             from observer_window import ObserverWindow
             window_factory = ObserverWindow
@@ -53,8 +61,10 @@ class LiveObserverController:
         self.output_root = Path(output_root)
         self.folder = self.output_root / f"observer_{stamp}_{uuid.uuid4().hex[:6]}"
         self.folder.mkdir(parents=True)
+        self.observation_only = bool(observation_only)
         self.movement_journal = (event_journal_factory or ObserverEventJournal)(
-            self.folder / "movement-events.jsonl", self.folder.name)
+            self.folder / "movement-events.jsonl", self.folder.name,
+            **({"foundry_token_output": True} if not self.observation_only else {}))
         self._event_generation = None
         self.engine = None
         self.journal = None
@@ -69,14 +79,71 @@ class LiveObserverController:
         self._last_reference_key = None
         self._last_reference = None
         self._reference_count = 0
+        self._pending_display_commands = {}
+        self._pending_superseded_commands = {}
         self.window = window_factory(parent, self.initialize, on_reset=self.reset,
                                      on_record=self.toggle_recording, on_close=self.close,
                                      mini_count=mini_count)
+        self.set_output_status(False, "Foundry movement gated — choose starting positions and assign tokens.")
         self._write_index()
 
     @property
     def is_recording(self):
         return self.journal is not None and not self.journal.closed
+
+    @property
+    def last_processed_timestamp(self):
+        return self._last_processed_timestamp
+
+    @property
+    def binding_generation(self):
+        return (f"{self.folder.name}:generation:{self._event_generation}"
+                if self._event_generation is not None else None)
+
+    @property
+    def display_waiting(self):
+        return bool(self._pending_display_commands or (self.engine and self.engine._display_recovery))
+
+    def set_output_status(self, enabled, message=""):
+        if not self.observation_only and hasattr(self.window, "set_output_status"):
+            self.window.set_output_status(bool(enabled), message)
+
+    def _initialization(self):
+        initialization = deepcopy(self.engine.initialization())
+        initialization["foundry_token_output"] = not self.observation_only
+        return initialization
+
+    def expect_display_change(self, command_id, scene_id, token_id):
+        """Record the local offer on the next camera input for exact replay."""
+        if self.observation_only or self.engine is None or self.engine.needs_reset or not self.engine._acquired:
+            return False
+        if not all(isinstance(value, str) and value and len(value) <= 256
+                   for value in (command_id, scene_id, token_id)):
+            raise ValueError("Expected display commands need command, scene and token IDs")
+        if scene_id != self.engine.geometry.view.get("sceneId"):
+            raise ValueError("Expected display command belongs to a different scene")
+        specification = {"command_id": command_id, "scene_id": scene_id, "token_id": token_id}
+        known = self.engine._known_display_commands.get(command_id)
+        prior = self._pending_display_commands.get(command_id) or (known or {}).get("specification")
+        if prior is not None:
+            if prior != specification:
+                raise ValueError("An expected command cannot change its target")
+            return False
+        self._pending_display_commands[command_id] = specification
+        return True
+
+    def cancel_expected_display_change(self, command_id, replacement_id=None):
+        if self.observation_only or self.engine is None:
+            return False
+        if command_id not in self._pending_display_commands and command_id not in self.engine._known_display_commands:
+            return False
+        self._pending_superseded_commands[command_id] = {
+            "command_id": command_id, "replacement_id": replacement_id}
+        return True
+
+    def _display_policy(self):
+        return ("hold-known-display-changes-v1" if self.observation_only else
+                "continuous-static-map-v1")
 
     def _write_index(self):
         _atomic(self.output_root / "latest.json", _json_bytes({
@@ -84,7 +151,7 @@ class LiveObserverController:
             "status": str((self.folder / "latest.json").resolve()),
             "image": str((self.folder / "latest.jpg").resolve()),
             "movement_event_journal": self.movement_journal.status(),
-            "active": not self.closed, "foundry_token_output": False}))
+            "active": not self.closed, "foundry_token_output": not self.observation_only}))
 
     def _stop_recording(self, reason="userStopped", error=None):
         saved = True
@@ -96,7 +163,10 @@ class LiveObserverController:
                 saved = False
         path = str(self.journal.folder) if self.journal is not None else ""
         if not self.window.closed:
-            self.window.set_recording(False, path)
+            summary = self.journal.status() if self.journal is not None else {}
+            if error is not None or not saved:
+                summary["error"] = str(error or self.error)
+            self.window.set_recording(False, path, summary=summary)
         return saved
 
     def reset(self):
@@ -104,6 +174,8 @@ class LiveObserverController:
         self.movement_journal.end_generation("bindings_reset")
         self._event_generation = None
         self.engine = self.result = None
+        self._pending_display_commands.clear()
+        self._pending_superseded_commands.clear()
         self._last_processed_timestamp = None
         if saved:
             self.error = ""
@@ -118,11 +190,11 @@ class LiveObserverController:
         geometry = BoardGeometry(frozen_context["view"], (frozen_board.shape[1], frozen_board.shape[0]))
         self.engine = ObserverEngine(geometry, positions, geometry_key=frozen_context["geometry_key"],
                                      detector_factory=HybridRingDetector,
-                                     watermark_mode="board-template-v1",
-                                     display_transition_policy="hold-known-display-changes-v1")
+                                     watermark_mode=watermark_mode(frozen_context),
+                                     display_transition_policy=self._display_policy())
         try:
             self._event_generation = self.movement_journal.begin_generation(
-                self.engine.initialization(), reason="initial_bindings")
+                self._initialization(), reason="initial_bindings")
             self._start_recording()
             self._consume(frozen_board, frozen_context)
         except Exception as exc:
@@ -141,8 +213,9 @@ class LiveObserverController:
             raise ValueError("Choose starting positions first")
         self._journal_index += 1
         self.journal = ObserverJournal(self.folder / f"recording_{self._journal_index:03d}",
-                                       self.engine.initialization())
-        self.window.set_recording(True, str(self.journal.folder))
+                                       self._initialization())
+        self.error = ""
+        self.window.set_recording(True, str(self.journal.folder), summary=self.journal.status())
 
     def toggle_recording(self):
         if self.is_recording:
@@ -156,16 +229,40 @@ class LiveObserverController:
         # An independent recording starts from an explicitly settled layout,
         # not a partial state machine whose earlier inputs have been omitted.
         board, context = self.current
+        context = deepcopy(context)
+        if self.engine.display_transition_policy == "continuous-static-map-v1":
+            # The new interval must explain late notifications from commands
+            # already offered before recording restarted. Carry bounded command
+            # provenance as recorded INPUT, never as physical acquisition.
+            specifications = {key: deepcopy(value["specification"])
+                              for key, value in self.engine._known_display_commands.items()}
+            specifications.update(deepcopy(self._pending_display_commands))
+            confirmed = self.engine._confirmed_display_commands & set(specifications)
+            active = set(self.engine._expected_display_commands) | set(self._pending_display_commands)
+            replacements = dict(self.engine._superseded_display_commands)
+            replacements.update({key: row.get("replacement_id")
+                                 for key, row in self._pending_superseded_commands.items()})
+            cancelled = set(specifications) - active - confirmed
+            superseded = [{"command_id": key, "replacement_id": replacements.get(key)
+                           if replacements.get(key) in specifications else None}
+                          for key in (cancelled | set(replacements)) if key in specifications]
+            metadata = context.setdefault("metadata", {})
+            metadata.update(expected_display_commands=list(specifications.values()),
+                            confirmed_command_ids=sorted(confirmed),
+                            unchanged_command_ids=sorted(set(metadata.get("unchanged_command_ids", ())) & confirmed),
+                            superseded_display_commands=superseded)
+            self._pending_display_commands.clear()
+            self._pending_superseded_commands.clear()
         positions = deepcopy(self.engine.mover.positions)
         cells = deepcopy(self.engine.confirmed_cells)
         self.movement_journal.end_generation("input_recording_restarted")
         self.engine = ObserverEngine(self.engine.geometry, positions, cells,
                                      geometry_key=context["geometry_key"],
                                      detector_factory=HybridRingDetector,
-                                     watermark_mode="board-template-v1",
-                                     display_transition_policy="hold-known-display-changes-v1")
+                                     watermark_mode=watermark_mode(context),
+                                     display_transition_policy=self._display_policy())
         self._event_generation = self.movement_journal.begin_generation(
-            self.engine.initialization(), reason="input_recording_restarted")
+            self._initialization(), reason="input_recording_restarted")
         self._last_processed_timestamp = None
         self._start_recording()
         self._consume(board, context)
@@ -174,10 +271,22 @@ class LiveObserverController:
         timestamp = context["timestamp"]
         if self._last_processed_timestamp is not None and timestamp <= self._last_processed_timestamp:
             raise ValueError("Observer capture clock did not advance; choose starting positions again")
+        metadata = context.setdefault("metadata", {})
+        if self._pending_display_commands:
+            metadata["expected_display_commands"] = list(self._pending_display_commands.values())
+        if self._pending_superseded_commands:
+            metadata["superseded_display_commands"] = list(self._pending_superseded_commands.values())
         result = self.engine.process(board, context["mask"], timestamp,
                                      locked=context["locked"], geometry_key=context["geometry_key"],
                                      frame_index=context.get("frame_index"),
-                                     scene_visual_revision=context.get("metadata", {}).get("scene_visual_revision"))
+                                     scene_visual_revision=metadata.get("scene_visual_revision"),
+                                     expected_display_commands=metadata.get("expected_display_commands", ()),
+                                     superseded_display_commands=metadata.get("superseded_display_commands", ()),
+                                     confirmed_command_ids=metadata.get("confirmed_command_ids", ()),
+                                     unchanged_command_ids=metadata.get("unchanged_command_ids", ()),
+                                     scene_visual_change=metadata.get("scene_visual_change"))
+        self._pending_display_commands.clear()
+        self._pending_superseded_commands.clear()
         self._last_processed_timestamp = timestamp
         self.result = result
         # A confirmed movement must not depend on the video budget or the next
@@ -187,13 +296,14 @@ class LiveObserverController:
             recording_folder=str(self.journal.folder) if self.is_recording else None)
         if result.get("needs_reset"):
             self.movement_journal.end_generation(result.get("state", {}).get("reason") or "observer_held")
+            self._event_generation = None
         if self.is_recording:
             try:
                 written = self.journal.append(board, context["mask"], timestamp, result,
                     locked=context["locked"], geometry_key=context["geometry_key"],
                     frame_index=context.get("frame_index"), metadata=context.get("metadata"))
                 if not written:
-                    self.window.set_recording(False, str(self.journal.folder))
+                    self.window.set_recording(False, str(self.journal.folder), summary=self.journal.status())
                     self.error = "Recording limit reached; saved inputs are available for replay."
             except Exception as exc:
                 self._stop_recording("recordingError", error=exc)
@@ -275,7 +385,10 @@ class LiveObserverController:
             f"{acquisition.get('visible_count', 0)}/{acquisition.get('required', 6)} visible · "
             + str(reason).replace("_", " ") if result and result.get("acquired") else
             str(reason).replace("_", " "))
-        if ref.get("message"):
+        # Render references are exported diagnostics, not a prerequisite for
+        # continuous physical observations. Keep their timing messages out of
+        # the live session's primary tracking status.
+        if self.observation_only and ref.get("message"):
             status += " · Reference: " + str(ref["message"])
         status = self._movement_message(status)
         if self.movement_journal.error:
@@ -305,8 +418,13 @@ class LiveObserverController:
         if not force and now - self._last_publish < 1:
             return
         self._last_publish = now
+        if self.is_recording:
+            self.window.update_recording(self.journal.status())
         self.movement_journal.flush()
-        preview = draw_observer_frame(board, result, self.engine.geometry) if result and self.engine else board
+        preview = board
+        if result and self.engine:
+            preview = (draw_observer_frame(board, result, self.engine.geometry) if self.observation_only else
+                       draw_observer_frame(board, result, self.engine.geometry, foundry_token_output=True))
         ok, encoded = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 88])
         if not ok:
             raise OSError("Could not export observer preview")
@@ -322,18 +440,19 @@ class LiveObserverController:
             "fresh_board_pixels": context["metadata"]["fresh_board_pixels"],
             "locked": context["locked"], "message": self._movement_message(status),
             "recording": self.is_recording,
+            "recording_status": self.journal.status() if self.journal is not None else None,
             "recording_folder": str(self.journal.folder) if self.journal else None,
             "reference_status": context["metadata"].get("reference_status"),
             "scene_visual_revision": context["metadata"].get("scene_visual_revision"),
             "movement_event_journal": self.movement_journal.status(),
             "movement_events": self.movement_journal.recent_events(),
             "movement_events_scope": "bounded recent run history; full accepted-move history is in movement_event_journal.path",
-            "observation": result, "foundry_token_output": False, "fog_validated": False}))
+            "observation": result, "foundry_token_output": not self.observation_only, "fog_validated": False}))
 
     def snapshot(self):
-        return {"kind": "live-observer", "foundry_token_output": False,
+        return {"kind": "live-observer", "foundry_token_output": not self.observation_only,
                 "movement_event_journal": self.movement_journal.status(),
-                "initialization": self.engine.initialization() if self.engine else None,
+                "initialization": self._initialization() if self.engine else None,
                 "last_observation": deepcopy(self.result)}
 
     def close(self):
@@ -348,7 +467,7 @@ class LiveObserverController:
         self.closed = True
         try:
             if self.current:
-                self._publish(*self.current, self.result, "Observer closed; Foundry movement remains off.", force=True)
+                self._publish(*self.current, self.result, "Tracking controller closed.", force=True)
         except Exception as exc:
             self.error = f"Observer status could not finish saving: {exc}"
         try:
@@ -356,4 +475,7 @@ class LiveObserverController:
         except Exception as exc:
             self.error = f"Observer location could not finish saving: {exc}"
         if not self.window.closed:
-            self.window.close()
+            if not self.observation_only and hasattr(self.window, "dispose"):
+                self.window.dispose()
+            else:
+                self.window.close()

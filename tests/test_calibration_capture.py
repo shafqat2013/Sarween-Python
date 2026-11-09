@@ -1,11 +1,15 @@
 """Steady, sharp and diverse calibration capture decisions without hardware."""
 
+import json
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
 
-from calibration_capture import CalibrationCaptureGate
+from calibration_capture import CalibrationCaptureGate, CalibrationViewArchive
 
 
 def checker(width=640, height=480):
@@ -235,6 +239,74 @@ class CalibrationCaptureTests(unittest.TestCase):
         self.assertTrue(last["complete"])
         self.assertFalse(self.observe(gate, 2, manual=True)["capture"])
         self.assertEqual(gate.count, 2)
+
+    def test_sweep_selects_clear_varied_moving_views_without_steady_hold(self):
+        gate = CalibrationCaptureGate(total=3, mode="sweep", start_delay=0)
+        for now, position in ((0, (100, 100)), (.4, (210, 100)), (.8, (100, 210))):
+            status = self.observe(gate, now, view=board(offset=position))
+            self.assertTrue(status["capture"], status)
+        self.assertTrue(status["complete"])
+        self.assertEqual(status["holdResets"], 0)
+
+    def test_sweep_rejects_blur_duplicates_and_isolated_misplaced_corners(self):
+        gate = CalibrationCaptureGate(mode="sweep", start_delay=0)
+        self.assertTrue(self.observe(gate, 0)["capture"])
+        self.assertEqual(self.observe(gate, .4)["reason"], "duplicate")
+        shifted = board(offset=(220, 100))
+        blurred = np.full((480, 640), 128, np.uint8)
+        self.assertEqual(self.observe(gate, .8, gray=blurred, view=shifted, manual=True)["reason"], "blur")
+        points, ids = shifted
+        points[10, 0] += (45, 30)
+        self.assertEqual(self.observe(gate, 1.2, view=(points, ids))["reason"], "corner_outlier")
+        self.assertEqual(gate.count, 1)
+        self.assertTrue(self.observe(gate, 1.6, view=board(offset=(220, 100)))["capture"])
+
+    def test_sweep_still_requires_countdown_spacing_and_varied_tilts(self):
+        gate = CalibrationCaptureGate(mode="sweep", start_delay=1)
+        self.assertEqual(self.observe(gate, 0)["reason"], "starting")
+        self.assertTrue(self.observe(gate, 1)["capture"])
+        self.assertEqual(self.observe(gate, 1.1, view=board(offset=(220, 100)))["reason"], "cooldown")
+        self.assertTrue(self.observe(gate, 1.4, view=board(offset=(220, 100)))["capture"])
+        gray = checker(1000, 700)
+        self.assertTrue(self.observe(gate, 1.8, gray=gray, view=board(offset=(100, 350)))["capture"])
+        self.assertEqual(self.observe(gate, 2.2, gray=gray, view=board(offset=(350, 350)))["reason"], "angle")
+        self.assertTrue(self.observe(gate, 2.6, gray=gray,
+            view=board(offset=(350, 350), perspective=(.08, .02)))["capture"])
+
+
+class CalibrationViewArchiveTests(unittest.TestCase):
+    def test_selected_full_size_frames_and_exact_corners_are_bounded_and_auditable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = CalibrationViewArchive("fixture-profile", total=2, root=directory)
+            image = np.dstack([checker()] * 3)
+            points, ids = board()
+            for i in range(2):
+                self.assertTrue(archive.record(image, points + i, ids, capture_seconds=100 + i,
+                    state={"captureMode": "sweep", "sharpness": 100.},
+                    source_metadata={"seq": i, "format": {"lens": "wide"}}))
+            self.assertFalse(archive.record(image, points, ids, capture_seconds=103, state={}))
+            self.assertTrue(archive.finish("saved"))
+            manifest = json.loads((archive.path / "manifest.json").read_text())
+            self.assertEqual(manifest["outcome"], "saved")
+            self.assertEqual(len(manifest["selectedViews"]), 2)
+            self.assertEqual(len(list(archive.path.glob("*.jpg"))), 2)
+            saved = json.loads((archive.path / "view-02.json").read_text())
+            np.testing.assert_array_equal(saved["charucoCorners"], (points + 1).reshape(-1, 2))
+            self.assertEqual(saved["charucoIds"], ids.ravel().tolist())
+            self.assertEqual(saved["source"]["seq"], 1)
+            self.assertEqual(saved["imageSize"], [640, 480])
+            self.assertEqual(cv2.imread(str(archive.path / "view-02.jpg")).shape, image.shape)
+
+    def test_image_write_failure_is_reported_in_manifest_not_called_saved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = CalibrationViewArchive("fixture-profile", root=directory)
+            points, ids = board()
+            with patch("app_paths.atomic_write_bytes", side_effect=OSError("disk full")):
+                self.assertFalse(archive.record(checker(), points, ids, capture_seconds=1., state={}))
+            self.assertFalse(archive.finish("failed"))
+            manifest = json.loads((archive.path / "manifest.json").read_text())
+            self.assertIn("disk full", manifest["error"])
+            self.assertEqual(manifest["selectedViews"], [])
 
 
 if __name__ == "__main__":

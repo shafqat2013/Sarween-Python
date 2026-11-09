@@ -1,4 +1,4 @@
-SARWEEN MINI OBSERVER — LIVE TEST
+SARWEEN SIX-MINI TRACKING — LIVE TEST
 
 Launch the source app as usual:
 
@@ -8,12 +8,73 @@ After a tracker update, fully quit the old Sarween process before running this
 command again. Stopping and restarting only the session does not reload Python
 code. Foundry and OBS may remain open.
 
-PRINTED MARKERS / POLARIZER SETUP (OPTIONAL, PHYSICAL TEST STILL PENDING)
+NORMAL START SESSION — EXPERIMENTAL FOUNDRY TOKEN FOLLOWING
+
+This now uses the shared six-base tracker inside the usual Start session flow.
+It is not a separate tracking mode. Fresh live acceptance, including changing
+fog, remains outstanding; code and replay checks do not establish live accuracy.
+
+1. Click Start session. Choose the TV, Sarween Camera and its matching calibrated
+   USB-camera profile. An OBS profile belongs to a different capture path.
+   Click Next: Foundry and display.
+2. Review the saved world, GM user, TV profile, marker mode, Unpause after joining
+   and Move Foundry to this TV + full screen options. Click Start session.
+   Wait for setup to finish. Follow a manual-placement prompt if macOS cannot
+   place the window. Wait for camera pixels, the Foundry scene and verified lock.
+   Keep the camera, map pan and zoom fixed during this first test. A changed
+   capture path, resolution or orientation needs its matching calibration.
+3. In Mini tracking, click Choose starting positions. The view freezes. Click
+   the CENTER OF EACH BASE/RING once, for six minis. Click order assigns Mini 1
+   through Mini 6. Keep all physical minis still. No individual color scans are
+   needed. Observation and an exact input recording start after the sixth click.
+4. Wait for Bases acquired: 6/6 AND 6/6 visible. Starting clicks alone do not
+   establish detection. While acquiring, the status shows visible and confirmed
+   counts and starting labels stay amber. If acquisition stalls, preserve that
+   failure rather than beginning a movement test.
+5. Open VTT Controls > Assignment. In Player minis > Foundry tokens, choose a
+   different Foundry token for each of Mini 1–6. Click Confirm assignments and
+   wait for 6/6 assignments confirmed. Saved token choices are only hints;
+   confirmation is required for the current scene and starting-position generation.
+   Create any missing scene tokens with Add a Foundry token BEFORE starting the
+   session; token creation is blocked while tracking output is gated.
+6. Keep all six bases visible and still. Sarween initially moves ALL SIX assigned
+   tokens to their physical bases. Wait for initial alignment before moving
+   anything. Token centers follow continuous measured base
+   positions; an uncertain P13/Q13 label does not force a token onto a grid cell.
+7. Move one mini, clear your hand, and wait for the labeled circle, transcript
+   and Foundry token to confirm. Then make another move. A pending delivery or
+   an invisible own-token redraw does not suspend physical movement inference.
+   Leave one mini stationary as a control; preserve any missed or false move.
+8. Stop recording in Mini tracking or with the main Stop Rec button when finished. Tracking and token
+   following continue; use Stop session in the control panel to stop them.
+   Closing the live Mini tracking window only hides it. Open six-mini tracking
+   view brings it back. Starting another input recording can create a new
+   binding generation; confirm assignments again when requested.
+
+Changing token selections in the assignment form invalidates confirmation.
+Physical observations continue while assignments are unconfirmed; token output
+is gated. Confirm the mapping again to align tokens with the CURRENT measured
+physical layout. Physical-tap selection is bypassed on this path.
+The retained legacy detector and legacy grid-move emitter do not run in normal
+Foundry sessions; self-hosted mode and historical regression retain them.
+
+DIAGNOSTIC OBSERVER — FOUNDRY MOVEMENT OFF
+
+Diagnostics > Test mini tracking uses the same guided hardware/Foundry setup and
+shared detector, but Start tracking test opens an explicitly read-only observer.
+Choose six starts and wait for acquisition as above; skip token assignments.
+Foundry tokens stay still. Closing this diagnostic window ends that observation;
+reopen it to continue or stop the session. Its output guard stays on for the
+whole diagnostic session, and old queued token moves are discarded.
+
+PRINTED MARKERS / POLARIZER SETUP (OPTIONAL)
 
 In VTT Controls > Startup, Start Foundry can launch the selected world, join as
-the selected GM and unpause. For the first automatic launch, close a native
-Foundry instance opened outside Sarween once; the startup flow will not replace
-or close another running session. Reload Foundry is also in Startup.
+the selected GM and unpause. An already-open matching world is reused. If its
+module is still connecting, setup waits with progress and continues automatically
+when ready; it can wait up to the normal 150-second startup deadline. Join the
+selected world as Gamemaster and enable its Sarween module if prompted.
+Reload Foundry is also in Startup.
 
 In VTT Controls > Display, select the calibrated TV/display profile and put
 Foundry fullscreen on that TV. Create matching print sheet uses the current
@@ -22,7 +83,7 @@ Size (100%), check the 50 mm ruler and retain the white borders. The supplied
 default sheet matches a 54-inch LCD, 1920x1080 fullscreen viewport, 120-pixel
 markers and 8-pixel inset; generate another sheet if those settings differ.
 
-During steps 1-2 below, before choosing mini starting positions, place paper
+Before choosing mini starting positions, place paper
 20 over screen guide 10, 21 over 11, 22 over 12 and 23 over 13, align
 the card edges, clear your hands, then click Align with screen guides. That is
 your declared placement, not independently measured screen alignment. It saves
@@ -36,30 +97,19 @@ alignment. Keep them flat and close to the LCD plane. Registered paper markers
 allow the screen drawings to be hidden while viewport geometry still updates.
 Changing registration mode or layout requires new mini bindings.
 
-1. On Sarween's home screen, click “Start mini observer”. Use the existing
-   Foundry setup. For the direct USB feed, choose Sarween Camera and its own
-   calibrated USB-camera profile; the OBS profile is a different capture path.
-2. Wait for a camera image, a Foundry scene and verified marker lock. Keep the
-   camera, map pan and zoom fixed during this first test.
-3. In the Mini observer window, click “Choose starting positions”. The view
-   freezes. Click the CENTER OF EACH BASE/RING once, for six minis. Those
-   clicks assign Mini 1 through Mini 6. Keep the physical minis still while
-   choosing. No individual color scans are needed. A new capture path or changed
-   resolution/orientation needs its own camera calibration before this test.
-4. Observation and an input recording start automatically after the sixth
-   click. Those clicks save starting positions; they do not mean the bases have
-   been detected. Keep the minis still until the status says “Bases acquired:
-   6/6” AND “6/6 visible”. While acquiring, the status shows visible and confirmed counts and
-   the starting labels stay amber. If acquisition stalls, preserve that failure
-   instead of beginning a movement test.
-5. Once all six bases are acquired, move one mini, clear your hand and watch
-   its labeled circle and the movement transcript. Foundry tokens will stay
-   still: tracker movement is OFF.
-6. Try several moves, one mini at a time. Leave one mini stationary. For a
-   clean first test, place bases near square centers.
-7. Click “Stop recording” IN THE OBSERVER WINDOW when finished. The observer
-   continues to run and export its latest preview. A later recording can start
-   when all bases are visible and settled.
+The preview and button positions stay fixed when messages change. Ordinary
+status updates are limited to twice per second. Details shows the full recording
+path and recent diagnostics, including the alternating fresh/stale Foundry
+reference messages. The recording area shows elapsed capture time, frames and
+size against the five-minute/2 GB limits. After stopping, its reason remains
+visible independently of the tracking status. “Stop recording action received”
+identifies the callback path; it does not prove an intentional user click.
+
+Current confirmation learns the regular interval between prior observations,
+with a maximum one-second observation gap. It requires two distinct destination
+measurements and retains obstruction, missing identity and outage holds. This
+avoids resetting every frame when processing takes longer than the former
+fixed 0.5-second limit. It does not increase the camera or processing frame rate.
 
 Green means last confirmed position, not a fresh measurement on every frame.
 Amber means held or uncertain. A destination such as P13/Q13 is intentionally
@@ -78,10 +128,6 @@ If marker lock is lost or the scene/viewport/calibration changes, the observer
 holds and asks for starting positions again. Clearing a temporary obstruction
 does not automatically claim positions were observed while hidden.
 
-Closing the observer keeps tracker movement disabled for the rest of that live
-session. Reopen the observer to continue, or stop the session. Starting a normal
-live session is a separate choice. Old pending token moves are cleared.
-
 LIVE FEED WITHOUT DESKTOP CONTROL
 
 The observer uses the camera already owned by Sarween. It does not open a
@@ -92,6 +138,8 @@ exports a rectified TV preview and status for read-only inspection:
 
 That file points to the active run's latest.jpg and latest.json. Check active,
 updated_at, locked and fresh_board_pixels before interpreting an image as live.
+foundry_token_output distinguishes a normal live tracker from a read-only test;
+the Mini tracking status reports whether its assignments/output are armed.
 Verify the preview.sha256 in the run status against latest.jpg: the two files
 are individually atomic, so a reader between writes must retry a mismatched pair.
 Codex can read these files after you launch the updated source app normally.
@@ -103,7 +151,8 @@ checks; a new user-launched live test is still required for the updated tracker.
 
 RECORDINGS AND REPLAY
 
-Observer recordings are separate from the Session tab's normal camera MP4.
+Shared-tracker input recordings are separate from legacy/self-hosted camera MP4s.
+The normal Foundry Session tab and Mini tracking window control the same input journal.
 Each observer run has recording_001, recording_002, etc. Each interval contains:
 
     manifest.json      bindings, mapping, detector/caption mode, source/asset hashes, limits
@@ -141,31 +190,66 @@ transcript.txt. verification_passed means the saved inputs reproduce the live
 software decisions with the same engine. It does not mean the decisions match
 the physical game. Review the video separately for tracking accuracy.
 
-FOG TEST — AFTER THE FIRST MOVEMENT CHECK
+New recordings save their timing policy. Historical recordings without that
+field retain fixed-gap-v1 during replay. To compare the new policy explicitly
+and save derived outputs separately from the original recording:
 
-With all physical minis still, change Foundry vision/fog once. A known visual
-revision now holds the observer with display_changed_rebind_required and emits
-no physical move. It remains held even if old camera pixels look quiet: the
-notification is not synchronized to AirPlay or camera arrival. After visually
-confirming the new display, explicitly choose starting positions again. Then
-make a physical move after fresh acquisition. Preserve the whole test.
+    python observer_journal.py '/absolute/path/to/recording_001' --allow-changed-code --timing-policy bounded-cadence-v1 --preview --output '/absolute/path/to/comparison'
 
-This verifies a known-change safety hold and fresh acquisition after rebinding.
-It is NOT acceptance of automatic tracking through fog changes. Missing visual
-revision metadata is marked unmonitored; silent animation is not covered.
+This is a changed-policy comparison, never exact-version verification. The
+November 9 CPL recording reproduced its original zero moves under the old
+policy; the new policy confirmed five visible relocations, with three grid
+destinations still uncertain. A fresh live test and changing-fog acceptance
+remain outstanding.
 
-This is an experiment: the current shared color/boundary detector and settled
-camera-image reference still assume a substantially static map. Foundry render
-references are now available for analysis, but they are NOT yet used to explain
+New live sessions save continuous-static-map-v1. Physical detections and
+one-mover association continue while token commands are pending or the LCD
+redraw is delayed, faint or invisible. Exact known own-command notifications
+are provenance, never a pixel-change prerequisite. Uncertain visual evidence
+still holds the affected movement; loss of camera lock, changed geometry or an
+unrelated Foundry visual revision requires explicit rebinding. Historical
+v1/v2/v3 redraw policies remain available only for recorded comparisons:
+
+    python observer_journal.py '/absolute/path/to/recording_002' --allow-changed-code --display-transition-policy continuous-static-map-v1 --preview --output '/absolute/path/to/continuous-comparison'
+
+This is an offline comparison: later moves cannot validate Foundry responses
+that were never issued during the original recording. It sends no commands.
+
+STATIC-MAP ACCEPTANCE BEFORE FOG
+
+First verify consecutive complete cycles on a static map: move a physical mini,
+observe its assigned token update, then move a different mini. Repeat across
+the six bases, including repeated moves of the same mini. Record identity,
+order, measured position and false/missed movements. An update with no visible
+LCD difference must not freeze the next physical move. A real loss of visibility
+must hold uncertain evidence rather than invent an identity. Glare and moving
+reflections remain relevant while fog is off.
+
+Then, with all physical minis still, make an unrelated manual vision/fog change.
+This requires new starting positions and assignment confirmation; even a batch
+containing both an own-token change and a manual change must not auto-recover.
+After visually confirming the new display, choose starts, wait for acquisition,
+confirm all six assignments again and make one physical move. Preserve the test.
+The read-only diagnostic observer requires rebinding after any known display
+change; it cannot register an own token command because its output is disabled.
+
+The synthetic feedback harness uses real detection, association, controller and
+outbox code, with camera artwork generated from commands actually sent during
+the test. It covers repeated cycles, delayed or invisible redraws, stale ACKs,
+delivery failures and temporal glare. This is distinct from replaying an old
+recording's control history. Neither synthetic tests nor replay establish live
+Foundry/camera acceptance; keep that gate explicit before fog testing.
+
+This remains an experiment. The shared appearance/boundary detector and settled
+camera reference do not provide general fog segmentation. Foundry render
+references are available for analysis, but they are NOT yet used to explain
 away fog changes in the ring detector. Automatic fog tracking is unproven.
 
 Foundry reference capture is diagnostic at one image every two seconds. Its
 status checks captured geometry, source time and image quality; stale intervals
 are deliberately marked stale. Actual camera/display alignment is unverified.
 
-The updated Foundry module was installed with a backup and reloaded through
-Sarween's supported connection. Actual scene pixels and six warmed captures
-were verified. No relay or capture probe remains running after development.
-
-This candidate is available from source. The installed Sarween desktop bundle
-has not been rebuilt as part of this work.
+This integration is available from source. Reload Foundry after installing the
+updated module, then perform the normal-session acceptance above. No live camera
+or Foundry validation of the new token-following integration is claimed here.
+The installed Sarween desktop bundle has not been rebuilt as part of this work.

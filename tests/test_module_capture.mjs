@@ -111,7 +111,7 @@ assert.equal(sent[0].capture.method, "pixi-stage-render-texture-v1");
 assert.equal(sent[0].capture.sequence, 1);
 assert.equal(referenceTargets[0].destroyed, true);
 assert.equal(snapshotDraws.length, 1);
-assert.deepEqual(snapshotDraws[0].slice(1), [28, 28, 1144, 744, 0, 0, 640, 360]);
+assert.deepEqual(snapshotDraws[0].slice(1), [20, 20, 1160, 760, 0, 0, 640, 360]);
 console.log("PASS: six-mini routes, comparable four-mini subset and scene-switch hooks");
 
 const socket = {readyState: 1, send(raw) {sent.push(JSON.parse(raw));}};

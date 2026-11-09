@@ -69,6 +69,21 @@ class PrintedGeometryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "do not match"):
             pm.guide_aligned_layout(view(), 160, 8)
 
+    def test_independent_white_margin_keeps_guide_pattern_width_unchanged(self):
+        for margin in (0, 6, 12):
+            current = view(margin=8 + margin)
+            expected = pm.guide_aligned_layout(current, inset=8, pattern_size=48, margin=margin)
+            first = np.asarray(expected["markerCorners"]["20"]) * (1920, 1080)
+            np.testing.assert_allclose(first[0], (8 + margin, 8 + margin))
+            np.testing.assert_allclose(first[1] - first[0], (48, 0))
+            corners, ids = detected(expected)
+            self.assertIsNotNone(pm.solve_homography(corners, ids, expected, current, (1280, 720)))
+        # A stale view must never silently reinterpret changed white padding.
+        with self.assertRaisesRegex(ValueError, "do not match"):
+            pm.guide_aligned_layout(view(margin=14), inset=8, pattern_size=48, margin=12)
+        smaller = pm.guide_aligned_layout(view(margin=18), 60, 8)
+        self.assertAlmostEqual((smaller["markerCorners"]["20"][1][0] - smaller["markerCorners"]["20"][0][0]) * 1920, 40)
+
     def test_perspective_fit_maps_actual_lcd_instead_of_paper_hull(self):
         saved = layout()
         corners, ids = detected(saved)

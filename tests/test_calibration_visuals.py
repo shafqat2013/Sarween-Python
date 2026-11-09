@@ -228,6 +228,7 @@ class CalibrationVisualTests(unittest.TestCase):
         self.assertEqual(set(marker_ids.flatten()), set(self.board.getIds().flatten()))
 
     def test_capture_mode_labels_follow_explicit_mode(self):
+        self.assertEqual(calibration_mode_label(True, {"captureMode": "sweep"}), "AUTO SWEEP")
         self.assertEqual(calibration_mode_label(False, {"captureMode": "timed"}), "TIMED (5s)")
         self.assertEqual(calibration_mode_label(True, {"captureMode": "manual"}), "MANUAL")
         self.assertEqual(calibration_mode_label(False, {"captureMode": "auto"}), "AUTO")
@@ -254,6 +255,18 @@ class CalibrationVisualTests(unittest.TestCase):
                 diagnostics=state, countdown=4.2)
             labels = [call.args[1] for call in text.call_args_list]
             self.assertTrue(any("TIMED (5s)" in label and "Next capture in 4.2s" in label for label in labels))
+
+    def test_sweep_preview_prompts_slow_movement_without_steady_hold_metrics(self):
+        state = {"captureMode": "sweep", "reason": "starting", "validCorners": 24,
+                 "stableProgress": 0., "holdResets": 0, "sharpness": 100.}
+        with patch.object(cv2, "putText", wraps=cv2.putText) as text:
+            render_calibration_preview(np.full((720, 1280, 3), 128, np.uint8),
+                captured=0, required=10, detected_corners=24,
+                diagnostics=state, countdown=4.2, auto_capture=True)
+            labels = [call.args[1] for call in text.call_args_list]
+        self.assertTrue(any("AUTO SWEEP" in label for label in labels))
+        self.assertTrue(any("move slowly" in label for label in labels))
+        self.assertFalse(any("Steady:" in label or "Hold resets:" in label or "hold still" in label for label in labels))
 
 
 if __name__ == "__main__":

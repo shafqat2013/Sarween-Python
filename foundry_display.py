@@ -222,9 +222,11 @@ class MacFoundryDisplayBackend:
             if key is not None and candidate != key:
                 return None
             ax = self.ax
-            for attribute in ("AXPosition", "AXSize", "AXFullScreen"):
-                if not ax.settable(window, attribute):
-                    raise RuntimeError("Foundry's window cannot be moved or made full screen through macOS Accessibility.")
+            # A native full-screen window commonly reports its frame as read
+            # only. Check the full-screen control first, then wait for the
+            # normal window before asking whether its frame can be changed.
+            if not ax.settable(window, "AXFullScreen"):
+                raise RuntimeError("Foundry's window cannot be moved or made full screen through macOS Accessibility.")
             if cancelled():
                 return False
             if ax.boolean(window, "AXFullScreen"):
@@ -245,6 +247,8 @@ class MacFoundryDisplayBackend:
             deadline = time.monotonic() + 3
             while True:
                 try:
+                    if not all(ax.settable(window, name) for name in ("AXPosition", "AXSize")):
+                        raise RuntimeError("Foundry's window cannot be moved or made full screen through macOS Accessibility.")
                     for name, kind, value in (
                             ("AXPosition", 1, _Point(display["x"], display["y"])),
                             ("AXSize", 2, _Size(display["width"], display["height"])),

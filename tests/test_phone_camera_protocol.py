@@ -11,7 +11,7 @@ import numpy as np
 
 from phone_camera_protocol import (
     MAX_HEADER_BYTES, MAX_JPEG_BYTES, CameraCancelled, ProtocolError,
-    encode_packet, jpeg_dimensions, read_packet, validate_frame, validate_hello,
+    encode_packet, jpeg_dimensions, read_packet, validate_frame, validate_frame_optics, validate_hello,
 )
 
 
@@ -104,6 +104,26 @@ class CameraProtocolTests(unittest.TestCase):
         for bad in (b"bad", b"\xff\xd8\xff\xd9", b"\xff\xd8\xff\xe0\xff\xff"):
             with self.subTest(bad=bad), self.assertRaises(ProtocolError):
                 jpeg_dimensions(bad)
+
+    def test_physical_lens_and_native_field_of_view_are_bounded(self):
+        for lens in ("wide", "ultra-wide", "telephoto"):
+            value = hello()
+            value["captureFormat"].update(lens=lens, nativeFieldOfViewDegrees=119.5)
+            self.assertEqual(validate_hello(value)["lens"], lens)
+        for changed in ({"lens": "triple"}, {"lens": []}, {"nativeFieldOfViewDegrees": True},
+                        {"nativeFieldOfViewDegrees": float("nan")}, {"nativeFieldOfViewDegrees": 180}):
+            value = hello()
+            value["captureFormat"].update(changed)
+            with self.subTest(changed=changed), self.assertRaises(ProtocolError):
+                validate_hello(value)
+
+    def test_same_resolution_lens_change_cannot_bypass_new_handshake(self):
+        fmt = {"lens": "wide", "zoom": 1.0, "nativeFieldOfViewDegrees": 64.0}
+        validate_frame_optics({}, fmt)  # Original v1 frames lacked redundant optical fields.
+        validate_frame_optics(dict(fmt), fmt)
+        for changed in ({"lens": "ultra-wide"}, {"zoom": 2}, {"nativeFieldOfViewDegrees": 120.0}):
+            with self.subTest(changed=changed), self.assertRaises(ProtocolError):
+                validate_frame_optics(changed, fmt)
 
 
 if __name__ == "__main__":

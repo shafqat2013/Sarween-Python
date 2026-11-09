@@ -22,7 +22,7 @@ import time
 import cv2
 import numpy as np
 
-from observer_engine import BoardGeometry, ObserverEngine, draw_observer_frame
+from observer_engine import BoardGeometry, ObserverEngine, draw_observer_frame, DISPLAY_TRANSITION_POLICIES
 from app_paths import resource_path
 
 
@@ -105,13 +105,24 @@ class ObserverJournal:
                          "created_at": datetime.now(timezone.utc).isoformat(),
                          "initialization": deepcopy(initialization),
                          "code_sha256": code_fingerprints, "frames": 0, "complete": False,
-                         "foundry_token_output": False,
+                         "foundry_token_output": bool(initialization.get("foundry_token_output", False)),
                          "scope": "recorded observer interval only",
                          "byte_count_scope": "PNG and JSONL frame payloads; excludes manifest",
                          "limits": {"seconds": self.max_seconds, "bytes": self.max_bytes}}
         _save_json(self.folder / "manifest.json", self.manifest)
         self._inputs = (self.folder / "inputs.jsonl").open("w")
         self._decisions = (self.folder / "decisions.jsonl").open("w")
+
+    def status(self):
+        """Progress and stop cause for the UI, without rewriting the manifest."""
+        elapsed = (self.last_timestamp - self.first_timestamp
+                   if self.first_timestamp is not None and self.last_timestamp is not None else 0.)
+        return {"recording": not self.closed, "elapsed_seconds": elapsed,
+                "frames": self.frames, "bytes": self.bytes,
+                "limits": {"seconds": self.max_seconds, "bytes": self.max_bytes},
+                "end_reason": self.manifest.get("end_reason"),
+                "limit_reached": self.manifest.get("limit_reached"),
+                "error": self.manifest.get("error")}
 
     def append(self, board, mask, timestamp, record, *, locked=True, geometry_key=None,
                frame_index=None, metadata=None):
@@ -295,7 +306,8 @@ def _write_transcripts(folder, events, first_timestamp, report):
     lines = ["SARWEEN OBSERVER MOVEMENT TRANSCRIPT", "",
              "Times are relative to the first recorded capture frame.",
              "Automatic observations; this transcript is not independent accuracy validation.",
-             "Foundry token movement was OFF.",
+             ("The recorded session permitted Foundry token movement. Replay sends no commands."
+              if report.get("recorded_foundry_token_output") else "Foundry token movement was OFF."),
              f"Replay verification passed: {report['verification_passed']}", ""]
     for event in events:
         elapsed = event["capture_seconds"] - first_timestamp
@@ -309,7 +321,8 @@ def _write_transcripts(folder, events, first_timestamp, report):
     (folder / "transcript.txt").write_text("\n".join(lines) + "\n")
 
 
-def replay_journal(folder, *, require_same_code=True, write_preview=False):
+def replay_journal(folder, *, require_same_code=True, write_preview=False,
+                   timing_policy=None, display_transition_policy=None, output_folder=None):
     folder = Path(folder).resolve()
     manifest = json.loads((folder / "manifest.json").read_text())
     if manifest.get("kind") != "sarween-observer-journal":
@@ -320,6 +333,11 @@ def replay_journal(folder, *, require_same_code=True, write_preview=False):
     if require_same_code and (not same_code or manifest.get("sources_unchanged") is not True):
         raise ValueError("Observer source fingerprints differ from the recording")
     initial = manifest["initialization"]
+    recorded_timing_policy = initial.get("timing_policy", "fixed-gap-v1")
+    selected_timing_policy = recorded_timing_policy if timing_policy is None else timing_policy
+    same_timing_policy = selected_timing_policy == recorded_timing_policy
+    if not same_timing_policy and require_same_code:
+        raise ValueError("A timing-policy comparison requires --allow-changed-code")
     watermark = initial.get("watermark")
     if watermark is not None and (not isinstance(watermark, dict)
                                   or watermark.get("mode") not in ("provided", "board-template-v1")):
@@ -327,12 +345,18 @@ def replay_journal(folder, *, require_same_code=True, write_preview=False):
     display = initial.get("display_transitions", {"policy": "disabled"})
     if not isinstance(display, dict):
         raise ValueError("Unsupported observer display-transition policy")
+    recorded_display_policy = display.get("policy")
+    selected_display_policy = recorded_display_policy if display_transition_policy is None else display_transition_policy
+    same_display_policy = selected_display_policy == recorded_display_policy
+    if not same_display_policy and require_same_code:
+        raise ValueError("A display-transition-policy comparison requires --allow-changed-code")
     engine = ObserverEngine(BoardGeometry(initial["view"], initial["warp_size"]),
                             initial["initial_positions"], initial["initial_cells"],
                             geometry_key=initial.get("geometry_key"),
                             detector_factory=_resolve_detector(initial),
                             watermark_mode=watermark["mode"] if watermark is not None else "provided",
-                            display_transition_policy=display.get("policy"))
+                            display_transition_policy=selected_display_policy,
+                            timing_policy=selected_timing_policy)
     inputs = [json.loads(line) for line in (folder / "inputs.jsonl").read_text().splitlines()]
     decisions = [json.loads(line) for line in (folder / "decisions.jsonl").read_text().splitlines()]
     timestamps = [float(entry["timestamp"]) for entry in inputs]
@@ -344,16 +368,24 @@ def replay_journal(folder, *, require_same_code=True, write_preview=False):
     if not math.isfinite(time_limit) or time_limit <= 0 or duration > time_limit:
         raise ValueError("Observer input timestamps exceed the declared recording interval")
     discrepancies, elapsed = [], []
-    preview = _PreviewWriter(folder, engine.geometry) if write_preview else None
+    output = Path(output_folder).resolve() if output_folder is not None else folder
+    output.mkdir(parents=True, exist_ok=True)
+    preview = _PreviewWriter(output, engine.geometry) if write_preview else None
     preview_metadata = None
     try:
         for index, entry in enumerate(inputs):
             if entry["index"] != index:
                 raise ValueError("Observer inputs must retain their original order")
             board, mask = _read_pixels(folder, entry, "board"), _read_pixels(folder, entry, "mask")
+            metadata = entry.get("metadata") or {}
             started = time.perf_counter()
             record = engine.process(board, mask, entry["timestamp"], locked=entry["locked"],
-                                    scene_visual_revision=(entry.get("metadata") or {}).get("scene_visual_revision"),
+                                    scene_visual_revision=metadata.get("scene_visual_revision"),
+                                    expected_display_commands=metadata.get("expected_display_commands", ()),
+                                    superseded_display_commands=metadata.get("superseded_display_commands", ()),
+                                    confirmed_command_ids=metadata.get("confirmed_command_ids", ()),
+                                    unchanged_command_ids=metadata.get("unchanged_command_ids", ()),
+                                    scene_visual_change=metadata.get("scene_visual_change"),
                                     geometry_key=entry.get("geometry_key"), frame_index=entry.get("frame_index"))
             elapsed.append((time.perf_counter() - started) * 1000)
             if index >= len(decisions) or canonical(record) != canonical(decisions[index]):
@@ -374,9 +406,16 @@ def replay_journal(folder, *, require_same_code=True, write_preview=False):
               "recording_complete": complete,
               "code_matches": same_code, "frame_counts_match": count_matches,
               "loaded_code_matches_disk": loaded_code_matches_disk,
+              "recorded_timing_policy": recorded_timing_policy,
+              "timing_policy": selected_timing_policy, "timing_policy_matches": same_timing_policy,
+              "recorded_display_transition_policy": recorded_display_policy,
+              "display_transition_policy": selected_display_policy,
+              "display_transition_policy_matches": same_display_policy,
               "sources_unchanged": sources_unchanged,
+              "recorded_foundry_token_output": bool(manifest.get("foundry_token_output", False)),
               "identical_decisions": identical,
-              "verification_passed": bool(identical and complete and same_code and sources_unchanged),
+              "verification_passed": bool(identical and complete and same_code and sources_unchanged
+                                          and same_timing_policy and same_display_policy),
               "discrepant_frames": discrepancies, "events": engine.events,
               "capture_duration_seconds": duration,
               "source_clock_origin": timestamps[0] if timestamps else None,
@@ -384,8 +423,8 @@ def replay_journal(folder, *, require_same_code=True, write_preview=False):
               "median_processing_ms": float(np.median(elapsed)) if elapsed else None,
               "scope": "recorded observer interval; not independent tracking accuracy",
               "foundry_token_output": False}
-    _save_json(folder / "replay-verification.json", report)
-    _write_transcripts(folder, engine.events, timestamps[0] if timestamps else 0, report)
+    _save_json(output / "replay-verification.json", report)
+    _write_transcripts(output, engine.events, timestamps[0] if timestamps else 0, report)
     return report
 
 
@@ -396,8 +435,15 @@ if __name__ == "__main__":
                         help="Compare a changed engine, without claiming identical-version reproduction")
     parser.add_argument("--preview", action="store_true",
                         help="Export an annotated replay at source capture-clock speed")
+    parser.add_argument("--timing-policy", choices=("fixed-gap-v1", "bounded-cadence-v1"),
+                        help="Compare a timing policy without modifying the original decisions")
+    parser.add_argument("--display-transition-policy", choices=DISPLAY_TRANSITION_POLICIES,
+                        help="Compare redraw recovery without modifying the original decisions")
+    parser.add_argument("--output", type=Path, help="Write derived replay artifacts to this folder")
     args = parser.parse_args()
     result = replay_journal(args.recording, require_same_code=not args.allow_changed_code,
-                            write_preview=args.preview)
+                            write_preview=args.preview, timing_policy=args.timing_policy,
+                            display_transition_policy=args.display_transition_policy,
+                            output_folder=args.output)
     print(json.dumps(result, indent=2))
     raise SystemExit(0 if result["verification_passed"] else 1)

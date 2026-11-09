@@ -9,7 +9,7 @@ from control_panel import ControlPanel, format_camera_calibration_status
 from hardware_profiles import HardwareProfiles
 from hardware_profiles_ui import (CameraProfilePicker, DisplayProfilePicker,
                                   HardwareProfilesPanel, CAMERA_FIELDS, camera_calibration_status,
-                                  camera_form_values, display_settings)
+                                  camera_form_values, display_settings, marker_total_text, DISPLAY_SETTINGS)
 
 
 class Variable:
@@ -75,6 +75,55 @@ class HardwareProfilesUITests(unittest.TestCase):
         self.assertEqual(picker.message.get(), "Applied 54 inch TV.")
         picker._display.configure.assert_called_once_with(display_id="tv")
         picker._display.place.assert_not_called()
+
+    def test_legacy_profile_applies_normalized_marker_fields_without_mutating_saved_profile(self):
+        picker, profile = self.display_picker()
+        profile = self.store.upsert_profile("display", {"settings": {"viewportMarkerSize": 120}},
+                                            profile_id=profile["id"])
+        before = self.store.path.read_bytes()
+        picker._read_status.side_effect = [ready(), ready(pending=True,
+            pendingRequest={"requestId": "request-one", "action": "settings.set", "sceneId": "scene"})]
+        self.assertTrue(picker.apply_profile())
+        settings = picker._request.call_args.args[1]["settings"]
+        self.assertEqual(settings["viewportMarkerPatternSize"], 80)
+        self.assertEqual(settings["viewportMarkerMargin"], 12)
+        self.assertNotIn("viewportMarkerSize", settings)
+        self.assertEqual(self.store.path.read_bytes(), before)
+        picker.refresh(ready(lastResult={"requestId": "request-one", "action": "settings.set",
+            "sceneId": "scene", "success": True}))
+        self.assertEqual(picker.message.get(), "Applied 54 inch TV.")
+        self.assertEqual(self.store.active_profile("display")["settings"]["viewportMarkerSize"], 120)
+
+    def test_marker_controls_normalize_legacy_values_and_keep_pattern_independent(self):
+        self.assertEqual(display_settings({"viewportMarkerSize": 72}),
+                         {"viewportMarkerPatternSize": 48, "viewportMarkerMargin": 12})
+        self.assertEqual(display_settings({"viewportMarkerPatternSize": "40", "viewportMarkerMargin": "0"}),
+                         {"viewportMarkerPatternSize": 40, "viewportMarkerMargin": 0})
+        self.assertEqual(display_settings({"viewportMarkerPatternSize": 240, "viewportMarkerMargin": 12,
+            "viewportMarkerSize": 264}), {"viewportMarkerPatternSize": 240, "viewportMarkerMargin": 12})
+        self.assertEqual(display_settings({"viewportMarkerMargin": "6"}), {"viewportMarkerMargin": 6})
+        self.assertIn("60 pixels", marker_total_text({"viewportMarkerPatternSize": 48, "viewportMarkerMargin": 6}))
+        self.assertIn("48 pixels", marker_total_text({"viewportMarkerPatternSize": 48, "viewportMarkerMargin": 0}))
+        self.assertEqual(marker_total_text({"viewportMarkerPatternSize": "bad", "viewportMarkerMargin": 6}),
+                         "Total marker width: —")
+        for margin in (-1, 13, float("nan")):
+            with self.subTest(margin=margin), self.assertRaises(ValueError):
+                display_settings({"viewportMarkerMargin": margin})
+
+    def test_loading_legacy_display_editor_shows_canonical_fields_without_writing(self):
+        profile = self.store.upsert_profile("display", {"name": "Legacy TV", "settings": {"viewportMarkerSize": 72}})
+        before = self.store.path.read_bytes()
+        panel = HardwareProfilesPanel.__new__(HardwareProfilesPanel)
+        panel.display_values = {key: Variable() for key in ("name", *DISPLAY_SETTINGS)}
+        panel.display_choice = Variable(profile["name"])
+        panel.include_display = Variable(False)
+        panel._target_display_id = None
+        panel._display_profiles = {profile["name"]: profile}
+        panel.load_display()
+        self.assertEqual(panel.display_values["viewportMarkerPatternSize"].get(), 48)
+        self.assertEqual(panel.display_values["viewportMarkerMargin"].get(), 12)
+        self.assertNotIn("viewportMarkerSize", panel._display_saved_keys)
+        self.assertEqual(self.store.path.read_bytes(), before)
 
     def test_failed_wrong_scene_or_unrelated_reply_never_activates_profile(self):
         for result in ({"requestId": "request-one", "sceneId": "scene", "success": False},

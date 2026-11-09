@@ -1,6 +1,8 @@
 """Observer UI geometry and callback contracts without opening native windows."""
 
 from types import SimpleNamespace
+from collections import deque
+import os
 import unittest
 from unittest.mock import Mock, patch
 
@@ -39,6 +41,15 @@ def window_model(*, initialize=None, count=2):
     window._record_path = ""
     window._event_keys = set()
     window._events = []
+    window._status_clock = Mock(return_value=0.)
+    window._status_started = 0.
+    window._last_status_at = -float("inf")
+    window._status_after_id = None
+    window._pending_status = None
+    window._status_history = deque(maxlen=200)
+    window._last_full_status = None
+    window._record_summary = {}
+    window._details_window = window._details_text = None
     window.canvas = Mock()
     window._image_item = "image"
     window.choose_button = Mock()
@@ -109,6 +120,58 @@ class ObserverSelectionTests(unittest.TestCase):
 
 
 class ObserverCallbackTests(unittest.TestCase):
+    def test_reference_diagnostics_do_not_replace_the_tracking_headline(self):
+        window = window_model()
+        window.set_status("Bases acquired: 6/6 · 6/6 visible · Reference: stale")
+        self.assertEqual(window.status.value, "Bases acquired: 6/6 · 6/6 visible")
+        window.set_status("Bases acquired: 6/6 · 6/6 visible · Reference: recent but alignment unverified")
+        self.assertEqual(window.status.value, "Bases acquired: 6/6 · 6/6 visible")
+        self.assertIn("Reference: stale", window._status_history[0])
+        self.assertIn("alignment unverified", window._status_history[-1])
+
+    def test_live_status_is_throttled_but_errors_and_click_instructions_are_immediate(self):
+        window = window_model()
+        window.set_status("First status", immediate=False)
+        window._status_clock.return_value = .1
+        window.set_status("Second status", immediate=False)
+        window._status_clock.return_value = .2
+        window.set_status("Latest status", immediate=False)
+        self.assertEqual(window.status.value, "First status")
+        window.window.after.assert_called_once()
+        window._status_clock.return_value = .51
+        window._flush_status()
+        self.assertEqual(window.status.value, "Latest status")
+        window._status_clock.return_value = .6
+        window.set_status("Another ordinary status", immediate=False)
+        window.set_status("Observer error: disk full", immediate=False)
+        self.assertEqual(window.status.value, "Observer error: disk full")
+        window.window.after_cancel.assert_called()
+        window._flush_status()
+        self.assertEqual(window.status.value, "Observer error: disk full")
+
+    def test_recording_stop_reason_persists_when_live_status_changes(self):
+        window = window_model()
+        summary = {"elapsed_seconds": 84.86, "frames": 121, "bytes": 167_211_594,
+                   "end_reason": "userStopped", "limits": {"seconds": 300, "bytes": 2_000_000_000}}
+        window.set_recording(False, "/tmp/very/long/recording_001", summary=summary)
+        recorded = window.record_status.value
+        self.assertIn("Stop recording action received", recorded)
+        self.assertIn("01:24", recorded)
+        self.assertIn("121 frames", recorded)
+        window.set_status("Bases acquired: 6/6 · 1/6 visible · Reference: stale")
+        self.assertEqual(window.record_status.value, recorded)
+        self.assertEqual(window._record_path, "/tmp/very/long/recording_001")
+
+    def test_recording_limits_and_save_errors_have_distinct_summaries(self):
+        text = ui.recording_text(False, {"end_reason": "recordingLimit", "limit_reached": "seconds",
+                                         "limits": {"seconds": 300, "bytes": 2_000_000_000}})
+        self.assertIn("time limit (05:00)", text)
+        text = ui.recording_text(False, {"end_reason": "recordingLimit", "limit_reached": "bytes",
+                                         "limits": {"seconds": 300, "bytes": 2_000_000_000}})
+        self.assertIn("size limit (2.0 GB)", text)
+        self.assertIn("Save error", ui.recording_text(False, {"end_reason": "recordingError", "error": "disk full"}))
+        self.assertIn("00:12 / 05:00", ui.recording_text(True, {"elapsed_seconds": 12}))
+
     def test_initialization_callback_gets_frozen_frame_despite_new_video(self):
         callback = Mock(return_value=True)
         window = window_model(initialize=callback)
@@ -193,6 +256,31 @@ class ObserverCallbackTests(unittest.TestCase):
         window.on_close.assert_called_once_with()
         window.parent.destroy.assert_not_called()
 
+    def test_live_tracking_close_hides_and_dispose_stops_the_window(self):
+        window = window_model()
+        window.heading, window.output_status = Value(), Value()
+        window.set_output_status(True, "Foundry movement armed")
+        self.assertEqual(window.heading.value, "Mini tracking")
+        self.assertEqual(window.output_status.value, "Foundry movement armed")
+        window.close()
+        window.window.withdraw.assert_called_once_with()
+        window.window.destroy.assert_not_called()
+        window.on_close.assert_not_called()
+        self.assertFalse(window.closed)
+        window.dispose()
+        window.window.destroy.assert_called_once_with()
+        window.on_close.assert_called_once_with()
+
+    def test_close_cancels_a_pending_status_update(self):
+        window = window_model()
+        window.set_status("One", immediate=False)
+        window._status_clock.return_value = .1
+        window.set_status("Two", immediate=False)
+        window.close()
+        window.window.after_cancel.assert_called_once()
+        window._flush_status()
+        self.assertEqual(window.status.value, "One")
+
     def test_engine_held_list_only_holds_named_mini_and_cell_uncertainty_is_shown(self):
         window = window_model()
         # Exercise the actual renderer with a fake image owner and Tk canvas.
@@ -232,6 +320,54 @@ class ObserverCallbackTests(unittest.TestCase):
         # Canvas coordinates for the physical center itself remain (115, 5).
         oval = window.canvas.create_oval.call_args.args
         self.assertEqual(((oval[0]+oval[2])/2, (oval[1]+oval[3])/2), (115, 5))
+
+
+@unittest.skipUnless(os.environ.get("SARWEEN_GUI_TESTS") == "1", "Native own-Sarween layout check is opt-in")
+class ObserverNativeLayoutTests(unittest.TestCase):
+    def test_messages_paths_and_stop_reasons_cannot_move_preview_or_buttons(self):
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        window = ui.ObserverWindow(root, Mock(), on_record=Mock())
+        try:
+            image = np.zeros((720, 1280, 3), np.uint8)
+            window.update_frame(image, context={"locked": True}, status="Bases acquired: 6/6 · 6/6 visible")
+            def bounds(widget):
+                return (widget.winfo_rootx() - window.window.winfo_rootx(),
+                        widget.winfo_rooty() - window.window.winfo_rooty(),
+                        widget.winfo_width(), widget.winfo_height())
+            for size in ("860x760", "620x500"):
+                window.window.geometry(size)
+                root.update_idletasks()
+                root.update()
+                baseline = [bounds(widget) for widget in
+                            (window.canvas, window.choose_button, window.undo_button, window.record_button)]
+                for index in range(8):
+                    window.set_output_status(index % 2 == 0, "Foundry token following · " + "Delivery status " * 40)
+                    text = "Bases acquired: 6/6 · 6/6 visible" if index % 2 else "A very long status " * 30
+                    window.set_status(text + " · Reference: " + "Reference diagnostics " * 50)
+                    window.set_recording(index % 2 == 0, "/tmp/" + "long recording folder/" * 15,
+                        summary={"frames": index, "elapsed_seconds": index * 10, "bytes": index * 1_000_000,
+                                 "end_reason": None if index % 2 == 0 else "userStopped"})
+                    root.update_idletasks()
+                    self.assertEqual(baseline, [bounds(widget) for widget in
+                                     (window.canvas, window.choose_button, window.undo_button, window.record_button)])
+                self.assertGreaterEqual(window.canvas.winfo_height(), 140)
+                for x, y, width, height in baseline:
+                    self.assertGreaterEqual(x, 0)
+                    self.assertGreaterEqual(y, 0)
+                    self.assertLessEqual(x + width, window.window.winfo_width())
+                    self.assertLessEqual(y + height, window.window.winfo_height())
+            before = bounds(window.canvas)
+            window.show_details()
+            root.update_idletasks()
+            self.assertEqual(bounds(window.canvas), before)
+            contents = window._details_text.get("1.0", "end")
+            self.assertIn("Reference diagnostics", contents)
+            self.assertIn("long recording folder", contents)
+        finally:
+            window.close()
+            root.destroy()
 
 
 if __name__ == "__main__":

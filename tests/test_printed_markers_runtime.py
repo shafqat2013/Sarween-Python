@@ -51,6 +51,17 @@ class PrintedControllerTests(unittest.TestCase):
         self.frames(screen=True)
         self.assertEqual(self.store.active_profile("display")["printedMarkerLayout"]["calibrationMethod"], "co-visible")
 
+    def test_declared_alignment_consumes_independent_pattern_and_margin_settings(self):
+        self.context["view"] = view(margin=14)
+        self.context["settings"].update(viewportMarkerPatternSize=48, viewportMarkerMargin=6)
+        paper = pm.guide_aligned_layout(self.context["view"], inset=8, pattern_size=48, margin=6)
+        self.controller.request_calibration(aligned_to_guides=True)
+        self.frames(paper=paper)
+        saved = self.store.active_profile("display")["printedMarkerLayout"]
+        self.assertIsNotNone(saved)
+        for marker_id, corners in paper["markerCorners"].items():
+            self.assertEqual(saved["markerCorners"][marker_id], corners)
+
     def test_cancel_preserves_previous_profile_and_late_observations_cannot_save(self):
         self.controller.request_calibration()
         self.frames(screen=True, count=1)

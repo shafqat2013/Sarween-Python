@@ -22,6 +22,7 @@ class AcceptedViews:
     """Pose quality is exercised separately by test_calibration_capture."""
     def __init__(self, total, *, automatic=True, **_options):
         self.total, self.automatic = total, automatic
+        self.mode = _options.get("mode", "steady")
         self.count = 0
         self.frames = []
 
@@ -52,6 +53,7 @@ class CameraCalibrationFlowTests(unittest.TestCase):
                 return value
 
             values = {"store": store, "profile": profile, "capture": capture, "gates": gates}
+            values["archive"] = stack.enter_context(patch.object(calibration, "CalibrationViewArchive"))
             stack.enter_context(patch("hardware_profiles.HardwareProfiles", return_value=store))
             stack.enter_context(patch.object(calibration, "NUM_FRAMES", frames))
             stack.enter_context(patch.object(calibration, "CalibrationCaptureGate", side_effect=gate))
@@ -89,6 +91,8 @@ class CameraCalibrationFlowTests(unittest.TestCase):
             self.assertIs(value["solve"].call_args.args[2], board)
             self.assertEqual(len(value["solve"].call_args.args[0]), 3)
             self.assertTrue(all(not manual and np.all(gray == 80) for gray, manual in value["gates"][0].frames))
+            self.assertEqual(value["gates"][0].mode, "sweep")
+            self.assertEqual(value["archive"].return_value.record.call_count, 3)
             self.assertEqual(value["preview"].call_args.args[1], DISPLAYS[0])
             self.assertTrue(all(call.args == (1,) for call in value["keys"].call_args_list))
             value["capture"].release.assert_called_once()
@@ -153,6 +157,24 @@ class CameraCalibrationFlowTests(unittest.TestCase):
         self.assertEqual(displays[1]["y"], -480)
         self.assertEqual(displays[1]["x"], -640)
         self.assertEqual(cameras, [{"index": 2}])
+
+    def test_archive_failure_is_visible_without_falsely_failing_saved_calibration(self):
+        real_save = calibration._save_calibration_diagnostics
+        with self.flow(frames=1) as value:
+            value["archive"].return_value.error = "selected-frame folder is read-only"
+            value["diagnostics"].side_effect = real_save
+            with patch("calibration_diagnostics.CalibrationDiagnostics.save", return_value="fixture-report.json"):
+                saved = self.run_flow(value)
+            self.assertTrue(saved["bindingVerified"])
+            self.assertIn("Selected-view audit incomplete", calibration.last_camera_calibration_message())
+            self.assertIn("read-only", calibration.last_camera_calibration_message())
+
+    def test_attempt_report_write_failure_is_visible_in_setup_summary(self):
+        from calibration_diagnostics import CalibrationDiagnostics
+        diagnostics = CalibrationDiagnostics("fixture", "Fixture")
+        with patch.object(diagnostics, "save", side_effect=OSError("report folder is read-only")):
+            calibration._save_calibration_diagnostics(diagnostics, "cancelled")
+        self.assertIn("Attempt report could not be saved", calibration.last_camera_calibration_message())
 
 
 if __name__ == "__main__":

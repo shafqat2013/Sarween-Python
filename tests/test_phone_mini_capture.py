@@ -71,13 +71,14 @@ class PhoneMiniCaptureTests(unittest.TestCase):
                 ("OBS", DEVICE, False), ("Sarween Camera USB", "different-phone", False),
                 ("Sarween Camera USB", DEVICE, True))):
                 profile = store.upsert_profile("camera", {"name": f"Source {number}",
-                    "sourceHint": hint, "deviceLabel": serial}, select=True)
+                    "sourceHint": hint, "deviceLabel": serial, "lens": "Back wide"}, select=True)
                 matrix = np.array([[100., 0, 16], [0, 100., 12], [0, 0, 1]])
                 store.save_camera_calibration(profile["id"], matrix, np.zeros(5), (32, 24), rms=.1)
                 with self.subTest(hint=hint, serial=serial), \
                      patch.object(minis.s, "load_last_selection", return_value=self.selection(profile["id"])), \
                      patch("hardware_profiles.HardwareProfiles", return_value=store):
-                    result = minis.get_camera_params((32, 24), camera_index=INDEX)
+                    result = minis.get_camera_params((32, 24), camera_index=INDEX,
+                        source_metadata={"deviceId": DEVICE, "format": {"lens": "wide", "width": 32, "height": 24}})
                     self.assertEqual(result[0] is not None, expected)
 
     def test_native_one_off_rejects_usb_profile_but_preserves_confirmed_obs_calibration(self):

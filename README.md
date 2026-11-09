@@ -1,6 +1,11 @@
 # Sarween-Python
 Camera Vision App for TTRPGs
 
+**Working V1 checkpoint — 9 November 2026:** the user confirmed every move was
+picked up in the live static-map test. Recovery tag: `working-v1-2026-11-09`;
+branch: `codex/working-v1`. See [recovery instructions](WORKING_V1.txt).
+Fog-of-war acceptance remains future work.
+
 ## Invitation-only Alpha Login
 
 Sarween now gates live tracking, Foundry connection and recording review behind
@@ -19,7 +24,7 @@ for owner approval/revocation tools, the agreed offline rules and verification.
 Sarween's Foundry module displays ArUco IDs 10-13 as fixed overlays in the four
 screen corners. They remain visible above fog while the GM pans or zooms even on
 maps much larger than the TV. The module sends Foundry's exact canvas transform
-to Python, so camera positions are converted to scene grid cells without moving
+to Python, so camera positions are converted to scene coordinates without moving
 or nudging the map into alignment.
 
 After the module connects, default LCD registration uses the viewport markers.
@@ -30,28 +35,65 @@ initial lock. The legacy tracker can retain its saved homography while three
 visible markers still agree.
 Its viewport-remapping path reseeds the background after a pan and moves each
 already-tracked Foundry token to the cell underneath its stationary physical mini.
-The experimental observer uses stricter registration holds and requires starting
+The shared six-base tracker uses stricter registration holds and requires starting
 positions again after lock or viewport changes.
 
-There are currently two tracking paths:
+### Start a six-mini Foundry session
 
-- **Start live session** uses the legacy tracker, individual appearance profiles
-  and color-based identities. Its ring-size and motion checks reduce some false
-  matches, but reliable tracking through changing fog, digital tokens and hands
-  has not been established.
-- **Start mini observer** uses shared ring/base appearance and one-mini-at-a-time
-  inference. IDs come from clicked starting base centers and movement history;
-  different ring colors are not required for identity. It waits for actual base
-  acquisition and reports held positions and uncertain grid boundaries. Foundry
-  token movement stays **off**. This is an experimental observer, not a promoted
-  replacement for the legacy tracker; fresh live acceptance and changing-fog
-  accuracy remain unverified. See [the observer instructions](OBSERVER_TESTING.txt).
+**Start session** in Foundry mode now uses the experimental shared six-base
+tracker and the existing Foundry delivery pipeline. IDs come from clicked
+starting base centers and one-mini-at-a-time movement history; individual color
+scans are not required. This integration still needs fresh live acceptance,
+including changing fog. Software and replay checks do not establish live accuracy.
+
+1. Click **Start session**. Choose the TV, camera and matching calibrated camera
+   profile, then **Next: Foundry and display**.
+2. Review the world, GM user, display profile, markers, unpause and placement
+   options. Click **Start session**. Follow any placement prompt and wait for
+   Foundry and a verified camera/marker lock.
+3. In **Mini tracking**, click **Choose starting positions**. On its frozen
+   image, click each of the six base/ring centers once. Click order defines
+   **Mini 1–6**. Keep the minis still until **Bases acquired: 6/6** and **6/6 visible**.
+4. Open **VTT Controls → Assignment**. Choose six different Foundry tokens in
+   the **Player minis → Foundry tokens** rows and click **Confirm assignments**.
+   Wait for **6/6 assignments confirmed**. Saved choices are hints; every new
+   starting layout needs explicit confirmation.
+5. Keep all bases visible and still while Sarween initially aligns all six
+   assigned tokens with their physical bases. Then move one mini at a time,
+   clear your hand and wait for confirmation before the next move. Positions
+   remain continuous; uncertain square labels do not force a token onto a grid cell.
+6. Use **Stop session** to stop tracking. Closing the live **Mini tracking**
+   window only hides it; **Open six-mini tracking view** brings it back.
+
+Physical observations continue while Foundry moves tokens, acknowledges commands
+or redraws the screen. An invisible or delayed own-token redraw does not freeze
+mini movement inference. Identity still requires one unambiguous departure and a
+stable measured arrival; glare, occlusion and competing candidates can hold an
+uncertain move. Delivery errors or missing assignment confirmation stop token
+output while retaining physical observations. Reconfirmation aligns tokens with
+the currently measured layout. Lost camera lock, changed geometry or unrelated
+Foundry visual changes require fresh starting positions. This targets static-map
+play first; general fog handling remains unvalidated. There is no physical-tap
+selection on this path. Restarting an input recording can create a new binding
+generation and require confirmation again.
+
+**Diagnostics → Test mini tracking** uses the same detector in an explicitly
+read-only session: Foundry token output stays off. The retained legacy tracker
+still serves self-hosted mode and historical regression work; normal Foundry
+sessions bypass its detector, physical taps and cell-move emission.
+See [the detailed test instructions](OBSERVER_TESTING.txt) for recording and limits.
 
 The legacy roster uses A=Red, B=Blue, C=Yellow, D=Green, and E=White. The saved
 `red10` profile is the legacy tracking identity for Red. These names do not impose
-per-color identity profiles on the six-mini observer.
+per-color identity profiles on the shared six-mini tracker.
 
-When recording is enabled, Sarween creates a video and timeline sidecar in
+The six-mini session automatically records exact tracking inputs after the six
+starting clicks. Its main **Record / Stop Rec** button controls the same input
+recording as the tracking window. **Choose positions again** restarts binding;
+individual appearance scans are retained only for self-hosted sessions. See the
+observer instructions for the input recordings and movement journal.
+
+Legacy video recording creates a video and timeline sidecar in
 `~/Library/Application Support/Sarween/Recordings/` on macOS:
 
 ```text
@@ -82,12 +124,14 @@ the clean display. It does not yet score detection precision or improve live
 tracking. Older recordings have no rendered frames; the original map image
 cannot reconstruct their fog, so this comparison requires a new recording.
 
-Relevant client settings are `Fixed viewport ArUco markers`, `Viewport marker
-size`, `Viewport marker inset`, `Grid square size (inches)`, and `Animate tracked
+Relevant client settings are `Fixed viewport ArUco markers`, `ArUco pattern
+width`, `White margin per side`, `Viewport marker inset`, `Grid square size (inches)`, and `Animate tracked
 token movement`. Animation is on by default; Foundry controls the slide timing.
 The physical grid setting already supports 1.25-inch squares when a larger mini
-setup is desired. The default 120-pixel marker plates are a good starting point;
-increase the size if the far pair is intermittent.
+setup is desired. **VTT Controls → Display → ArUco markers** has independent
+pattern width (1–240 pixels) and white margin per side (0–12 pixels), plus a
+read-only total width: pattern + twice the margin. The former 72-pixel minimum
+is removed. Changing the margin leaves the coded pattern size unchanged.
 
 Both the home window and live control panel have a **VTT Controls** tab. Its
 **Display** page contains **TV grid size**: enter the active screen's diagonal,
@@ -103,7 +147,7 @@ top-left corner of visible square-grid cells, following the scene's grid origin,
 pan, and zoom. Changing label visibility briefly reseeds the tracking background.
 
 The tab also provides a **Startup** page, actor-to-token creation, printed-marker
-alignment, marker size/inset, **Hide Foundry UI**, movement
+alignment, marker pattern/margin/inset, **Hide Foundry UI**, movement
 selection/budget/undo/reset, mini-to-token assignment, guided capture, module
 settings, and **Reload Foundry**. Foundry connects automatically while Sarween's
 local relay is running. Desktop commands are acknowledged and scoped to the
@@ -121,8 +165,11 @@ line remains visible on every VTT page; Startup shows the full connection detail
 Choose **Unpause after joining** and, optionally, **Move to the selected TV + full
 screen**, then click **Start Foundry**. Progress covers world startup, normal
 Foundry login, the Sarween module and the active scene. A matching connected world
-and GM session can be reused. Automatic login into a native instance opened
-outside this flow requires closing Foundry once and starting it here. **Cancel
+and GM session is reused. If Foundry is already open and its module has not yet
+connected, setup keeps waiting with instructions to join the selected world as
+the selected Gamemaster. It continues automatically when that connection is ready,
+including the selected unpause and placement steps. Existing windows can remain
+open; automatic login is available for instances launched by Sarween. **Cancel
 startup** stops automation and leaves Foundry open. Passwords are not saved or
 included in launch arguments. Startup/login uses the owned local Foundry window;
 optional window placement still needs the permission described below.
@@ -171,14 +218,20 @@ final feed dimensions, and lens calibration. Select the camera profile during
 hardware setup and confirm it matches the selected camera and feed. **Calibrate
 camera** generates a matching ChArUco board fullscreen on the display currently
 selected in hardware setup and keeps its preview on a separate monitor. After a five-second
-startup countdown, it captures ten clear, steady, different views automatically.
-Move and tilt the camera relative to the TV, then hold each view still; a printed
-board can be moved and tilted instead. Progress and prompts appear on the TV.
-Keep the lens, zoom, and OBS output fixed. Repeated views, motion, insufficient
-corners, and blur are skipped. **C** or **Space** captures an eligible view now,
-**T** switches to a five-second timer when holding still is awkward. Timed
-capture skips the hold requirement while retaining board-quality and new-view
-checks. **A** switches automatic/manual capture, and **Q** or **Escape** cancels without
+startup countdown, automatic sweep capture selects ten clear, different views
+from the live video. Slowly move and tilt the camera relative to the TV; there
+is no steady-hold countdown for each view. A printed board can be moved and
+tilted instead. Repeated views, insufficient corners, isolated bad corners, and
+blur are skipped. Keep the physical lens, zoom, orientation, and output size
+fixed. A CPL is optional for camera intrinsics: use the setting that leaves the
+board clear and readable. If a clip-on filter changes image geometry or clips
+the view, correct its mounting and verify the resulting calibration.
+Progress and prompts appear on the TV, Mac preview, and the direct USB iPhone
+app. On the phone, **Capture view** requests an eligible frame and **Cancel**
+stops without saving; finishing early cannot bypass the required ten varied
+views. **C** or **Space** also captures an eligible view now. **T** switches to a
+five-second timer. Manual and timed capture retain the same clarity, coverage,
+and new-view checks. **A** switches automatic/manual capture, and **Q** or **Escape** cancels without
 replacing the saved calibration. Results save to the named profile without ten
 additional comparison-window keypresses. Changing optical/feed metadata invalidates its old
 calibration; changing a profile name does not. Exact frame dimensions are checked
@@ -191,12 +244,16 @@ Already-processed recordings remain unchanged on replay. New recordings include
 the actual camera profile/correction status in their timeline sidecar. Switching
 camera profiles affects the next live session.
 
-The capture hold tolerates small hand jitter and changing visible corner subsets.
-A watermark that hides board features can still reduce detection; the preview
-and TV show corner counts, motion, sharpness, and the current blocking reason.
+The sweep selector accepts changing visible corner subsets when enough clear
+corners remain. A watermark that hides board features can still reduce detection;
+the preview and TV show corner counts, sharpness, and the current blocking reason.
 After cancellation, hardware setup shows a short summary. The latest local attempt report
 is saved at `~/Library/Application Support/Sarween/Calibration/last_attempt.json`;
-it contains capture decisions and measurements, without camera images.
+it contains capture decisions and measurements, without camera images. Up to ten
+selected full-resolution JPEGs and the exact solver corner coordinates are saved
+separately under `Calibration/views/<attempt>/`, with a manifest recording whether
+the attempt was cancelled, failed, or saved. Rejected frames and continuous video
+are not saved. An audit-write failure is reported separately from calibration success.
 
 Display profiles save physical grid calibration, marker settings, and an optional
 preferred monitor. Use **Read current Foundry settings** to capture the connected
@@ -258,9 +315,9 @@ are restored when the guide receives the saved acknowledgement. Tracking stays
 paused until `Resume tracking` is clicked. See [the recording checklist](CAPTURE_CHECKLIST.md)
 for the single-mover ring, reflective-dot and polarizer study. Guided updates are
 driven by user confirmations and must not be reported as automatic tracking
-latency. The legacy tracker still uses individual profiles. Single-mover inference
-is implemented separately in the experimental mini observer, with token output
-disabled; automatic white/grey recovery is not implemented.
+latency. This labeled dataset workflow is separate from automatic six-base
+tracking in Start session. The retained legacy tracker still uses individual
+profiles; automatic white/grey recovery is not implemented.
 
 Use **VTT Controls → Display** to toggle all four viewport markers when they
 obstruct a Foundry dialog. LCD registration requires the markers to be restored
@@ -276,12 +333,16 @@ future movements. Resolve these requests in **VTT Controls → Assignment**.
 
 ### Confirmed Foundry Delivery
 
-Sarween 1.5 retains the latest intended cell for each mini until Foundry replies
-with the applied position. Missing acknowledgements and rejected moves receive
+Sarween retains the latest intended destination for each mini until Foundry replies
+with the applied position. The six-base tracker supplies continuous scene-space
+base centers; delivery uses the assigned token's current width and height to
+place its center there. The legacy path supplies grid cells. Missing
+acknowledgements and rejected moves receive
 up to three attempts. After that, the control panel shows a failed move and
 enables `Retry moves`. Assignment and reconnection recover the latest position
-without requiring another physical move. Old paths are not replayed, and
-scene/grid changes discard obsolete intentions.
+without requiring another physical move. Current-generation six-mini assignment
+confirmation is still required before this output is armed. Old paths are not
+replayed, and scene/grid changes discard obsolete intentions.
 
 Reload the Foundry world after updating this module: the Python relay requires
 the version-2 acknowledgement handshake and reports an outdated module instead
@@ -290,6 +351,9 @@ time. Repeated commands for a token already at the target are acknowledged
 without repeating its animation or spending movement allowance again.
 
 ## Mini Library
+
+These appearance profiles belong to the retained legacy tracker. The shared
+six-base Foundry session does not need per-mini color scans.
 
 The control panel's `Mini Library` button opens the player-mini roster. It shows
 all five planned ring colors, whether each mini has a usable tracker profile,
@@ -355,17 +419,17 @@ repeated acknowledgements do not add a movement segment.
 
 Physical tap selection is **paused and off by default** while tracking is being
 resolved. The desktop controls show **Physical tap selection: paused**; use the
-explicit selection controls in **Movement** instead. The experimental observer
-also bypasses tap handling. The retained legacy tap detector can recognize a brief
+explicit selection controls in **Movement** instead. Both shared six-base sessions
+and the read-only diagnostic bypass tap handling. The retained legacy tap detector can recognize a brief
 touch followed by the same mini reappearing, but restoring that feature, double-tap
 actions, attack ranges and aura ranges is deferred.
 
 Scene activation and grid/background edits now resend scene geometry before the
 viewport transform. Python derives row/column counts from the Foundry grid,
 clears old anchors, and discards moves queued for a different scene. Player
-tokens uniquely named Red, Blue, Yellow, Green, and White are automatically
-bound to the corresponding mini identities in each scene. Other token naming
-schemes still use **VTT Controls → Assignment**. Scene padding is included in
+tokens uniquely named Red, Blue, Yellow, Green, and White can supply legacy
+assignment defaults. The six-base tracker always requires explicit Mini 1–6
+confirmation in **VTT Controls → Assignment**, regardless of token names. Scene padding is included in
 movement coordinates. A printed image grid must still be aligned with Foundry's grid;
 Sarween does not infer the intended scale of arbitrary artwork.
 
@@ -562,12 +626,21 @@ Saved token IDs are saved data, not proof of a current Foundry connection.
 - **VTT Controls** shows the relay, Foundry, and scene status alongside the
   display, movement, capture, assignment, and advanced controls. **Start relay**
   starts the local connection; it does not open the camera.
-- **Start live session** or **Start mini observer** opens hardware selection
-  inside the existing **Session** tab. Choose the display, camera, profile and
-  mode, then **Continue**. Foundry mode shows progress and waits for the module
-  and a fresh active scene before starting the camera. A late connection resumes
-  automatically; no second Start click or separate waiting dialog is needed.
-  **Cancel** returns to the idle Session tab; **Change hardware** edits the draft.
+- **Start session** opens a guided setup inside the existing **Session** tab.
+  First choose the TV, camera and camera profile. **Next: Foundry and display**
+  brings together the saved TV profile, screen/printed markers, grid labels,
+  Foundry world and login, unpause and full-screen placement. **Start session**
+  opens or reuses Foundry, starts the relay and waits for confirmed TV settings
+  before connecting the camera. Placement failures pause for manual placement
+  before physical grid sizing is applied. A late module connection resumes here;
+  no second Start click or separate waiting dialog is needed.
+  **Back** edits the draft; **Cancel** returns to the idle Session tab.
+  Saved TVs are restored by a unique name so AirPlay index changes do not switch
+  to another display. An absent or ambiguous TV requires an explicit choice.
+- **Diagnostics** holds **Test mini tracking** (the observation-only experiment),
+  **Open recording…** and **Watch example**. The tracking test uses the same setup
+  flow but never moves Foundry tokens. Setup can still unpause Foundry while
+  the observation-only token-output guard remains enabled.
 - Live controls include **Session**, **Scans**, **Diagnostics**, **Map**, and **VTT Controls**.
   **Stop session** closes tracking and returns to the idle Session tab. Missing profiles
   no longer force an automatic brightness scan; scanning remains explicit.
@@ -751,8 +824,8 @@ opening it. No camera, Foundry session or sign-in is needed for review.
 
 ## Recording Review And Demo
 
-Open Sarween and choose **Watch real example**, **Open your video**, or
-**Start live session**. The example is about 15 seconds of real tabletop footage
+Open Sarween's **Diagnostics** tab and choose **Watch example** or
+**Open recording…**. The example is about 15 seconds of real tabletop footage
 from the owner's approved clips 10 and 11. Surroundings are masked and the
 reflection remains blurred. Original physical marker borders are retained so
 the normal detector can read them. The recording is silent and runs at its
@@ -767,7 +840,7 @@ or the old recording's movement log. **Show settings** reveals tracking setup
 and the movement review controls. Synthetic footage remains only a developer
 test fixture; it is not linked from the app or included in the new bundle.
 
-**Open your video** selects a local file; it does not upload footage. Recordings
+**Open recording…** selects a local file; it does not upload footage. Recordings
 with matching `.tracking.json` and mini profiles are analyzed automatically when
 they have no saved analysis. Reopening a reviewed recording loads its saved
 results without resetting review decisions or completion; **Analyze** explicitly
@@ -896,24 +969,35 @@ changing resolution or orientation, then use a matching camera profile and
 fresh mini bindings. FPS-only calibration reuse depends on retaining the exact
 same format.
 
-In the observer, movement-events.jsonl now preserves accepted moves separately
+In the shared tracker, movement-events.jsonl preserves accepted moves separately
 from video-recording limits and preview refreshes. The latest status exposes
-recent events, the full log location and any pending save error. Known Foundry
-visual changes now hold the observer until explicit rebinding; this is a guard
-for its static-background assumption, not implemented automatic fog tracking.
+recent events, the full log location and any pending save error. Normal Foundry
+sessions keep physical inference independent of their own token updates and
+acknowledgement timing; unrelated changes require explicit rebinding. The read-only
+diagnostic holds after every known display change. General fog separation and
+live changing-fog accuracy remain unverified.
 
 See [the work checkpoint](docs/WORK_STATUS_2026-11-06.md) and the
 [physical acceptance plan](docs/PHYSICAL_ACCEPTANCE.md) for evidence and open work.
 
 ## Backlog
 
+Current coding batch:
+
+1. **Reuse already-open Foundry:** implemented. Setup keeps waiting with
+   connection progress through the normal startup deadline, reuses the matching
+   world and Gamemaster connection, then continues the selected unpause/display
+   steps. Controlled tests pass; acceptance with the running Foundry app remains.
+
 Current priorities, distinguishing implemented software from physical acceptance:
 
 1. **Reliable multi-mini tracking with changing fog:** the main goal remains open.
-   The observer has development regressions and conservative holds, but is not
-   promoted to automatic Foundry movement. The next physical test is blocked on
-   completing the printed-marker/polarizer setup; fresh held-out movement and fog
-   recordings are still needed.
+   Normal Foundry Start session now connects the experimental shared six-base
+   tracker to acknowledged continuous token movement, with explicit assignments
+   and continuous physical observations independent of own-token redraws. This is
+   an integration candidate, not live
+   acceptance. Fresh held-out movement and fog recordings are still needed,
+   including the printed-marker/polarizer setup.
 2. **Printed markers and matching PDF:** software is implemented, including
    profile-sized paper cards, screen-guide alignment and bezel calibration.
    Printing for the 54-inch active LCD, physical alignment and registration through

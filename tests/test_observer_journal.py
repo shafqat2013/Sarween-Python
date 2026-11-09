@@ -85,6 +85,82 @@ class JournalTests(unittest.TestCase):
             self.assertTrue(np.all(pixels[mask > 0] == 255))
             self.assertEqual(int(np.count_nonzero(mask)), 120 * 120)
 
+    def capture_legacy_slow_interval(self, folder):
+        engine = make_engine(timing_policy="fixed-gap-v1")
+        initial = engine.initialization()
+        initial.pop("timing_policy")  # Historical journals had no policy field.
+        journal = ObserverJournal(folder, initial)
+        for index in range(10):
+            pixels = image((100, 100) if index < 4 else (260, 100))
+            timestamp = index * .6
+            row = engine.process(pixels, None, timestamp)
+            journal.append(pixels, None, timestamp, row)
+        journal.close()
+        return engine
+
+    def test_missing_timing_policy_replays_legacy_behavior_instead_of_new_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "legacy"
+            engine = self.capture_legacy_slow_interval(folder)
+            self.assertEqual(engine.events, [])
+            report = replay_journal(folder)
+            self.assertTrue(report["verification_passed"])
+            self.assertTrue(report["identical_decisions"])
+            self.assertEqual(report["timing_policy"], "fixed-gap-v1")
+
+    def test_explicit_timing_comparison_uses_separate_outputs_without_claiming_reproduction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "legacy"
+            self.capture_legacy_slow_interval(folder)
+            originals = {name: (folder / name).read_bytes()
+                         for name in ("manifest.json", "inputs.jsonl", "decisions.jsonl")}
+            with self.assertRaisesRegex(ValueError, "timing-policy comparison"):
+                replay_journal(folder, timing_policy="bounded-cadence-v1")
+            output = Path(directory) / "candidate"
+            report = replay_journal(folder, timing_policy="bounded-cadence-v1",
+                                    require_same_code=False, output_folder=output)
+            self.assertFalse(report["verification_passed"])
+            self.assertFalse(report["timing_policy_matches"])
+            self.assertEqual(len(report["events"]), 1)
+            self.assertEqual(report["events"][0]["to_cell"], "G3")
+            self.assertTrue((output / "transcript.txt").is_file())
+            self.assertFalse((folder / "transcript.txt").exists())
+            for name, value in originals.items():
+                self.assertEqual((folder / name).read_bytes(), value)
+
+    def test_redraw_policy_comparison_is_explicit_and_preserves_original_recording(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder, output = Path(directory) / "recorded", Path(directory) / "candidate"
+            engine = make_engine(display_transition_policy="recover-expected-display-changes-v1")
+            journal = ObserverJournal(folder, engine.initialization())
+            for index in range(6):
+                metadata = {"scene_visual_revision": 0}
+                row = engine.process(image(), None, index * .125, **metadata)
+                journal.append(image(), None, index * .125, row, metadata=metadata)
+            journal.close()
+            originals = {name: (folder / name).read_bytes()
+                         for name in ("manifest.json", "inputs.jsonl", "decisions.jsonl")}
+            with self.assertRaisesRegex(ValueError, "display-transition-policy comparison"):
+                replay_journal(folder, display_transition_policy="recover-expected-display-changes-v2")
+            legacy = replay_journal(folder, output_folder=Path(directory) / "control")
+            self.assertTrue(legacy["verification_passed"])
+            self.assertEqual(legacy["display_transition_policy"], "recover-expected-display-changes-v1")
+            candidate = replay_journal(folder, display_transition_policy="recover-expected-display-changes-v2",
+                                       require_same_code=False, output_folder=output)
+            self.assertEqual(candidate["recorded_display_transition_policy"], "recover-expected-display-changes-v1")
+            self.assertEqual(candidate["display_transition_policy"], "recover-expected-display-changes-v2")
+            self.assertFalse(candidate["display_transition_policy_matches"])
+            self.assertFalse(candidate["verification_passed"])
+            self.assertFalse(candidate["foundry_token_output"])
+            current = replay_journal(folder, display_transition_policy="recover-expected-display-changes-v3",
+                                     require_same_code=False, output_folder=Path(directory) / "candidate-v3")
+            self.assertEqual(current["display_transition_policy"], "recover-expected-display-changes-v3")
+            self.assertFalse(current["display_transition_policy_matches"])
+            self.assertFalse(current["verification_passed"])
+            self.assertFalse(current["foundry_token_output"])
+            for name, value in originals.items():
+                self.assertEqual((folder / name).read_bytes(), value)
+
     def test_lock_loss_and_geometry_change_replay_the_same_latched_holds(self):
         with tempfile.TemporaryDirectory() as directory:
             for name, options, reason in (
@@ -219,6 +295,10 @@ class JournalTests(unittest.TestCase):
             self.assertTrue(journal.closed)
             self.assertEqual(journal.frames, 3)
             self.assertEqual(journal.manifest["limit_reached"], "seconds")
+            self.assertEqual(journal.status()["end_reason"], "recordingLimit")
+            self.assertEqual(journal.status()["elapsed_seconds"], .25)
+            self.assertEqual(journal.status()["frames"], 3)
+            self.assertFalse(journal.status()["recording"])
             self.assertTrue(replay_journal(journal.folder)["verification_passed"])
 
     def test_byte_limit_rejects_entire_png_pair_before_any_excess_write(self):

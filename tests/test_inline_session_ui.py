@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import tests.test_app_observer_entry as entry_tests
 
@@ -26,8 +26,24 @@ class NativeInlineSessionTests(unittest.TestCase):
         self.stack.enter_context(patch("cv2.VideoCapture", side_effect=AssertionError("UI test opened camera")))
         self.stack.enter_context(patch("foundryoutput.request_scene_info"))
         self.stack.enter_context(patch("foundryoutput.set_observation_only"))
+        def foundry_step(parent, **kwargs):
+            from guided_foundry_setup import GuidedFoundrySetup
+            from foundry_startup import DEFAULTS
+            from hardware_profiles import HardwareProfiles
+            controller = Mock()
+            controller.defaults.return_value = {**DEFAULTS, "worldId": "testing", "username": "Gamemaster"}
+            controller.worlds.return_value = [{"id": "testing", "name": "Testing"}]
+            guide = GuidedFoundrySetup(parent, controller=controller,
+                store=HardwareProfiles(Path(self.directory) / "profiles.json"), **kwargs)
+            # Render real controls; asynchronous launch/ack has separate tests.
+            guide.coordinator.validate = lambda choices: choices
+            guide.coordinator.begin = lambda choices: True
+            guide.coordinator.poll = lambda: {"phase": "ready", "ready": True,
+                "message": "Foundry ready", "error": None, "warning": ""}
+            return guide
         self.app._startup_factory = lambda parent, **kwargs: SessionStartupUI(parent,
-            inventory_loader=lambda: (self.displays, self.cameras), **kwargs)
+            inventory_loader=lambda: (self.displays, self.cameras),
+            foundry_setup_factory=foundry_step, **kwargs)
 
         class Service:
             running = False
@@ -108,6 +124,14 @@ class NativeInlineSessionTests(unittest.TestCase):
                     for name in ("continue_button", "cancel_button", "refresh_button"):
                         self.assert_visible_inside_root(name, getattr(ui, name))
                     self.assertTrue(ui.selector.ready)
+                    ui.continue_button.invoke()
+                    self.assertEqual(ui.phase, "foundry_setup")
+                    self.assert_one_window()
+                    self.assertGreaterEqual(ui.selector.master._scroll_canvas.winfo_height(), 150)
+                    self.assertFalse(ui.refresh_button.winfo_ismapped())
+                    for name in ("continue_button", "cancel_button", "edit_button"):
+                        self.assert_visible_inside_root("foundry-" + name, getattr(ui, name))
+                    self.assertEqual(ui.foundry_setup.world_choice.get(), "Testing (testing)")
                     ui.continue_button.invoke()
                     self.assertEqual(calls, [])
                     for phase, heading in (("waiting_module", "Waiting for the Foundry module"),
