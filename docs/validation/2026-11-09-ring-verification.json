@@ -1,0 +1,130 @@
+{
+  "date": "2026-11-09",
+  "status": "Implemented; fresh live fog acceptance pending",
+  "working_v1": {
+    "tag": "working-v1-2026-11-09",
+    "commit": "5745cd66bdf5c13b840a3605e8b4d77ac4694861",
+    "unchanged": true
+  },
+  "implementation": [
+    "All proposal sources pass measured diameter, annular-band geometry and sampled-ring color checks before arbitration.",
+    "Named appearance compatibility constrains both old-position presence and the inferred mover destination; identity still requires a single unambiguous departure.",
+    "Unexplained extras preserve uncertainty and cannot update the background, including extras appearing during acquisition.",
+    "Local anchor searches use the same verifier and widen immediately on missing or ambiguous evidence; periodic full-board audits run independently of movement confirmation.",
+    "Whole-board background adaptation is disabled on local-only observations."
+  ],
+  "python_tests": {
+    "run": 1336,
+    "skipped": 18,
+    "failures": 0,
+    "errors": 0
+  },
+  "recorded_regression": {
+    "scope": "Saved-camera open-loop regression. Changed tracker outputs do not generate new Foundry redraws. Live fog acceptance remains required.",
+    "frames": 868,
+    "reviewed_physical_moves": 15,
+    "baseline_matched": 12,
+    "current_matched": 15,
+    "unmatched_events": 0,
+    "exact_cell_accuracy_validated": false,
+    "cases": {
+      "working": {
+        "frames": 303,
+        "reviewed_physical_moves": 7,
+        "baseline_matched": 7,
+        "final_matched": 7,
+        "unmatched_events": 0,
+        "pass": true
+      },
+      "failure1": {
+        "frames": 457,
+        "reviewed_physical_moves": 6,
+        "baseline_matched": 4,
+        "final_matched": 6,
+        "unmatched_events": 0,
+        "pass": true
+      },
+      "failure2": {
+        "frames": 108,
+        "reviewed_physical_moves": 2,
+        "baseline_matched": 1,
+        "final_matched": 2,
+        "unmatched_events": 0,
+        "pass": true
+      }
+    }
+  },
+  "cpu": {
+    "scope": "Alternate old/new stationary engine frames, then time a departed-ring search.\n\nEach engine sees the same exact saved frames and metadata in the same order.\nThe separate departure probe calls only the detectors using unchanged starting\npositions and a later real camera frame; it measures immediate wide fallback,\nnot movement accuracy or end-to-end latency.\n",
+    "opencv_threads": 1,
+    "cases": {
+      "working": {
+        "stationary_engine": {
+          "frames": 29,
+          "old_median_cpu_ms": 189.47300000000044,
+          "new_median_cpu_ms": 103.85200000000071,
+          "median_paired_ratio": 0.5475555317954635,
+          "new_search_counts": {
+            "local": 20,
+            "full": 9
+          },
+          "new_fallback_counts": {}
+        },
+        "departure_detector": {
+          "source_input_index": 138,
+          "old_median_cpu_ms": 163.30700000000144,
+          "new_median_cpu_ms": 234.47499999999977,
+          "fallback_reasons": [
+            "anchor_missing_or_ambiguous",
+            "anchor_missing_or_ambiguous",
+            "anchor_missing_or_ambiguous"
+          ]
+        }
+      },
+      "fog": {
+        "stationary_engine": {
+          "frames": 25,
+          "old_median_cpu_ms": 196.68199999999914,
+          "new_median_cpu_ms": 104.19499999999893,
+          "median_paired_ratio": 0.5325639770443017,
+          "new_search_counts": {
+            "local": 18,
+            "full": 7
+          },
+          "new_fallback_counts": {}
+        },
+        "departure_detector": {
+          "source_input_index": 60,
+          "old_median_cpu_ms": 310.11099999999914,
+          "new_median_cpu_ms": 380.1419999999993,
+          "fallback_reasons": [
+            "anchor_missing_or_ambiguous",
+            "anchor_missing_or_ambiguous",
+            "anchor_missing_or_ambiguous"
+          ]
+        }
+      }
+    },
+    "end_to_end_fps_validated": false
+  },
+  "code_sha256": {
+    "observer_engine.py": "03dc869125d989ecbe7a826a6558bbb62ba834d0b2b59fc921fa559c1ee64dc5",
+    "single_mover_state.py": "d5c7d654e8b7982d7adf7fb1d369c20c85394b2c94d95bb6a4dcbd23eeecb330",
+    "poc_scene_reference.py": "8fab6009e0eb4527266ea7e6f62c1f643ded7a8384c482b3915dfff7bc8f0650",
+    "hybrid_ring_detector.py": "39aad5f673768e75ac8937056db773f7fcdf33fb115dfbe4ed724ee71e900d85",
+    "annular_ring_detector.py": "c002e2a327fe83793f9ff02bfedb7e75c61208a3f0a6f739528b6cd0e97e8e88",
+    "poc_ring_detector.py": "3810a654231608b6f51f57ba63ed77feac5d2bb5fa29b927807f81cd69324b6d"
+  },
+  "avatar_template_probe": {
+    "implemented_in_live_tracker": false,
+    "method": "Manually cropped rendered-avatar image compared with candidate color patterns in three nearby saved frames.",
+    "exposed_avatar_similarity_range": [
+      0.9145,
+      0.9178
+    ],
+    "highest_physical_ring_similarity": 0.3689,
+    "scope": "One avatar and lighting setup; production catalog, threshold and occlusion handling remain unvalidated."
+  },
+  "local_evidence_directory": "artifacts/ring-verification-validation-20261109",
+  "live_acceptance": "Restart source app, keep fog and avatars visible, bind six physical rings, and move one mini at a time. Saved replay does not generate new feedback/redraws for newly detected moves."
+}

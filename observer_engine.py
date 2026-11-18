@@ -147,6 +147,7 @@ class ObserverEngine:
                 raise ValueError("Initial base centers must be inside the board image")
         self.detector = self._detector_factory(geometry.grid_px)
         self._detector_initialized = False
+        self._last_full_ring_search = None
         self.reference = SceneReference(geometry.grid_px)
         self.mover = mover
         self.initial_positions = deepcopy(mover.positions)
@@ -182,6 +183,7 @@ class ObserverEngine:
         self._acquisition_samples = {mini: [] for mini in mover.positions}
         self._acquisition_matches = {}
         self._acquisition_ready = set()
+        self._acquisition_reference = None
         self.acquisition_settle_seconds = .20
         self.acquisition_window_seconds = 5.0
 
@@ -489,7 +491,8 @@ class ObserverEngine:
         ambiguous = set()
         for item in measured:
             matches = [mini for mini in nearby
-                       if math.dist(item.xy, self.mover.positions[mini]) <= self.mover.anchor_gate]
+                       if item.allows(mini)
+                       and math.dist(item.xy, self.mover.positions[mini]) <= self.mover.anchor_gate]
             if len(matches) == 1:
                 nearby[matches[0]].append(item)
             elif len(matches) > 1:
@@ -533,13 +536,16 @@ class ObserverEngine:
         names = list(self.mover.positions)
         matches = {} if self.needs_reset else self._acquisition_matches
         ready = set() if self.needs_reset else self._acquisition_ready
+        missing_profiles = getattr(self.detector, "missing_profile_ids", [])
+        missing_profiles = list(missing_profiles) if isinstance(missing_profiles, (tuple, list)) else []
         return {"required": len(names), "visible_count": len(matches),
                 "ready_count": len(ready),
                 "missing": [mini for mini in names if mini not in matches],
                 "pending": [mini for mini in names if mini not in ready],
                 "settle_seconds": self.acquisition_settle_seconds,
                 "window_seconds": self.acquisition_window_seconds,
-                "minimum_measurements": 2}
+                "minimum_measurements": 2,
+                "ring_profiles_missing": missing_profiles}
 
     def _record(self, timestamp, frame_index, candidates, raw_count, unavailable,
                 obstructed, changed, emitted, state=None):
@@ -567,6 +573,9 @@ class ObserverEngine:
                   "reference_updates": self.reference.reference_updates,
                   "reference_evidence": deepcopy(self.reference.last_evidence),
                   "foundry_token_output": False}
+        diagnostics = getattr(self.detector, "last_diagnostics", None)
+        if isinstance(diagnostics, dict):
+            record["detector_diagnostics"] = deepcopy(diagnostics)
         if self.display_transition_policy != "disabled":
             record["display_transition"] = {
                 "policy": self.display_transition_policy,
@@ -708,16 +717,45 @@ class ObserverEngine:
         obstructed, changed = motion_guard(blur, self._previous, mask, self._previous_mask, self.geometry.grid_px)
         if not self._detector_initialized:
             if hasattr(self.detector, "initialize"):
-                self.detector.initialize(board_bgr, list(self.mover.positions.values()),
-                                         excluded_mask=mask)
-            self._detector_initialized = True
-        raw_candidates = self.detector.detect(board_bgr, mask)
+                # A click identifies the physical ring whose appearance must
+                # persist; a pooled profile cannot verify the old mini later.
+                if not obstructed:
+                    self.detector.initialize(board_bgr, self.mover.positions,
+                                             excluded_mask=mask)
+                self._detector_initialized = (not obstructed
+                    and getattr(self.detector, "profiles_ready", True))
+            else:
+                self._detector_initialized = True
+        if (self._detector_initialized
+                and callable(getattr(type(self.detector), "detect_tracked", None))):
+            # Stationary frames check small physical-ring neighborhoods. A
+            # miss widens the detector's search in this same frame; the periodic
+            # scan is for unexplained extras, never a delay before finding a move.
+            full_search = (not self._acquired
+                or self.mover.status["phase"] not in {"settled", "confirmed"}
+                or self._last_full_ring_search is None
+                or now - self._last_full_ring_search >= 1.)
+            raw_candidates = self.detector.detect_tracked(
+                board_bgr, self.mover.positions, mask, full_search=full_search)
+        else:
+            raw_candidates = self.detector.detect(board_bgr, mask)
+        diagnostics = getattr(self.detector, "last_diagnostics", {})
+        complete_search = (not isinstance(diagnostics, dict)
+                           or diagnostics.get("full_board_search", True))
+        if complete_search:
+            self._last_full_ring_search = now
         unavailable = masked_anchors(mask, self.mover.positions, self.geometry.grid_px * 0.75)
         if self._display_recovery is not None:
             return self._recover_expected_display(board_bgr, blur, mask, raw_candidates,
                                                    unavailable, obstructed, now, index)
         if not self._acquired:
             acquired = self._acquire(raw_candidates, unavailable, obstructed, now)
+            if (self._acquisition_reference is None and not obstructed and not unavailable
+                    and len(self._acquisition_matches) == len(self.mover.positions)):
+                # Preserve the first complete visible layout while repeated
+                # observations establish acquisition. A new unexplained ring
+                # appearing during that wait must still count as new evidence.
+                self._acquisition_reference = (board_bgr.copy(), mask.copy())
             if not acquired:
                 acquisition = self._acquisition_status()
                 state = {"phase": "acquiring", "reason": "waiting_for_base_acquisition",
@@ -730,7 +768,9 @@ class ObserverEngine:
                                     obstructed, changed, [], state)
             # Seed change evidence only after the declared layout is actually
             # acquired. Never use a partially acquired/moving layout as a map.
-            self.reference.update(board_bgr, mask)
+            baseline = self._acquisition_reference or (board_bgr, mask)
+            self.reference.update(*baseline)
+            self._acquisition_reference = None
         else:
             self._acquisition_matches = ({} if obstructed
                                          else self._anchor_matches(raw_candidates, unavailable))
@@ -740,6 +780,8 @@ class ObserverEngine:
             unavailable.discard(active)
         emitted = self.mover.update(candidates, now, obstructed=obstructed, unavailable=unavailable)
         if (not obstructed and not unavailable and not self.mover.status["missing"]
+                and not self.mover.status["unassigned"]
+                and complete_search
                 and self.mover.status["phase"] in ("settled", "confirmed")):
             self.reference.update(board_bgr, mask)
         events = []

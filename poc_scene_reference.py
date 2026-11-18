@@ -17,6 +17,8 @@ import math
 
 import numpy as np
 
+from single_mover_state import candidate_compatible_minis
+
 
 def _number(value, label):
     try:
@@ -103,10 +105,10 @@ class SceneReference:
         if not isinstance(positions, Mapping):
             raise ValueError("Confirmed positions must be a mapping")
         anchors = []
-        for xy in positions.values():
+        for mini, xy in positions.items():
             if not isinstance(xy, (tuple, list, np.ndarray)) or len(xy) != 2:
                 raise ValueError("Confirmed positions need two coordinates")
-            anchors.append((_number(xy[0], "Anchor x"), _number(xy[1], "Anchor y")))
+            anchors.append((mini, _number(xy[0], "Anchor x"), _number(xy[1], "Anchor y")))
 
         height, width = image.shape[:2]
         parsed = []
@@ -121,11 +123,12 @@ class SceneReference:
                 raise ValueError("Each candidate needs cx, cy, and radius") from None
             if radius <= 0 or radius > max(width, height):
                 raise ValueError("Candidate radius must be positive and bounded by the image size")
-            parsed.append((index, candidate, x, y, radius))
+            compatible = candidate_compatible_minis(candidate)
+            parsed.append((index, candidate, x, y, radius, compatible))
 
         output = []
         evidence = []
-        for index, candidate, x, y, radius in parsed:
+        for index, candidate, x, y, radius, compatible in parsed:
             record = {"candidate": index, "cx": x, "cy": y,
                       "accepted": False, "reason": None,
                       "valid_fraction": None, "changed_fraction": None}
@@ -133,7 +136,11 @@ class SceneReference:
             if not (0 <= x < width and 0 <= y < height):
                 record["reason"] = "outside_image"
                 continue
-            if any(math.hypot(x-ax, y-ay) <= self.anchor_gate for ax, ay in anchors):
+            if compatible == frozenset():
+                record["reason"] = "incompatible_ring_appearance"
+                continue
+            if any((compatible is None or mini in compatible)
+                   and math.hypot(x-ax, y-ay) <= self.anchor_gate for mini, ax, ay in anchors):
                 record.update(accepted=True, reason="confirmed_anchor")
                 output.append(candidate)
                 continue

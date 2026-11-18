@@ -6,6 +6,14 @@ picked up in the live static-map test. Recovery tag: `working-v1-2026-11-09`;
 branch: `codex/working-v1`. See [recovery instructions](WORKING_V1.txt).
 Fog-of-war acceptance remains future work.
 
+**Candidate checkpoint — 18 November 2026:** stricter physical-ring checks,
+local searches and desktop Vision & Fog controls are preserved separately from
+Working V1. Fresh live fog acceptance is pending. See the
+[current handoff and recovery instructions](docs/WORK_STATUS_2026-11-18.md).
+
+Current work is maintained in the [backlog](docs/BACKLOG.md) and
+[parked list](docs/PARKED.md), updated 18 November 2026.
+
 ## Invitation-only Alpha Login
 
 Sarween now gates live tracking, Foundry connection and recording review behind
@@ -177,6 +185,29 @@ optional window placement still needs the permission described below.
 The startup flow has controlled Python/JavaScript tests. An actual cold launch,
 login and full-screen placement with the user's Foundry installation still needs
 manual acceptance.
+
+### Configure vision and fog from the laptop
+
+Stop the session or mini observer, then open **VTT Controls → Vision & Fog**.
+Foundry can stay full screen on the TV with its interface hidden. After updating
+the Sarween module, use **Startup → Reload Foundry** once to enable these controls.
+
+Under **Scene vision and fog**, set **Token vision**, **Remember explored fog**
+and **Global illumination (daylight)**, then click **Apply scene settings**. For
+the first moving-visibility test, enable the first two and disable daylight.
+Under **Token vision**, choose a placed **Foundry token**, enable its vision,
+enter a **Sight range** in the displayed scene units (for example, 30 for a
+feet-based scene), and click **Apply token settings**. Zero range relies on
+other lighting. Click **Show this token's view on TV** to select that token on
+the display; it does not need a mini assignment first.
+
+The page reads the actual scene and token settings and waits for Foundry to
+confirm changes. It preserves other lighting, fog and token sight properties;
+it does not erase previously explored fog. Configure the view before starting a
+session and binding the minis. These controls are disabled during tracking and
+capture, since changing the view would invalidate the existing bindings. The
+controls have automated tests; multi-mini tracking with fog remains a separate
+live acceptance test.
 
 ### Create a token from a world actor
 
@@ -354,6 +385,22 @@ without repeating its animation or spending movement allowance again.
 
 These appearance profiles belong to the retained legacy tracker. The shared
 six-base Foundry session does not need per-mini color scans.
+
+The current six-base session automatically samples the visible rings when
+their starting positions are chosen. Every proposed base must pass the same
+measured diameter, visible ring-band and lighting-tolerant color checks; a
+color-only blob cannot bypass them. Appearance checks constrain which rings
+could explain a detection, while identity still comes from one mini departing
+at a time. Keep hands clear until all six bases are acquired.
+
+Small neighborhoods around the known positions are checked first. A missing or
+ambiguous ring triggers a full-board search in the same frame, and periodic full
+searches check for unexplained objects. Local-only checks cannot update the
+whole background. Unexplained extra rings preserve uncertainty instead of being
+silently absorbed into the map. This rejects the recorded smaller purple avatar;
+it does not establish that arbitrary screen artwork can never resemble a ring.
+Avatar artwork is not blanket-masked, and no avatar-template exclusion is
+currently applied. Fog tracking still requires a fresh live acceptance test.
 
 The control panel's `Mini Library` button opens the player-mini roster. It shows
 all five planned ring colors, whether each mini has a usable tracker profile,
@@ -977,64 +1024,19 @@ acknowledgement timing; unrelated changes require explicit rebinding. The read-o
 diagnostic holds after every known display change. General fog separation and
 live changing-fog accuracy remain unverified.
 
-See [the work checkpoint](docs/WORK_STATUS_2026-11-06.md) and the
-[physical acceptance plan](docs/PHYSICAL_ACCEPTANCE.md) for evidence and open work.
+Use the [current handoff](docs/WORK_STATUS_2026-11-18.md),
+[physical acceptance plan](docs/PHYSICAL_ACCEPTANCE.md), [backlog](docs/BACKLOG.md)
+and [parked list](docs/PARKED.md) for current instructions and priorities. The
+[6 November checkpoint](docs/WORK_STATUS_2026-11-06.md) preserves historical
+evidence and assumptions.
 
 ## Backlog
 
-Current coding batch:
+The maintained [backlog](docs/BACKLOG.md) lists planned work, current status and
+hardware requirements. The separate [parked list](docs/PARKED.md) retains optional
+experiments and later features with reasons to revisit them.
 
-1. **Reuse already-open Foundry:** implemented. Setup keeps waiting with
-   connection progress through the normal startup deadline, reuses the matching
-   world and Gamemaster connection, then continues the selected unpause/display
-   steps. Controlled tests pass; acceptance with the running Foundry app remains.
-
-Current priorities, distinguishing implemented software from physical acceptance:
-
-1. **Reliable multi-mini tracking with changing fog:** the main goal remains open.
-   Normal Foundry Start session now connects the experimental shared six-base
-   tracker to acknowledged continuous token movement, with explicit assignments
-   and continuous physical observations independent of own-token redraws. This is
-   an integration candidate, not live
-   acceptance. Fresh held-out movement and fog recordings are still needed,
-   including the printed-marker/polarizer setup.
-2. **Printed markers and matching PDF:** software is implemented, including
-   profile-sized paper cards, screen-guide alignment and bezel calibration.
-   Printing for the 54-inch active LCD, physical alignment and registration through
-   the polarizer remain unvalidated.
-3. **Six registration markers:** deferred; four-marker software remains current.
-   Extra-marker redundancy is lower priority than the physical tracking test.
-4. **Automatic marker sizing:** deferred. Current size/inset controls are manual;
-   automatic reduction and recovery need an explicit visibility-margin test.
-5. **Physical target experiments:** in progress. Large-ring and polarizer footage
-   has been examined, but reflective-dot benefit, flashlight on/off, smaller-ring
-   comparisons and white/grey recovery have not been established. A dark LCD can
-   improve optical contrast while also hiding its registration markers.
-6. **Foundry startup and inline setup:** hardware selection and module/scene waiting
-   now live in the main Session tab. **VTT Controls → Startup** implements native
-   launch, normal GM login and optional unpause/placement. Controlled tests pass;
-   an actual cold launch and end-to-end setup still need manual acceptance.
-7. **Create actor tokens from Sarween:** implemented in **VTT Controls → Assignment**
-   using existing world actors and explicit placement. Real Foundry acceptance is
-   still required; this does not create actors or infer mini assignments.
-8. **Physical taps:** paused, default off and deferred until tracking is reliable.
-9. **Holistic methodology/code review:** completed. See the
-   [read-only review](docs/reviews/TRACKING_METHODOLOGY_2026-11-05.txt) for prioritized
-   findings and proposed tests. Durable event history and accepted-family
-   uncertainty have since been addressed explicitly; automatic fog separation and
-   measured physical localization accuracy remain open.
-
-Other retained work:
-
-- Polish the Mini Library portfolio editor and hardware-profile workflow.
-- Validate the personal DMG with the real camera/TV setup after returning home.
-  The Apple Silicon app, writable-data migration, and drag-to-Applications DMG
-  are built and startup-tested. Developer ID signing, notarization, Intel or
-  Universal distribution, and older macOS testing remain open.
-- Add a pre-gridded image setup mode that derives the Foundry grid dimensions,
-  scale, and alignment from grid lines already baked into a map image.
-- Evaluate how verified portfolio samples should update live color thresholds
-  without reintroducing fog-of-war false positives. Add explicit room-lighting,
-  map-brightness, and fog labels plus conservative outlier review.
-- Add import/export and archive controls for minis that are not part of the
-  default five-player roster.
+Completed implementations are distinguished from outstanding acceptance tests.
+Printed markers are an optional fallback, not a prerequisite for the next live
+test. Superseded OBS-watermark and legacy color-profile work are excluded from
+active development; existing compatibility is retained.

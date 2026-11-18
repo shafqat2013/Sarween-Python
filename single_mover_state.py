@@ -1,7 +1,8 @@
 """Causal association for the offline, one-moving-piece proof of concept.
 
-This module knows neither ring colors nor the expected movement sequence. Its
-inputs are accepted base-center measurements, a capture timestamp, and explicit
+This module does not infer identities from ring colors or an expected movement
+sequence. Its inputs are accepted base-center measurements, optional physical
+appearance compatibility, a capture timestamp, and explicit
 visibility/obstruction information. Confirmed positions are preserved until an
 unambiguous departure and a stable replacement measurement establish one move.
 Coordinates remain continuous; the caller decides how to represent grid borders.
@@ -9,7 +10,7 @@ Coordinates remain continuous; the caller decides how to represent grid borders.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from collections import deque
 from collections.abc import Mapping
@@ -33,11 +34,32 @@ def _finite(value, label):
     return number
 
 
+def candidate_compatible_minis(item):
+    """Read detector evidence without treating appearance as an identity claim.
+
+    Missing evidence retains the original generic-measurement API for offline
+    callers. A detector that knows the starting rings supplies an explicit list;
+    an empty list cannot establish physical presence or a destination.
+    """
+    if "compatible_minis" not in item:
+        return None
+    names = item["compatible_minis"]
+    if (not isinstance(names, (list, tuple, set, frozenset))
+            or any(not isinstance(name, str) or not name for name in names)):
+        raise ValueError("Candidate compatibility needs a collection of nonempty mini names")
+    return frozenset(names)
+
+
 @dataclass(frozen=True)
 class _Candidate:
     xy: tuple[float, float]
     confidence: float
     uncertainty: float
+    radius: float | None = None
+    compatible_minis: frozenset[str] | None = None
+
+    def allows(self, mini):
+        return self.compatible_minis is None or mini in self.compatible_minis
 
 
 class SingleMover:
@@ -114,16 +136,29 @@ class SingleMover:
             uncertainty = _finite(item.get("uncertainty_px", 0.0), "Candidate uncertainty")
             if not 0 <= confidence <= 1 or uncertainty < 0:
                 raise ValueError("Confidence must be between zero and one; uncertainty nonnegative")
-            if "radius" in item and _finite(item["radius"], "Candidate radius") <= 0:
+            radius = _finite(item["radius"], "Candidate radius") if "radius" in item else None
+            if radius is not None and radius <= 0:
                 raise ValueError("Candidate radius must be positive")
-            if confidence >= self.minimum_confidence:
-                parsed.append(_Candidate(xy, confidence, uncertainty))
+            compatible = candidate_compatible_minis(item)
+            if confidence >= self.minimum_confidence and compatible != frozenset():
+                parsed.append(_Candidate(xy, confidence, uncertainty, radius, compatible))
         # Prefer the better supported measurement without assigning the same
         # physical spot twice when inner/outer ring boundaries share a center.
         accepted = []
         for item in sorted(parsed, key=lambda c: (-c.confidence, c.uncertainty, c.xy)):
-            if not any(_distance(item.xy, other.xy) <= self.duplicate_gate for other in accepted):
+            duplicate = next((index for index, other in enumerate(accepted)
+                              if _distance(item.xy, other.xy) <= self.duplicate_gate), None)
+            if duplicate is None:
                 accepted.append(item)
+            else:
+                other = accepted[duplicate]
+                # Alternative measurements of one spot can independently
+                # support more than one starting ring. Do not drop that
+                # compatibility merely because a different fit scored higher.
+                explicit = [names for names in (other.compatible_minis, item.compatible_minis)
+                            if names is not None]
+                compatible = frozenset().union(*explicit) if explicit else None
+                accepted[duplicate] = replace(other, compatible_minis=compatible)
         return accepted
 
     def _set_status(self, phase, reason, missing, unavailable, extras, timestamp):
@@ -224,7 +259,8 @@ class SingleMover:
         ambiguous_anchors = set()
         for index, item in enumerate(measured):
             nearby = [mini for mini, xy in self.positions.items()
-                      if mini not in hidden and _distance(item.xy, xy) <= self.anchor_gate]
+                      if mini not in hidden and item.allows(mini)
+                      and _distance(item.xy, xy) <= self.anchor_gate]
             if len(nearby) > 1:
                 ambiguous = True
                 ambiguous_anchors.update(nearby)
@@ -265,13 +301,20 @@ class SingleMover:
         # A stable new spot may be observed before identity becomes unique.
         # Retain only its recent real measurements through transient dropouts;
         # masks never delete another unresolved identity from this decision.
-        self._observe_destination(extras, now)
+        destination_extras = extras
+        if len(self._unresolved) == 1:
+            mover, = self._unresolved
+            destination_extras = [item for item in extras if item.allows(mover)]
+            if self._pending is not None and any(
+                    not sample.allows(mover) for _timestamp, sample in self._pending["samples"]):
+                self._pending = None
+        self._observe_destination(destination_extras, now)
         if len(self._unresolved) != 1:
             if not self._unresolved:
                 self._active_mini = None
                 self._pending = None
                 reason = "layout_confirmed" if not extras else "extra_candidates_with_full_layout"
-                self._set_status("settled", reason, missing, hidden, extras, now)
+                self._set_status("uncertain" if extras else "settled", reason, missing, hidden, extras, now)
             else:
                 reason = "multiple_missing_anchors" if len(missing) > 1 else "unresolved_departure_history"
                 self._set_status("uncertain", reason, missing, hidden, extras, now)
@@ -288,13 +331,13 @@ class SingleMover:
             self._pending = None
             self._set_status("uncertain", "conflicting_departure", missing, hidden, extras, now)
             return []
-        if len(extras) != 1:
+        if len(destination_extras) != 1:
             self._pending = None
-            reason = "destination_not_visible" if not extras else "competing_destinations"
-            self._set_status("moving" if not extras else "uncertain", reason, missing, hidden, extras, now)
+            reason = "destination_not_visible" if not destination_extras else "competing_destinations"
+            self._set_status("moving" if not destination_extras else "uncertain", reason, missing, hidden, extras, now)
             return []
 
-        item = extras[0]
+        item = destination_extras[0]
         origin = self.positions[mover]
         if _distance(item.xy, origin) < self.move_threshold:
             self._pending = None
@@ -321,5 +364,6 @@ class SingleMover:
         self._unresolved.discard(mover)
         self._pending = None
         self._active_mini = None
-        self._set_status("confirmed", "single_move_confirmed", [], hidden, [], now)
+        unmatched = [candidate for candidate in extras if candidate is not item]
+        self._set_status("confirmed", "single_move_confirmed", [], hidden, unmatched, now)
         return [event]

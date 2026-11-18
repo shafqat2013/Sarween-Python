@@ -39,6 +39,7 @@ class SingleMoverTests(unittest.TestCase):
         for timestamp in (0, .3, .6):
             self.assertEqual(state.update(frame, timestamp), [])
         self.assertEqual(state.status["reason"], "extra_candidates_with_full_layout")
+        self.assertEqual(state.status["phase"], "uncertain")
         self.assertEqual(state.positions, {"one": (20, 20), "two": (80, 20)})
 
     def test_two_missing_anchors_and_one_candidate_do_not_choose_identity(self):

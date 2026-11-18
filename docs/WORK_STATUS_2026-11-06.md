@@ -1,5 +1,10 @@
 # Sarween work checkpoint — 6 November 2026
 
+This is a historical checkpoint. The hardware-pending statements and
+display-change behavior below describe the earlier implementation. Use the
+[18 November handoff](WORK_STATUS_2026-11-18.md), [backlog](BACKLOG.md) and
+[parked list](PARKED.md) for the current state and remaining work.
+
 This checkpoint saves the source accumulated during the recent manual tracking,
 Foundry workflow, printed-marker and direct iPhone camera work. Local raw videos,
 user-specific profiles, signing assets, generated application bundles and bulky

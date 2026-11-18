@@ -12,7 +12,7 @@ from core_token_bridge import CoreTokenBridge
 from foundry_delivery import MoveOutbox
 from observer_engine import BoardGeometry
 from observer_session import LiveObserverController
-from tests.test_observer_expected_recovery import POSITIONS, VIEW, image
+from tests.test_observer_expected_recovery import POSITIONS, VIEW, physical_ring_image as image
 from tests.test_observer_session import FakeWindow
 
 

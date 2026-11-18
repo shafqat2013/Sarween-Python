@@ -325,7 +325,7 @@ class AcquisitionTests(unittest.TestCase):
         args = self.detector.initialize.call_args
         np.testing.assert_array_equal(args.args[0], image)
         np.testing.assert_array_equal(args.kwargs["excluded_mask"], mask)
-        self.assertEqual(args.args[1], [(100, 100), (260, 100)])
+        self.assertEqual(args.args[1], {"first": (100, 100), "second": (260, 100)})
         self.engine.reset({"first": (100, 100), "second": (260, 100)})
         self.assertEqual(self.factory.call_count, 2)
         self.assertFalse(self.engine._acquired)

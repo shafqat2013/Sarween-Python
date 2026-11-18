@@ -36,19 +36,17 @@ class HybridDetectorTests(unittest.TestCase):
     def setUpClass(cls):
         cv2.setNumThreads(0)
 
-    def test_pale_and_partial_occluded_bases_are_complementary(self):
+    def test_loose_partial_filled_base_is_not_a_verified_physical_ring(self):
         board = image()
         detector = HybridRingDetector(28)
         detector.initialize(board, [(100, 120), (280, 120)])
         candidates = detector.detect(board)
-        self.assertEqual(len(candidates), 2, candidates)
-        left, right = candidates
-        self.assertLess(np.hypot(left["cx"] - 100, left["cy"] - 120), 3)
-        self.assertEqual(left["chosen_measurement_source"], "color-boundary")
-        self.assertLess(left["support_coverage"], .75)
-        original = min(RingDetector(28).detect(board),
-                       key=lambda item: np.hypot(item["cx"] - 100, item["cy"] - 120))
-        self.assertEqual(left["uncertainty_px"], original["uncertainty_px"])
+        # The old hybrid accepted the left filled blob solely because its
+        # partial outer contour fit a circle. It has no physical ring band.
+        self.assertEqual(len(candidates), 1, candidates)
+        right, = candidates
+        self.assertEqual(detector.missing_profile_ids, [0])
+        self.assertFalse(detector.profiles_ready)
         self.assertLess(np.hypot(right["cx"] - 280, right["cy"] - 120), 3)
         self.assertEqual(right["chosen_measurement_source"], "annular-boundary")
         json.dumps(candidates, allow_nan=False)
@@ -57,6 +55,8 @@ class HybridDetectorTests(unittest.TestCase):
         detector = HybridRingDetector(28)
         detector.warm.detect = Mock(return_value=warm)
         detector.annular.detect = Mock(return_value=annular)
+        # These tests isolate proposal arbitration, not physical acceptance.
+        detector.detect = detector._propose
         return detector
 
     def test_selected_center_is_retained_but_allowance_encloses_accepted_alternatives(self):
@@ -134,8 +134,12 @@ class HybridDetectorTests(unittest.TestCase):
         detector.initialize(board, points, mask)
         detector.annular.initialize.assert_called_once_with(board, points, excluded_mask=mask)
         self.assertEqual(detector.detect(board, mask), [])
-        detector.warm.detect.assert_called_once_with(board, mask)
-        detector.annular.detect.assert_called_once_with(board, mask)
+        # Initialization now samples actual proposals to learn fixed ring
+        # geometry and appearance; detection observes the following frame.
+        self.assertEqual(detector.warm.detect.call_count, 2)
+        self.assertEqual(detector.annular.detect.call_count, 2)
+        detector.warm.detect.assert_called_with(board, mask)
+        detector.annular.detect.assert_called_with(board, mask)
 
 
 if __name__ == "__main__":

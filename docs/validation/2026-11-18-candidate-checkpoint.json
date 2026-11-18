@@ -1,0 +1,69 @@
+{
+  "date": "2026-11-18",
+  "timezone": "Asia/Bangkok",
+  "kind": "candidate checkpoint; fresh live fog acceptance pending",
+  "publication": {
+    "status": "prepared",
+    "branch": "codex/ring-tracking-candidate-2026-11-18",
+    "tag": "ring-tracking-candidate-2026-11-18"
+  },
+  "working_v1": {
+    "commit": "5745cd66bdf5c13b840a3605e8b4d77ac4694861",
+    "branch": "codex/working-v1",
+    "tag": "working-v1-2026-11-09",
+    "unchanged": true
+  },
+  "fresh_checks": {
+    "python": {
+      "version": "3.13.9",
+      "command": "python -m unittest discover -s tests -p 'test_*.py' -q",
+      "run": 1336,
+      "skipped": 18,
+      "failures": 0,
+      "errors": 0
+    },
+    "javascript": {
+      "version": "25.1.0",
+      "command": "node --experimental-vm-modules --test tests/test_vision_fog_controls.mjs tests/test_vtt_controls.mjs tests/test_module_capture.mjs tests/test_module_move_ack.mjs tests/test_scene_visual_invalidation.mjs tests/test_token_creation.mjs",
+      "reported_checks": 48,
+      "passed": 48,
+      "failed": 0,
+      "skipped": 0
+    },
+    "git_diff_check": "passed",
+    "tracker_hashes_match_2026_11_09_validation": true
+  },
+  "saved_recording_evidence": {
+    "date": "2026-11-09",
+    "rerun_on_checkpoint_date": false,
+    "frames": 868,
+    "reviewed_physical_moves": 15,
+    "candidate_matched": 15,
+    "baseline_matched": 12,
+    "unmatched_events": 0,
+    "source": "2026-11-09-ring-verification.json",
+    "scope": "Existing exact saved inputs; unchanged tracker source hashes. Does not generate new Foundry redraws for newly detected moves or establish fresh live fog acceptance."
+  },
+  "fresh_live_hardware_test": false,
+  "avatar_artwork_exclusion_implemented": false,
+  "code_sha256": {
+    "annular_ring_detector.py": "c002e2a327fe83793f9ff02bfedb7e75c61208a3f0a6f739528b6cd0e97e8e88",
+    "foundryoutput.py": "15c77bb7d217dbc3288f206d260409232bb7aa167d8ed47747971ca51bedb3e8",
+    "hybrid_ring_detector.py": "39aad5f673768e75ac8937056db773f7fcdf33fb115dfbe4ed724ee71e900d85",
+    "module.js": "e50323a7f6ec3cd8e5d349cb9bc0cf602b3fa7244c4ea2f871645c2b755b9ca4",
+    "module.json": "a7da54c04278f20e8e31ba8f015ec3ddbd0038297c601dba8599682170ab777a",
+    "observer_engine.py": "03dc869125d989ecbe7a826a6558bbb62ba834d0b2b59fc921fa559c1ee64dc5",
+    "poc_ring_detector.py": "3810a654231608b6f51f57ba63ed77feac5d2bb5fa29b927807f81cd69324b6d",
+    "poc_scene_reference.py": "8fab6009e0eb4527266ea7e6f62c1f643ded7a8384c482b3915dfff7bc8f0650",
+    "single_mover_state.py": "d5c7d654e8b7982d7adf7fb1d369c20c85394b2c94d95bb6a4dcbd23eeecb330",
+    "vision_fog_controls.py": "9eb8ee615af1b6f06aab2d3d9191f46ef11d5f8196d242a977a669167ed83962",
+    "vtt_controls.py": "64af736af0ac553e90aedd4432575f42689f4e3c569ea65f2afde87346b63f48"
+  },
+  "excluded_from_source_checkpoint": [
+    "raw/private recordings and bulk artifacts",
+    "personal hardware and calibration data",
+    "Keychain/auth sessions",
+    "generated app bundles",
+    "signing credentials and private keys"
+  ]
+}

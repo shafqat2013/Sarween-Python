@@ -83,7 +83,9 @@ _vtt_actions = frozenset({
     "capture.new", "capture.resume", "movement.select", "movement.undo", "movement.reset",
     "assignment.save", "assignment.cancel", "ui.setHidden", "lifecycle.reload", "state.sync",
     "lifecycle.setPaused", "token.create",
+    "vision.scene.set", "vision.token.set", "vision.token.select",
 })
+_vision_actions = frozenset({"vision.scene.set", "vision.token.set", "vision.token.select"})
 
 # Live Foundry viewport registration. The browser sends this whenever the GM
 # pans or zooms, allowing a fixed physical point on the TV to be mapped back to
@@ -431,6 +433,29 @@ def _finish_vtt_request(request_id, message):
                 "sceneId": pending["sceneId"], "success": False, "message": message})
 
 
+def _validate_vision_values(action, values):
+    """Reject incomplete or ambiguous visibility changes before queueing them."""
+    if action == "vision.scene.set":
+        names = {"tokenVision", "fogExploration", "globalIllumination"}
+        if set(values) != names or any(type(values[name]) is not bool for name in names):
+            raise ValueError("Choose on or off for token vision, fog exploration and global illumination.")
+        return
+    names = {"tokenId", "enabled", "range"} if action == "vision.token.set" else {"tokenId"}
+    if set(values) != names:
+        raise ValueError("Choose a token and complete its vision settings.")
+    token_id = values["tokenId"]
+    if not (action == "vision.token.select" and token_id is None):
+        if not isinstance(token_id, str) or not token_id.strip() or token_id != token_id.strip():
+            raise ValueError("Choose a Foundry token for vision.")
+    if action == "vision.token.set":
+        sight_range = values["range"]
+        if type(values["enabled"]) is not bool:
+            raise ValueError("Choose on or off for the token's vision.")
+        if (isinstance(sight_range, bool) or not isinstance(sight_range, (int, float))
+                or not math.isfinite(sight_range) or sight_range < 0):
+            raise ValueError("Vision range must be a finite number of scene distance units, zero or greater.")
+
+
 def request_vtt_command(action, values=None, *, return_request_id=False) -> bool | str:
     if not isinstance(action, str) or action not in _vtt_actions:
         raise ValueError("Unknown VTT control action.")
@@ -443,6 +468,10 @@ def request_vtt_command(action, values=None, *, return_request_id=False) -> bool
     if action == "token.create":
         from token_creation import validate_token_request
         values = validate_token_request(values)
+    if action in _vision_actions:
+        _validate_vision_values(action, values)
+        if tracking_output_paused():
+            raise ValueError("Stop the mini observer or finish capture before changing vision or fog.")
     if action in {"lifecycle.setPaused", "token.create"} and tracking_output_paused():
         raise ValueError("Stop the mini observer or finish capture before changing Foundry tokens or pause state.")
     try:
@@ -459,6 +488,11 @@ def request_vtt_command(action, values=None, *, return_request_id=False) -> bool
         if (capture.get("active") or capture.get("recording")
                 or capture.get("phase") in {"Starting", "Saving", "Restoring"}):
             raise ValueError("Finish recording before changing Foundry tokens or pause state.")
+    if action in _vision_actions:
+        capture = status.get("capture") or {}
+        if (capture.get("active") or capture.get("recording")
+                or capture.get("phase") in {"Starting", "Saving", "Restoring"}):
+            raise ValueError("Finish recording before changing vision or fog.")
     if not status["connected"] or not status["supported"] or status["blocked"] or status["pending"]:
         return False
     if action not in (status.get("capabilities") or []):
@@ -483,6 +517,9 @@ def request_vtt_command(action, values=None, *, return_request_id=False) -> bool
             return
         if action in {"lifecycle.setPaused", "token.create"} and tracking_output_paused():
             _finish_vtt_request(request_id, "Observer or capture mode blocks this Foundry change.")
+            return
+        if action in _vision_actions and tracking_output_paused():
+            _finish_vtt_request(request_id, "Stop the mini observer or finish capture before changing vision or fog.")
             return
         queue.put_nowait(payload)
 
@@ -1776,6 +1813,9 @@ async def ctrl_loop(websocket):
                 continue
             if msg.get("action") in {"lifecycle.setPaused", "token.create"} and tracking_output_paused():
                 _finish_vtt_request(msg["requestId"], "Observer or capture mode blocks this Foundry change.")
+                continue
+            if msg.get("action") in _vision_actions and tracking_output_paused():
+                _finish_vtt_request(msg["requestId"], "Stop the mini observer or finish capture before changing vision or fog.")
                 continue
             if (websocket is not _active_socket or msg.get("sceneId") != SCENE_ID
                     or not _connection_ready):

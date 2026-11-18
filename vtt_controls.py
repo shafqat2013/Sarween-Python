@@ -179,6 +179,7 @@ class VTTControls(ttk.Frame):
         self.pages.pack(fill="both", expand=True)
         startup = _scroll_page(self.pages, "Startup")
         display = _scroll_page(self.pages, "Display")
+        vision = _scroll_page(self.pages, "Vision & Fog")
         movement = _scroll_page(self.pages, "Movement")
         capture = _scroll_page(self.pages, "Capture")
         assignment = _scroll_page(self.pages, "Assignment")
@@ -209,6 +210,11 @@ class VTTControls(ttk.Frame):
             display_controller=self._display,
             can_apply=lambda: self._allowed("settings.set") and not self._display_busy)
         self.display_profiles.pack(fill="x", pady=(0, 8), before=self.grid_controls)
+        from vision_fog_controls import VisionFogControls
+        self.vision_fog = VisionFogControls(vision, require_access=require_access,
+            read_status=self._read_status, request=self._request,
+            can_change=lambda: not self._live_session and not self._display_busy)
+        self.vision_fog.pack(fill="x")
         self._build_movement(movement)
         self._build_capture(capture)
         self._build_assignment(assignment)
@@ -217,7 +223,7 @@ class VTTControls(ttk.Frame):
             read_status=self._read_status, can_create=lambda: not self._display_busy)
         self.token_creation.pack(fill="x", pady=(8, 0))
         self._build_advanced(advanced)
-        for page in (startup, display, movement, capture, assignment, advanced):
+        for page in (startup, display, vision, movement, capture, assignment, advanced):
             self._bind_scroll(page)
         self.footer = ttk.Label(self, textvariable=self.footer_message, width=1, anchor="w")
         # Reserve this line before the notebook takes its expanding parcel.
@@ -654,6 +660,8 @@ class VTTControls(ttk.Frame):
             self.printed_markers.set_enabled(enabled)
         if hasattr(self, "token_creation"):
             self.token_creation.set_enabled(enabled)
+        if hasattr(self, "vision_fog"):
+            self.vision_fog.set_enabled(enabled)
         self._update_enabled()
 
     def _allowed(self, action):
@@ -868,6 +876,8 @@ class VTTControls(ttk.Frame):
             self.printed_markers.refresh()
         if hasattr(self, "token_creation"):
             self.token_creation.refresh(status)
+        if hasattr(self, "vision_fog"):
+            self.vision_fog.refresh(status)
         self._update_enabled()
 
     def command(self, action, values=None):

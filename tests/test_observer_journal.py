@@ -562,10 +562,15 @@ class JournalTests(unittest.TestCase):
                                 cv2.circle(pixels, center, 21, (150, 90, 40), -1)
                                 cv2.circle(pixels, center, 15, (130, 130, 130), -1)
                             else:
-                                # The projecting warm body interrupts part of
-                                # the outer circular boundary; no separate
-                                # concentric inner-ring edge is visible.
-                                pixels = image(center)
+                                # A projecting warm body interrupts one arc,
+                                # while the exposed annular band remains
+                                # visible. A filled warm disk alone must not
+                                # qualify as a physical ring in the hybrid.
+                                pixels = np.full((240, 400, 3), (150, 90, 40), np.uint8)
+                                cv2.circle(pixels, center, 30, (35, 75, 180), -1)
+                                cv2.circle(pixels, center, 24, (160, 160, 160), -1)
+                                cv2.circle(pixels, center, 15, (35, 75, 180), -1)
+                                cv2.line(pixels, center, (center[0] - 43, center[1]), (35, 75, 180), 8)
                             row = engine.process(pixels, None, index / 8)
                             self.assertTrue(journal.append(pixels, None, index / 8, row))
                     finally:

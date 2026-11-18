@@ -109,6 +109,7 @@ const VTT_ACTIONS = [
   "capture.resume", "movement.select", "movement.undo", "movement.reset", "assignment.save",
   "assignment.cancel", "ui.setHidden", "lifecycle.reload", "state.sync",
   "lifecycle.setPaused", "token.create",
+  "vision.scene.set", "vision.token.set", "vision.token.select",
 ];
 
 function captureIsActive() {
@@ -132,6 +133,13 @@ function vttState() {
       viewportMarkerMargin: viewportMarkerGeometry().margin},
     scene: scene ? {id: scene.id, name: scene.name ?? "", gridSize: Number(scene.grid?.size ?? 0),
       gridType: Number(scene.grid?.type ?? 0), tokenVision: Boolean(scene.tokenVision)} : null,
+    vision: scene ? {
+      tokenVision: Boolean(scene.tokenVision), fogExploration: Boolean(scene.fog?.exploration),
+      globalIllumination: Boolean(scene.environment?.globalLight?.enabled),
+      distanceUnits: String(scene.grid?.units ?? ""),
+      selectedTokenId: canvas.tokens?.controlled?.length === 1
+        ? canvas.tokens.controlled[0].document?.id ?? canvas.tokens.controlled[0].id ?? null : null,
+    } : null,
     tokens,
     actors: listWorldActorChoices(),
     miniBindings: Object.fromEntries([...miniTokenBindings].filter(([_mini, tokenId]) =>
@@ -439,6 +447,77 @@ async function createDesktopToken(values, requireCurrent) {
   finally {if (desktopTokenCreations.get(key) === pending) desktopTokenCreations.delete(key);}
 }
 
+function editableVisionScene(requireCurrent) {
+  requireCurrent();
+  requireIdleCapture();
+  const scene = canvas.scene;
+  if (scene.canUserModify?.(game.user, "update") === false) throw new Error("You cannot change this scene's vision settings.");
+  return scene;
+}
+
+async function setSceneVision(values, requireCurrent) {
+  if (![values.tokenVision, values.fogExploration, values.globalIllumination]
+      .every(value => typeof value === "boolean")) throw new Error("Choose on or off for every scene vision setting.");
+  const scene = editableVisionScene(requireCurrent);
+  if (typeof scene.update !== "function") throw new Error("This Foundry version cannot change scene vision.");
+  // Foundry 13 stores fog and global light in these nested fields. Updating
+  // individual paths preserves fog colors, overlays and lighting thresholds.
+  await scene.update({tokenVision: values.tokenVision, "fog.exploration": values.fogExploration,
+    "environment.globalLight.enabled": values.globalIllumination}, {sarweenSource: "desktopSceneVision"});
+  requireCurrent();
+  if (Boolean(scene.tokenVision) !== values.tokenVision
+      || Boolean(scene.fog?.exploration) !== values.fogExploration
+      || Boolean(scene.environment?.globalLight?.enabled) !== values.globalIllumination) {
+    throw new Error("Foundry did not confirm all requested scene vision settings. Refresh and try again.");
+  }
+}
+
+function visionToken(values, requireCurrent) {
+  const scene = editableVisionScene(requireCurrent);
+  if (typeof values.tokenId !== "string" || !values.tokenId || values.tokenId.length > 128) {
+    throw new Error("Choose a token on the current scene.");
+  }
+  const token = scene.tokens?.get?.(values.tokenId);
+  if (!token) throw new Error("The selected token is no longer on this scene.");
+  return token;
+}
+
+async function setTokenVision(values, requireCurrent) {
+  if (typeof values.enabled !== "boolean" || typeof values.range !== "number"
+      || !Number.isFinite(values.range) || values.range < 0) {
+    throw new Error("Choose a vision state and a nonnegative sight range in scene units.");
+  }
+  const token = visionToken(values, requireCurrent);
+  if (token.canUserModify?.(game.user, "update") === false || typeof token.update !== "function") {
+    throw new Error("You cannot change this token's vision settings.");
+  }
+  // This is a settings edit, not a tracker-issued token move: keep the normal
+  // tokenUpdated invalidation so an existing binding cannot trust the old view.
+  await token.update({"sight.enabled": values.enabled, "sight.range": values.range});
+  requireCurrent();
+  if (canvas.scene.tokens?.get?.(values.tokenId) !== token) throw new Error("The selected token changed. Refresh and try again.");
+  if (Boolean(token.sight?.enabled) !== values.enabled || Number(token.sight?.range) !== values.range) {
+    throw new Error("Foundry did not confirm the requested token vision. Refresh and try again.");
+  }
+}
+
+function selectTokenVision(values, requireCurrent) {
+  editableVisionScene(requireCurrent);
+  if (values.tokenId === null) {
+    canvas.tokens.releaseAll();
+    if (canvas.tokens.controlled?.length) throw new Error("Foundry did not clear the token view.");
+    return;
+  }
+  const token = visionToken(values, requireCurrent);
+  const placeable = canvas.tokens.get(token.id);
+  if (typeof placeable?.control !== "function") throw new Error("This token is not ready on the TV. Try again.");
+  placeable.control({releaseOthers: true});
+  if (canvas.tokens.controlled?.length !== 1
+      || (canvas.tokens.controlled[0].document?.id ?? canvas.tokens.controlled[0].id) !== token.id) {
+    throw new Error("Foundry did not select the requested token view.");
+  }
+}
+
 async function handleVttCommand(data, socket) {
   const current = () => socket === ws && socket?.readyState === WebSocket.OPEN;
   const initialSceneId = canvas?.scene?.id ?? null;
@@ -454,12 +533,17 @@ async function handleVttCommand(data, socket) {
     requireCurrent();
     if (!game.user?.isGM) throw new Error("VTT controls require a Foundry GM connection.");
     if (typeof data.requestId !== "string" || !data.requestId || !VTT_ACTIONS.includes(data.action)) throw new Error("Unsupported VTT command.");
+    if (data.action.startsWith("vision.") && (typeof data.sceneId !== "string" || !data.sceneId)) {
+      throw new Error("Choose the current Foundry scene before changing vision.");
+    }
     const values = data.values ?? {};
     requireKeys(values, {
       "settings.set": ["settings"], "markers.set": ["enabled"], "capture.start": ["participants", "scenario", "notes"],
       "movement.select": ["tokenId"], "assignment.save": ["miniId", "tokenId"], "ui.setHidden": ["hidden"],
       "lifecycle.setPaused": ["paused"],
       "token.create": ["actorId", "name", "placement", "row", "col", "creationId"],
+      "vision.scene.set": ["tokenVision", "fogExploration", "globalIllumination"],
+      "vision.token.set": ["tokenId", "enabled", "range"], "vision.token.select": ["tokenId"],
     }[data.action] ?? []);
     if (!["settings.set", "ui.setHidden", "lifecycle.reload", "lifecycle.setPaused", "state.sync"].includes(data.action)
         && (!canvas?.ready || !canvas.scene)) throw new Error("Open a Foundry scene first.");
@@ -505,6 +589,9 @@ async function handleVttCommand(data, socket) {
         resetSelectedMovement(); break;
       case "assignment.save": requireIdleCapture(); assignMiniFromDesktop(values); break;
       case "token.create": actionResult = await createDesktopToken(values, requireCurrent); break;
+      case "vision.scene.set": await setSceneVision(values, requireCurrent); break;
+      case "vision.token.set": await setTokenVision(values, requireCurrent); break;
+      case "vision.token.select": selectTokenVision(values, requireCurrent); break;
       case "assignment.cancel":
         if (assignmentRequests.length) sendToPython({type: "assignMiniResult", ...assignmentRequests.shift(), tokenId: null, actorId: null, cancelled: true});
         break;
@@ -1864,6 +1951,7 @@ function listSceneTokenChoices(scene) {
     actorId: t.actorId || null,
     width: Number(t.width ?? 1), height: Number(t.height ?? 1),
     sightEnabled: Boolean(t.sight?.enabled), sightRange: Number(t.sight?.range ?? 0),
+    vision: {enabled: Boolean(t.sight?.enabled), range: Number(t.sight?.range ?? 0)},
   }));
   tokens.sort((a, b) => (a.tokenName || "").localeCompare(b.tokenName || ""));
   return tokens;
@@ -2292,6 +2380,7 @@ Hooks.on("controlToken", (token, controlled) => {
     clearMovementSelection();
   }
   tokenVisualChanged(token, controlled ? "tokenControlled" : "tokenReleased");
+  sendVttState();
 });
 
 Hooks.on("updateToken", (document, changes, options = {}) => {

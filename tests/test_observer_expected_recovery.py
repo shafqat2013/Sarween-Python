@@ -35,6 +35,24 @@ def image(*, redraw=False, moved=False, patch_x=180):
     return pixels
 
 
+def physical_ring_image(*, redraw=False, moved=False, patch_x=180):
+    """Live hybrid fixture: visible annular bases plus projecting mini bodies.
+
+    The legacy recovery-policy tests above intentionally retain their original
+    filled-component fixture and detector. The live controller now requires
+    actual ring-band evidence rather than accepting those filled disks.
+    """
+    pixels = np.full((360, 400, 3), (150, 90, 40), np.uint8)
+    if redraw:
+        pixels[160:200, patch_x:patch_x + 60] = (210, 210, 210)
+    for mini, point in POSITIONS.items():
+        center = (80, 160) if moved and mini == "mini1" else point
+        cv2.circle(pixels, center, 30, (35, 75, 180), -1)
+        cv2.circle(pixels, center, 24, (160, 160, 160), -1)
+        cv2.line(pixels, center, (center[0] - 43, center[1]), (160, 160, 160), 8)
+    return pixels
+
+
 def command(identity="move1"):
     return {"command_id": identity, "scene_id": "test-scene", "token_id": "token1"}
 
@@ -620,6 +638,7 @@ class PositiveDisplayRecoveryTests(ExpectedDisplayRecoveryTests):
 
 class LiveControllerRecoveryTests(unittest.TestCase):
     def test_live_flags_queued_provenance_and_default_observer_policy(self):
+        image = physical_ring_image
         with tempfile.TemporaryDirectory() as directory:
             controller = LiveObserverController(None, Path(directory), observation_only=False,
                                                 window_factory=FakeWindow)

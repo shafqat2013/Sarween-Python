@@ -158,9 +158,14 @@ class ContinuousStaticMapTests(unittest.TestCase):
         self.acquire(engine)
         positions = deepcopy(POSITIONS)
         positions["mini1"] = (80, 160)
-        row = self.move(engine, positions, .375, artifact=True)
+        # Both arrivals must satisfy the same physical-ring verifier. The
+        # filled display-artifact disk is correctly rejected, so it cannot
+        # stand in for a genuinely competing base measurement here.
+        positions["unbound_competing_ring"] = (300, 180)
+        row = self.move(engine, positions, .375)
         self.assertEqual(engine.events, [])
         self.assertEqual(row["state"]["reason"], "competing_destinations")
+        self.assertEqual(len(row["state"]["unassigned"]), 2)
         self.assertEqual(engine.mover.positions, POSITIONS)
 
     def test_colored_ring_departures_on_white_lcd_are_not_masked_as_glare(self):

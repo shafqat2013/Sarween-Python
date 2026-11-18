@@ -172,7 +172,10 @@ class MockFoundry:
         for center in physical.values():
             x, y = map(round, center)
             cv2.circle(board, (x, y), 25, (35, 75, 180), -1)
-            cv2.line(board, (x, y), (x - 30, y), (35, 75, 180), 7)
+            # Physical rings surround grey minis; a filled colored disk must
+            # remain a distractor rather than satisfy ring verification.
+            cv2.circle(board, (x, y), 20, (160, 160, 160), -1)
+            cv2.line(board, (x, y), (x - 30, y), (160, 160, 160), 7)
         if glare == 10:
             # A broad bright reflection temporarily washes out two stationary
             # bases. It is not a physical movement or an exclusion annotation.

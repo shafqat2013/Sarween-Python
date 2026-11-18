@@ -1,57 +1,88 @@
-# Physical acceptance after the markers and CPL arrive
+# Physical tracking acceptance
 
-Use one fixed capture mode, camera mount, display profile and observer code
-snapshot throughout each comparison. Keep Foundry token output and physical taps
-off. Software unit/replay checks are preparation; the recordings below establish
-physical performance only after independent human review.
+Updated 18 November 2026, Asia/Bangkok.
 
-## First useful table image
+The next test checks the current six-ring candidate in a real camera-to-Foundry
+feedback loop with fog enabled. Saved replay passed all 15 reviewed moves, but
+does not establish how newly detected moves and their resulting TV redraws behave
+live. Use normal **Start session** for token following; the diagnostic mini
+observer is read-only and has a different display-change hold policy.
 
-Install the matching printed markers at Actual Size, secure the CPL, and create
-a calibration for the direct USB feed. Start with Standard 1080p/15. Verify focus,
-marker lock and visible bases at the nearest and farthest TV squares. Measure
-base diameter at both the camera and detector input; an upstream 4K image cannot
-help detail discarded later by rectification/resizing.
+## Keep the first setup fixed
 
-Preserve the camera/profile/mode identity and the failure if six bases cannot be
-acquired. Initial clicks assign IDs and approximate centers; they do not prove
-that bases were detected. Wait for acquired 6/6 and visible 6/6 before moving.
+Use the existing iPhone USB feed, Wide 1x and matching 4K portrait calibration,
+54-inch active-screen profile, mounted CPL and six minis with oversized rings.
+Retain the current on-screen marker settings and verify 4/4 lock. Printed markers
+are an optional fallback, not a prerequisite for this test. The prior static-map
+milestone used torch off with exposure and white balance locked.
 
-## One short static-map recording
+Do not change capture mode, camera placement, CPL angle, pan or zoom during the
+comparison. A matching lens/format calibration already exists; do not repeat
+camera calibration merely because testing resumes. If a lens or capture format
+changes, use the appropriate matching profile before continuing.
 
-1. Leave all six minis untouched for ten seconds.
-2. Move one mini at a time. Choose the sequence yourself without giving the
-   observer expected endpoints. Include a repeated mover and leave one stationary.
-3. Include neighboring bases and ordinary temporary hand occlusions. Clear the
-   hand and wait between moves. Keep camera, pan and zoom fixed.
-4. Stop the input recording; retain its manifest, exact inputs, decisions and the
-   run's independent movement-events.jsonl. Confirm savedMoveCount agrees with
-   acceptedMoveCount and pendingMoves is zero.
+## Start the normal session
 
-Human review scores identity and order, origin, destination or justified border
-abstention, false/missed moves, acquisition failure and hand-clear response delay.
-Record observations before tuning. Abstention is distinct from an exact-cell hit.
-The archived 611-frame development clip still fails exact-cell acceptance; it is
-not held-out evidence or a reason to force narrower uncertainty.
+1. Fully quit any older Sarween process, then launch the source app with
+   `python main.py --dev-no-login` in the normal project environment. The
+   development login bypass is for this source test.
+2. Connect Foundry and keep the scene on the TV. An already-open matching world
+   can be reused. If automatic placement hits the known Accessibility error,
+   place the window manually before binding.
+3. In **VTT Controls → Vision & Fog**, enable **Token vision** and **Remember
+   explored fog**, disable **Global illumination (daylight)** for an obvious
+   first visibility test, and click **Apply scene settings**. Choose the test
+   token, enable its vision, set a finite sight range in the displayed scene
+   units, and click **Apply token settings**. Click **Show this token's view on
+   TV**. Finish visibility changes before binding and leave avatars visible.
+4. Start the session, choose the six physical base/ring centers and confirm their
+   token assignments. Click order defines Mini 1–6. Keep hands clear until
+   acquired 6/6 and visible 6/6. Clicks declare positions; acquisition verifies
+   that the detector can see the rings. Physical taps remain off.
 
-## Known fog change, then an independently bound physical move
+## Record one short test
 
-Keep all physical minis still and change fog or lighting. The current observer
-must hold on a received visual revision and report no movement. Do not wait for
-an automatic recovery: explicit rebinding is required after seeing the new TV
-image. After acquisition, make another physical move and review it separately.
-This checks the hold, not automatic fog tracking or map/physical-object separation.
+1. Leave all six minis untouched for ten seconds. No physical move should be
+   reported during that interval.
+2. Make random moves one mini at a time, without supplying expected endpoints to
+   the observer. Include all six, a repeated mover, adjacent minis and ordinary
+   hand occlusion. Keep the camera and viewport fixed.
+3. Include the previous failure: move a ring away so that its digital avatar is
+   exposed at the old position. Sarween must not count that artwork as continuing
+   physical presence or silently learn the real destination into the map.
+4. Check that the selected token follows and changes vision/fog, then make another
+   physical move. Tracker-issued token updates and acknowledgement timing must
+   not prevent continued physical tracking.
+5. Stop and save the short recording. Retain its manifest, exact inputs,
+   decisions and movement-events journal. Preserve a failure before changing
+   settings or software.
 
-Automatic fog recovery remains future work requiring verified camera/display
-pairing or equivalent physical foreground evidence. A relay notification, a quiet
-timer, a dark LCD, or a digital circle at an old anchor cannot establish that by
-itself. Preserve changes that arrive late and changes without notifications.
+## Review the physical result
 
-## Camera presets, only after the baseline is understood
+Use the existing video-review app to compare actual physical moves with the
+reported moves. Record correct identity/order, missed and extra moves, origin and
+destination or justified border uncertainty, acquisition failures and delay after
+the hand clears. Exact-cell accuracy and uncertainty are separate outcomes; do
+not force narrower uncertainty to obtain a pass.
 
-Compare the same physical arrangement at Standard and Smooth using separate short
-clips. Smooth must preserve the exact native format. Try Detail only if offered;
-use a matching calibration, verify actual base pixels and measure response,
-processor load, sustained heat and USB throughput. Higher FPS is more temporal
-sampling, not proof of lower gameplay delay. Neither Smooth nor Detail phone performance has
-been established by the synthetic server tests.
+Review one or two short clips from this current CPL setup rather than making a
+large historical archive audit a prerequisite. Retain fresh footage for future
+checks without tuning the tracker to its expected sequence. Accepted-event logs
+alone are not a complete record of physical movements.
+
+For save integrity, check that savedMoveCount equals acceptedMoveCount and that
+pendingMoves is zero. Saved recordings and software tests support implementation
+checks; only a fresh physical test can support a new live-confirmed checkpoint.
+
+## Separate tests for unrelated changes
+
+Manual scene, lighting, vision, camera-lock or viewport changes outside normal
+tracker-issued token movement can intentionally hold tracking and require
+rebinding. Test those safeguards separately with stationary minis; they must not
+manufacture physical moves. This differs from the token-driven fog updates in
+the main test above.
+
+After a reliable baseline, optional printed-marker/CPL and other accessory
+comparisons can be revisited from the [parked list](PARKED.md). Sustained camera
+FPS, heat, battery behavior and end-to-end latency remain separate measurements;
+higher resolution or a nominal FPS setting alone does not establish faster play.
