@@ -20,7 +20,7 @@ from app_paths import atomic_write_json, data_path
 
 FOUNDRY_BUNDLE_ID = "com.electron.foundryvtt"
 PERMISSION_MESSAGE = (
-    "To move Foundry, allow Sarween in System Settings → Privacy & Security → "
+    "To control Foundry's window, allow Sarween in System Settings → Privacy & Security → "
     "Accessibility. For a source run, macOS may list Terminal or your Python app. "
     "This optional feature does not request permission automatically."
 )
@@ -54,6 +54,7 @@ class _Accessibility:
             (self.ax, "AXUIElementSetMessagingTimeout", [pointer, ctypes.c_float], integer),
             (self.ax, "AXUIElementCopyAttributeValue", [pointer, pointer, ctypes.POINTER(pointer)], integer),
             (self.ax, "AXUIElementSetAttributeValue", [pointer, pointer, pointer], integer),
+            (self.ax, "AXUIElementPerformAction", [pointer, pointer], integer),
             (self.ax, "AXUIElementIsAttributeSettable", [pointer, pointer, ctypes.POINTER(ctypes.c_bool)], integer),
             (self.ax, "AXValueCreate", [ctypes.c_uint32, pointer], pointer),
             (self.ax, "AXValueGetValue", [pointer, ctypes.c_uint32, pointer], ctypes.c_bool),
@@ -98,9 +99,13 @@ class _Accessibility:
             self.release(value)
 
     def boolean(self, element, name):
+        return bool(self.optional_boolean(element, name))
+
+    def optional_boolean(self, element, name):
+        """Distinguish a false attribute from one the window does not expose."""
         value = self.copy(element, name)
         if not value:
-            return False
+            return None
         try:
             return bool(self.cf.CFBooleanGetValue(value))
         finally:
@@ -121,6 +126,23 @@ class _Accessibility:
                 raise RuntimeError(f"Foundry could not change {name.removeprefix('AX')} (macOS error {error}).")
         finally:
             self.release(attribute)
+
+    def press_fullscreen_button(self, window, cancelled):
+        """Press only the explicit fullscreen control, never a generic zoom button."""
+        button = self.copy(window, "AXFullScreenButton")
+        if not button:
+            return False
+        action = self._attribute("AXPress")
+        try:
+            if cancelled():
+                return False
+            error = self.ax.AXUIElementPerformAction(button, action)
+            if error:
+                raise RuntimeError(f"Foundry's fullscreen button could not be pressed (macOS error {error}).")
+            return True
+        finally:
+            self.release(action)
+            self.release(button)
 
     def geometry(self, element, name, kind, value):
         encoded = self.ax.AXValueCreate(kind, ctypes.byref(value))
@@ -217,6 +239,49 @@ class MacFoundryDisplayBackend:
         self._visit_windows(lambda key, _window: result.append(key))
         return result
 
+    def set_fullscreen(self, key, enabled, cancelled):
+        """Set an absolute native state without moving or resizing the window."""
+        if type(enabled) is not bool:
+            raise ValueError("Choose Enter or Exit Fullscreen.")
+
+        def change(candidate, window):
+            if key is not None and candidate != key:
+                return None
+            if cancelled():
+                return False
+            ax = self.ax
+            read = getattr(ax, "optional_boolean", ax.boolean)
+            state = read(window, "AXFullScreen")
+            if state is None:
+                raise RuntimeError("Foundry's window does not expose its fullscreen state through macOS Accessibility.")
+            if state == enabled:
+                return not cancelled()
+            writable = ax.settable(window, "AXFullScreen")
+            if cancelled():
+                return False
+            if writable:
+                ax.set(window, "AXFullScreen", ax.true if enabled else ax.false)
+            else:
+                press = getattr(ax, "press_fullscreen_button", None)
+                if not callable(press) or not press(window, cancelled):
+                    if cancelled():
+                        return False
+                    raise RuntimeError("Foundry's window cannot change fullscreen through macOS Accessibility. Use Foundry's window controls.")
+            deadline = time.monotonic() + 4
+            while read(window, "AXFullScreen") != enabled:
+                if cancelled():
+                    return False
+                if time.monotonic() >= deadline:
+                    action = "entering" if enabled else "leaving"
+                    raise RuntimeError(f"macOS has not confirmed Foundry {action} fullscreen. Check its window and try again.")
+                time.sleep(0.05)
+            return not cancelled()
+
+        result = self._visit_windows(change)
+        if result is None:
+            raise RuntimeError("Open the native Foundry app first. Browser fullscreen is not controlled here.")
+        return result
+
     def place(self, key, display, cancelled):
         def move(candidate, window):
             if key is not None and candidate != key:
@@ -304,12 +369,15 @@ class FoundryDisplayController:
         self._thread = None
         self._enabled = True
         self._busy = False
+        self._fullscreen = None
+        self._fullscreen_message = "Choose Enter or Exit Fullscreen to control Foundry's current window."
         self._job = None
         self._generation = 0
         self._seen = None
         self._displays = []
         self._permission = False
         self._message = "Choose a display, then move the native Foundry window."
+        self._message_scope = "placement"
         self._last_refresh = float("-inf")
         self._poll_interval = max(0.01, float(poll_interval))
 
@@ -337,6 +405,8 @@ class FoundryDisplayController:
                 message = "Foundry window placement is available on macOS."
             elif not self._permission:
                 message = PERMISSION_MESSAGE
+            elif self._message_scope == "fullscreen":
+                message = self._message
             elif not self._displays:
                 message = "Connect the TV as an extended display first."
             elif self._selected not in {item["id"] for item in self._displays}:
@@ -345,10 +415,21 @@ class FoundryDisplayController:
                 message = self._message
             if self._auto and self._enabled and self._permission and not self._stop.is_set():
                 self._ensure_worker()
+            fullscreen_supported = self.backend.supported and callable(getattr(self.backend, "set_fullscreen", None))
+            fullscreen_message = self._fullscreen_message
+            if not fullscreen_supported:
+                fullscreen_message = "Native Foundry fullscreen controls are unavailable on this system."
+            elif not self._permission:
+                fullscreen_message = PERMISSION_MESSAGE
+            elif self._busy:
+                fullscreen_message = self._message
             return {"supported": self.backend.supported,
                     "displays": [{key: item[key] for key in ("id", "name", "primary")} for item in self._displays],
                     "selectedDisplay": self._selected, "auto": self._auto,
-                    "busy": self._busy, "message": message, "permission": self._permission}
+                    "busy": self._busy, "message": message, "permission": self._permission,
+                    "fullscreen": self._fullscreen if self._permission and self._enabled and not self._stop.is_set() else None,
+                    "fullscreenMessage": fullscreen_message,
+                    "fullscreenSupported": fullscreen_supported}
 
     def configure(self, display_id=None, auto=None):
         self._refresh()
@@ -368,6 +449,7 @@ class FoundryDisplayController:
                 self._seen = None
             self._selected, self._auto = selected, automatic
             self._message = "Automatic placement enabled for newly opened Foundry windows." if automatic else "Automatic placement is off."
+            self._message_scope = "placement"
             if automatic and self._enabled and self._permission:
                 self._ensure_worker()
             self._wake.set()
@@ -379,6 +461,7 @@ class FoundryDisplayController:
                 self._generation += 1
             self._enabled = enabled
             if not self._enabled:
+                self._fullscreen = None
                 if self._job is not None:
                     self._busy = False
                 self._job = None
@@ -396,9 +479,31 @@ class FoundryDisplayController:
             if display is None:
                 self._message = "Choose a connected display."
                 return False
-            self._job = (display, self._generation)
+            self._job = ("place", display, self._generation)
             self._busy = True
             self._message = "Moving Foundry and entering full screen…"
+            self._message_scope = "placement"
+            self._ensure_worker()
+            self._wake.set()
+            return True
+
+    def set_fullscreen(self, enabled):
+        """Queue Enter/Exit Fullscreen independently of the selected display."""
+        if type(enabled) is not bool:
+            raise ValueError("Choose Enter or Exit Fullscreen.")
+        self._refresh()
+        with self._lock:
+            if self._stop.is_set() or not self._enabled or self._busy:
+                return False
+            if (not self.backend.supported or not self._permission
+                    or not callable(getattr(self.backend, "set_fullscreen", None))):
+                return False
+            self._job = ("fullscreen", enabled, self._generation)
+            self._busy = True
+            self._fullscreen = None
+            self._message_scope = "fullscreen"
+            self._message = "Entering Foundry fullscreen…" if enabled else "Leaving Foundry fullscreen…"
+            self._fullscreen_message = self._message
             self._ensure_worker()
             self._wake.set()
             return True
@@ -415,8 +520,10 @@ class FoundryDisplayController:
 
     def _move(self, key, display, generation):
         cancelled = lambda: self._cancelled(generation)
+        confirmed = False
         try:
             if not cancelled() and self.backend.place(key, display, cancelled):
+                confirmed = True
                 message = f"Foundry is full screen on {display['name']}."
             else:
                 message = "Foundry window placement cancelled."
@@ -425,6 +532,33 @@ class FoundryDisplayController:
         with self._lock:
             self._busy = False
             self._message = message
+            self._message_scope = "placement"
+            self._fullscreen = True if confirmed and not cancelled() else None
+            self._fullscreen_message = message
+
+    def _change_fullscreen(self, enabled, generation):
+        cancelled = lambda: self._cancelled(generation)
+        confirmed = False
+        try:
+            confirmed = not cancelled() and self.backend.set_fullscreen(None, enabled, cancelled)
+            if confirmed and not cancelled():
+                message = "Foundry is fullscreen." if enabled else "Foundry is windowed."
+            else:
+                confirmed = False
+                message = "Foundry fullscreen change cancelled."
+        except Exception as exc:
+            message = str(exc)
+        with self._lock:
+            self._busy = False
+            self._message_scope = "fullscreen"
+            self._message = message
+            self._fullscreen_message = message
+            self._fullscreen = enabled if confirmed and not cancelled() else None
+            # macOS may replace a window's AX identity during fullscreen
+            # transitions. Treat the resulting windows as the next baseline,
+            # otherwise auto placement could immediately undo a manual exit.
+            # The saved preference remains on for genuinely later windows.
+            self._seen = None
 
     def _run(self):
         while not self._stop.is_set():
@@ -434,7 +568,11 @@ class FoundryDisplayController:
                 generation = self._generation
                 display = next((dict(item) for item in self._displays if item["id"] == self._selected), None)
             if job is not None:
-                self._move(None, *job)
+                action, value, job_generation = job
+                if action == "fullscreen":
+                    self._change_fullscreen(value, job_generation)
+                else:
+                    self._move(None, value, job_generation)
             elif auto and display is not None:
                 try:
                     keys = self.backend.windows()

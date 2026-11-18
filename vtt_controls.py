@@ -201,6 +201,7 @@ class VTTControls(ttk.Frame):
         self.grid_controls.pack(fill="x", pady=(0, 8))
         self._build_display(display, display_controller)
         self.display_controller = self._display
+        self._build_quick_controls(startup)
         from foundry_startup_ui import FoundryStartupControls
         self.foundry_startup = FoundryStartupControls(startup, require_access=require_access,
             foundry_service=foundry_service, display_controller=self._display)
@@ -335,6 +336,45 @@ class VTTControls(ttk.Frame):
         self.display_auto_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=3)
         label = _wrapped_label(placement, textvariable=self.display_message)
         label.grid(row=3, column=0, columnspan=2, sticky="ew", pady=3)
+
+    def _build_quick_controls(self, parent):
+        section = self._section(parent, "Quick controls")
+        section.columnconfigure(1, weight=1)
+        self.pause_message = tk.StringVar(self, "Game: status unavailable")
+        _wrapped_label(section, textvariable=self.pause_message).grid(
+            row=0, column=0, columnspan=2, sticky="ew")
+        self.pause_button = self._button(section, "Pause", "lifecycle.setPaused",
+                                         lambda: self.set_paused(True))
+        self.unpause_button = self._button(section, "Unpause", "lifecycle.setPaused",
+                                           lambda: self.set_paused(False))
+        self.pause_button.grid(row=1, column=0, sticky="ew", padx=(0, 3), pady=(3, 8))
+        self.unpause_button.grid(row=1, column=1, sticky="ew", padx=(3, 0), pady=(3, 8))
+        self.fullscreen_message = tk.StringVar(self, "Window: no confirmed state")
+        _wrapped_label(section, textvariable=self.fullscreen_message).grid(
+            row=2, column=0, columnspan=2, sticky="ew")
+        self.fullscreen_enter = ttk.Button(section, text="Enter Fullscreen",
+                                           command=lambda: self.set_fullscreen(True))
+        self.fullscreen_exit = ttk.Button(section, text="Exit Fullscreen",
+                                          command=lambda: self.set_fullscreen(False))
+        self.fullscreen_enter.grid(row=3, column=0, sticky="ew", padx=(0, 3), pady=(3, 0))
+        self.fullscreen_exit.grid(row=3, column=1, sticky="ew", padx=(3, 0), pady=(3, 0))
+
+    def _refresh_pause_controls(self):
+        if not hasattr(self, "pause_message"):
+            return
+        state = self._last_status.get("paused")
+        connected = bool(self._last_status.get("connected") and self._last_status.get("supported"))
+        known = connected and type(state) is bool
+        self.pause_message.set(f"Game: {'paused' if state else 'unpaused'}" if known
+                               else "Game: status unavailable")
+        allowed = self._allowed("lifecycle.setPaused")
+        self.pause_button.configure(state="normal" if allowed and not (known and state) else "disabled")
+        self.unpause_button.configure(state="normal" if allowed and not (known and not state) else "disabled")
+
+    def set_paused(self, paused):
+        if type(paused) is not bool:
+            return False
+        return self.command("lifecycle.setPaused", {"paused": paused})
 
     def _build_movement(self, parent):
         section = self._section(parent, "Selected mini")
@@ -671,6 +711,8 @@ class VTTControls(ttk.Frame):
             return False
         if action not in status.get("capabilities", []):
             return False
+        if action == "lifecycle.setPaused" and status.get("outputPaused"):
+            return False
         capture = status.get("capture") or {}
         active = capture_active(capture)
         if action == "capture.confirm":
@@ -692,6 +734,10 @@ class VTTControls(ttk.Frame):
     def _update_enabled(self):
         for widget, action in self._actions:
             widget.configure(state="normal" if self._allowed(action) else "disabled")
+        self._refresh_pause_controls()
+        if hasattr(self, "fullscreen_enter") and not self._native_allowed():
+            self.fullscreen_enter.configure(state="disabled")
+            self.fullscreen_exit.configure(state="disabled")
         settings_enabled = self._allowed("settings.set")
         for widget in self._setting_widgets:
             widget.configure(state="normal" if settings_enabled else "disabled")
@@ -990,6 +1036,39 @@ class VTTControls(ttk.Frame):
         enabled = bool(self._native_allowed() and status.get("supported") and not status.get("busy"))
         self.display_place.configure(state="normal" if enabled and status.get("permission") and selected is not None else "disabled")
         self.display_auto_check.configure(state="normal" if enabled else "disabled")
+        if hasattr(self, "fullscreen_message"):
+            value = status.get("fullscreen")
+            confirmed = ("Last confirmed window: full screen" if value is True else
+                         "Last confirmed window: windowed" if value is False else
+                         "Window: no confirmed state")
+            detail = status.get("fullscreenMessage") or ""
+            if not self._native_allowed():
+                detail = ("Finish guided capture before changing the Foundry window."
+                          if self._enabled else "Sign in to use window controls.")
+            self.fullscreen_message.set(confirmed + (f". {detail}" if detail else ""))
+            available = enabled and status.get("permission") and status.get("fullscreenSupported")
+            # Absolute actions remain usable after someone changes the window
+            # outside Sarween. Last-confirmed state is not a live window poll.
+            for button in (self.fullscreen_enter, self.fullscreen_exit):
+                button.configure(state="normal" if available else "disabled")
+
+    def set_fullscreen(self, enabled):
+        if type(enabled) is not bool:
+            return False
+        try:
+            if self._require_access is not None:
+                self._require_access()
+            self.refresh(self._read_status())
+            if not self._native_allowed():
+                return False
+            accepted = self._display.set_fullscreen(enabled)
+            self._refresh_display()
+            self._update_enabled()
+            return bool(accepted)
+        except Exception as exc:
+            if hasattr(self, "fullscreen_message"):
+                self.fullscreen_message.set(str(exc))
+            return False
 
     def configure_display(self):
         try:

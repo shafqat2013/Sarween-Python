@@ -26,6 +26,7 @@ class Backend:
         self.permission = True
         self.keys = [(12, 100)]
         self.moves = []
+        self.fullscreen_changes = []
         self.scans = 0
         self.block = None
         self.entered = threading.Event()
@@ -47,6 +48,15 @@ class Backend:
         if cancelled():
             return False
         self.moves.append((key, dict(display)))
+        return True
+
+    def set_fullscreen(self, key, enabled, cancelled):
+        self.entered.set()
+        if self.block is not None:
+            self.block.wait(1)
+        if cancelled():
+            return False
+        self.fullscreen_changes.append((key, enabled))
         return True
 
 
@@ -177,8 +187,161 @@ class DisplayControllerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.controller.configure(auto="yes")
 
+    def test_absolute_fullscreen_actions_work_without_a_connected_saved_tv(self):
+        self.controller._selected = "disconnected-tv"
+        for enabled in (True, False, False):
+            self.assertTrue(self.controller.set_fullscreen(enabled))
+            self.until(lambda: not self.controller.status()["busy"])
+            state = self.controller.status()
+            self.assertEqual(state["fullscreen"], enabled)
+            self.assertTrue(state["fullscreenSupported"])
+            self.assertIn("fullscreen" if enabled else "windowed", state["fullscreenMessage"])
+            self.assertNotIn("disconnected", state["message"])
+        self.assertEqual(self.backend.fullscreen_changes, [(None, True), (None, False), (None, False)])
+        self.assertEqual(self.backend.moves, [])
+        self.assertFalse(self.path.exists())
+
+    def test_fullscreen_rejects_permission_disabled_closed_and_invalid_requests(self):
+        for value in (None, 1, "true"):
+            with self.assertRaises(ValueError):
+                self.controller.set_fullscreen(value)
+        self.backend.permission = False
+        self.assertFalse(self.controller.set_fullscreen(True))
+        self.backend.permission = True
+        self.controller._last_refresh = float("-inf")
+        self.controller.set_enabled(False)
+        self.assertFalse(self.controller.set_fullscreen(True))
+        self.controller.set_enabled(True)
+        self.controller.close()
+        self.assertFalse(self.controller.set_fullscreen(False))
+        self.assertEqual(self.backend.fullscreen_changes, [])
+
+    def test_fullscreen_busy_and_cancellation_never_issue_a_second_request(self):
+        self.backend.block = threading.Event()
+        self.assertTrue(self.controller.set_fullscreen(True))
+        self.assertTrue(self.backend.entered.wait(1))
+        self.assertFalse(self.controller.set_fullscreen(False))
+        self.assertFalse(self.controller.place())
+        self.controller.set_enabled(False)
+        self.backend.block.set()
+        self.until(lambda: not self.controller.status()["busy"])
+        self.assertEqual(self.backend.fullscreen_changes, [])
+        self.assertIsNone(self.controller.status()["fullscreen"])
+        self.assertIn("cancelled", self.controller.status()["fullscreenMessage"])
+
+    def test_fullscreen_failure_does_not_claim_state_or_change_placement(self):
+        self.backend.set_fullscreen = lambda *_args: (_ for _ in ()).throw(RuntimeError("No fullscreen attribute"))
+        self.assertTrue(self.controller.set_fullscreen(False))
+        self.until(lambda: not self.controller.status()["busy"])
+        self.assertIsNone(self.controller.status()["fullscreen"])
+        self.assertEqual(self.controller.status()["fullscreenMessage"], "No fullscreen attribute")
+        self.assertEqual(self.backend.moves, [])
+
+    def test_unsupported_fullscreen_controls_explain_the_disabled_action(self):
+        self.backend.set_fullscreen = None
+        self.assertFalse(self.controller.status()["fullscreenSupported"])
+        self.assertIn("unavailable", self.controller.status()["fullscreenMessage"])
+        self.assertFalse(self.controller.set_fullscreen(True))
+
+    def test_auto_placement_does_not_undo_manual_fullscreen_identity_change(self):
+        self.controller.configure(auto=True)
+        self.until(lambda: self.backend.scans > 1)
+        original = self.backend.set_fullscreen
+        def change_identity(key, enabled, cancelled):
+            result = original(key, enabled, cancelled)
+            self.backend.keys = [(12, 101)]
+            return result
+        self.backend.set_fullscreen = change_identity
+        before = self.backend.scans
+        self.assertTrue(self.controller.set_fullscreen(False))
+        self.until(lambda: not self.controller.status()["busy"] and self.backend.scans > before + 2)
+        self.assertEqual(self.backend.fullscreen_changes, [(None, False)])
+        self.assertEqual(self.backend.moves, [])
+        self.assertTrue(self.controller.status()["auto"])
+        self.assertTrue(json.loads(self.path.read_text())["auto"])
+        self.backend.keys.append((13, 102))
+        self.until(lambda: len(self.backend.moves) == 1)
+        self.assertEqual(self.backend.moves, [((13, 102), DISPLAYS[1])])
+
 
 class NativeBackendContractTests(unittest.TestCase):
+    def fullscreen_backend(self, initial=False, *, writable=True, button=False):
+        backend = MacFoundryDisplayBackend()
+        state, calls = {"value": initial}, []
+        def set_attribute(_window, name, value):
+            calls.append((name, value))
+            state["value"] = value
+        def press(_window, cancelled):
+            if cancelled():
+                return False
+            calls.append(("AXFullScreenButton", "AXPress"))
+            if button:
+                state["value"] = not state["value"]
+            return button
+        ax = SimpleNamespace(true=True, false=False, optional_boolean=lambda *_args: state["value"],
+            boolean=lambda *_args: state["value"], settable=lambda *_args: writable,
+            set=set_attribute, press_fullscreen_button=press,
+            geometry=lambda *_args: self.fail("Fullscreen must not move or resize Foundry"))
+        backend._accessibility = ax
+        backend._visit_windows = lambda callback: callback((12, 100), "window")
+        return backend, state, calls
+
+    def test_standalone_fullscreen_is_absolute_idempotent_and_never_moves(self):
+        backend, state, calls = self.fullscreen_backend()
+        self.assertTrue(backend.set_fullscreen(None, True, lambda: False))
+        self.assertTrue(state["value"])
+        self.assertTrue(backend.set_fullscreen(None, True, lambda: False))
+        self.assertEqual(calls, [("AXFullScreen", True)])
+        self.assertTrue(backend.set_fullscreen(None, False, lambda: False))
+        self.assertFalse(state["value"])
+        self.assertEqual(calls[-1], ("AXFullScreen", False))
+
+    def test_explicit_fullscreen_button_fallback_requires_known_opposite_state(self):
+        backend, state, calls = self.fullscreen_backend(writable=False, button=True)
+        for enabled in (True, True, False):
+            self.assertTrue(backend.set_fullscreen(None, enabled, lambda: False))
+        self.assertEqual(calls, [("AXFullScreenButton", "AXPress"), ("AXFullScreenButton", "AXPress")])
+        state["value"] = None
+        with self.assertRaisesRegex(RuntimeError, "does not expose"):
+            backend.set_fullscreen(None, False, lambda: False)
+        self.assertEqual(len(calls), 2)
+
+    def test_unavailable_control_missing_window_and_cancel_do_not_succeed(self):
+        backend, _state, calls = self.fullscreen_backend(writable=False)
+        with self.assertRaisesRegex(RuntimeError, "cannot change"):
+            backend.set_fullscreen(None, True, lambda: False)
+        self.assertEqual(calls, [("AXFullScreenButton", "AXPress")])
+        calls.clear()
+        self.assertFalse(backend.set_fullscreen(None, True, lambda: True))
+        self.assertEqual(calls, [])
+        backend._visit_windows = lambda callback: None
+        with self.assertRaisesRegex(RuntimeError, "Open the native Foundry"):
+            backend.set_fullscreen(None, True, lambda: False)
+
+    def test_fullscreen_readback_timeout_does_not_report_success(self):
+        backend, _state, calls = self.fullscreen_backend()
+        backend.ax.set = lambda *_args: calls.append("requested")
+        with patch("foundry_display.time.monotonic", side_effect=[0, 5]):
+            with self.assertRaisesRegex(RuntimeError, "has not confirmed"):
+                backend.set_fullscreen(None, True, lambda: False)
+        self.assertEqual(calls, ["requested"])
+
+    def test_fullscreen_cancel_after_write_does_not_confirm_or_move(self):
+        backend, _state, _calls = self.fullscreen_backend()
+        with patch.object(backend.ax, "set", return_value=None):
+            checks = iter((False, False, True))
+            self.assertFalse(backend.set_fullscreen(None, True, lambda: next(checks)))
+
+    def test_cancellation_during_capability_lookup_prevents_the_write(self):
+        backend, _state, calls = self.fullscreen_backend()
+        cancelled = {"value": False}
+        def settable(*_args):
+            cancelled["value"] = True
+            return True
+        backend.ax.settable = settable
+        self.assertFalse(backend.set_fullscreen(None, True, lambda: cancelled["value"]))
+        self.assertEqual(calls, [])
+
     def test_coordinates_cover_left_above_and_below_displays(self):
         self.assertEqual(screen_coordinates((-1920, 0, 1920, 1080), 800),
                          {"x": -1920, "y": -280, "width": 1920, "height": 1080})

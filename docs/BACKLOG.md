@@ -61,11 +61,15 @@ examples; no fresh live acceptance is claimed. See the
    through glare, hands and CPL needs the TV. Manual pattern width, white margin
    and inset controls already exist.
 
-4. **Add independent Foundry controls.** Pending; mostly possible at the cafe.
-   Expose Pause/Unpause and Enter/Exit Fullscreen independently of startup. The
-   pause protocol exists, but the manual controls do not. Resolve the known macOS
-   Accessibility problem with window placement; external-display acceptance
-   requires the TV.
+4. **Verify independent Foundry controls.** Implemented on
+   `codex/independent-foundry-controls`; needs native-window acceptance.
+   **VTT Controls → Startup → Quick controls** now exposes Pause/Unpause and
+   Enter/Exit Fullscreen independently of startup and display placement.
+   Headless checks cover confirmed pause state, capture/observer restrictions,
+   permission, cancellation, native fullscreen readback and the named fullscreen
+   button fallback. The fullscreen actions can be checked on the laptop at the
+   cafe. The existing startup/TV placement Accessibility problem remains a
+   separate acceptance item requiring the external display.
 
 5. **Finish live acceptance of setup and existing VTT features.** Implemented;
    needs broader manual checks. Verify cold startup, reuse of an already-open

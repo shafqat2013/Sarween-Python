@@ -186,6 +186,25 @@ The startup flow has controlled Python/JavaScript tests. An actual cold launch,
 login and full-screen placement with the user's Foundry installation still needs
 manual acceptance.
 
+### Change pause or fullscreen independently
+
+**VTT Controls → Startup → Quick controls** contains **Pause**, **Unpause**,
+**Enter Fullscreen** and **Exit Fullscreen**, above the launch form. These actions
+can be used with an already-open Foundry instance. Pause state follows Foundry's
+acknowledged state, including changes made inside Foundry. Pause controls require
+the connected module and are disabled during guided capture or a read-only mini
+observer.
+
+The fullscreen actions control the native Mac Foundry window on its current
+display. They require the existing optional Accessibility permission, and work
+without a connected relay or TV. They do not invoke startup or display placement.
+Sarween reports a confirmed result only after macOS returns the requested state;
+both absolute buttons remain available if the window is later changed manually.
+An unsupported window exposes an error instead of a successful result. These
+controls have headless tests; actual native window behavior and external-display
+placement still need manual acceptance. A window-size change during tracking can
+require rebinding when the camera/display geometry changes.
+
 ### Configure vision and fog from the laptop
 
 Stop the session or mini observer, then open **VTT Controls → Vision & Fog**.
