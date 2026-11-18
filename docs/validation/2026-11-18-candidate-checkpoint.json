@@ -3,9 +3,12 @@
   "timezone": "Asia/Bangkok",
   "kind": "candidate checkpoint; fresh live fog acceptance pending",
   "publication": {
-    "status": "prepared",
+    "status": "published",
     "branch": "codex/ring-tracking-candidate-2026-11-18",
-    "tag": "ring-tracking-candidate-2026-11-18"
+    "tag": "ring-tracking-candidate-2026-11-18",
+    "verified_source_commit": "1e760afc3de9ea80151b9b3ca1a5964967c8958b",
+    "verified_on": "2026-11-18",
+    "note": "Source branch publication verified before the documentation-only publication update; recovery tag includes that update."
   },
   "working_v1": {
     "commit": "5745cd66bdf5c13b840a3605e8b4d77ac4694861",

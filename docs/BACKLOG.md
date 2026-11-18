@@ -15,17 +15,17 @@ events. Its Python suite ran 1,336 tests with 18 skips and no failures. A fresh
 live fog test remains outstanding. See the
 [validation record](validation/2026-11-09-ring-verification.json).
 
-The newer tracking changes and Vision & Fog controls are still local,
-uncommitted changes on `codex/after-working-v1` as of this update.
+The newer tracking changes, Vision & Fog controls and refreshed handoff were
+saved separately to GitHub on 18 November 2026. The candidate branch is
+`codex/ring-tracking-candidate-2026-11-18`, with recovery tag
+`ring-tracking-candidate-2026-11-18`. See the
+[current handoff](WORK_STATUS_2026-11-18.md) for evidence and recovery instructions.
+Saving this candidate and refreshing the handoff are complete; fresh live fog
+acceptance remains pending.
 
 ## Planned work
 
-1. **Save the current candidate and refresh the handoff.** Pending; possible at
-   the cafe. Commit and push the current work separately from Working V1. Keep
-   the untested candidate distinct from a live-confirmed milestone, and update
-   historical setup notes before treating them as current instructions.
-
-2. **Add automatic avatar artwork rejection.** Experimental, not implemented;
+1. **Add automatic avatar artwork rejection.** Experimental, not implemented;
    possible at the cafe. Cache Foundry avatar artwork and compare ambiguous
    candidate patches against its color and spatial pattern. Reject strong matches
    to exposed avatars without masking the entire token location. Test different
@@ -33,9 +33,9 @@ uncommitted changes on `codex/after-working-v1` as of this update.
    promising. Keep this work separate from the frozen tracking candidate; it
    does not block testing that candidate live.
 
-3. **Run fresh live six-mini fog acceptance and review its recording.**
-   Implemented candidate; needs the
-   table setup. Keep the current camera, rings and CPL configuration fixed, retain
+2. **Run fresh live six-mini fog acceptance and review its recording.**
+   Implemented candidate; needs the table setup. Keep the current camera, rings
+   and CPL configuration fixed, retain
    on-screen markers and visible avatars, and configure fog before binding.
    Include stationary minis, random single-mini moves, a repeated mover and hand
    occlusion. Check token following and the resulting fog changes. Record one or
@@ -47,38 +47,38 @@ uncommitted changes on `codex/after-working-v1` as of this update.
    regression checks. Preserve any failure before changing settings; save a new
    milestone only after a live pass.
 
-4. **Measure placement accuracy and gameplay response.** Pending; recorded work
+3. **Measure placement accuracy and gameplay response.** Pending; recorded work
    and table testing. Measure neighboring-square uncertainty, actual hand-clear
    response time and camera-to-Foundry latency. Current CPU measurements do not
    establish end-to-end FPS or response time. Keep legitimate border uncertainty
    distinct from a correct exact-square result.
 
-5. **Improve registration usability and redundancy.** Queued after the tracking
+4. **Improve registration usability and redundancy.** Queued after the tracking
    baseline. Add a visual indication of the missing corner, support six markers
    for occlusion tolerance, and implement automatic sizing with a safe recovery
    margin. Logic and previews can be developed at the cafe; reliable detection
    through glare, hands and CPL needs the TV. Manual pattern width, white margin
    and inset controls already exist.
 
-6. **Add independent Foundry controls.** Pending; mostly possible at the cafe.
+5. **Add independent Foundry controls.** Pending; mostly possible at the cafe.
    Expose Pause/Unpause and Enter/Exit Fullscreen independently of startup. The
    pause protocol exists, but the manual controls do not. Resolve the known macOS
    Accessibility problem with window placement; external-display acceptance
    requires the TV.
 
-7. **Finish live acceptance of setup and existing VTT features.** Implemented;
+6. **Finish live acceptance of setup and existing VTT features.** Implemented;
    needs broader manual checks. Verify cold startup, reuse of an already-open
    world, inline connection progress, unpause and display placement. Check token
    creation from existing actors, hidden Foundry UI and Vision & Fog controls.
    These are acceptance tasks, not features that need rebuilding.
 
-8. **Measure sustained iPhone camera behavior.** Pending; requires the phone,
+7. **Measure sustained iPhone camera behavior.** Pending; requires the phone,
    and the table for tracking latency. Check delivered FPS, USB reconnection,
    heat, battery use and behavior at the supported presets. Keep camera profiles
    matched to lens and capture format. The native USB feed and camera controls
    are already implemented.
 
-9. **Finish the current Mac release path.** Pending; lower priority than live
+8. **Finish the current Mac release path.** Pending; lower priority than live
    tracking. Verify normal sign-in and email delivery, the packaged Apple Silicon
    app and installer with the real camera/TV setup, and signing/distribution for
    the Mac and iPhone apps. Broader Mac compatibility is parked.

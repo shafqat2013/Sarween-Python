@@ -15,8 +15,10 @@ replace the live-confirmed Working V1 recovery references.
 - Working V1 recovery tag: `working-v1-2026-11-09`.
 - Working V1 commit: `5745cd66bdf5c13b840a3605e8b4d77ac4694861`.
 
-Publication is being prepared; remote confirmation will be recorded after the
-source checkpoint is pushed. The candidate and Working V1 must remain separate.
+The source checkpoint was pushed to GitHub and verified on 18 November 2026 at
+commit `1e760afc3de9ea80151b9b3ca1a5964967c8958b`. The recovery tag also includes
+the documentation update recording publication. The candidate and Working V1
+remain separate; live fog acceptance is still pending.
 
 ## What changed
 
