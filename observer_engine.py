@@ -18,6 +18,8 @@ import numpy as np
 
 from poc_ring_detector import RingDetector
 from poc_scene_reference import SceneReference
+from avatar_artwork import AvatarArtworkMatcher
+from avatar_catalog import decode_avatar_catalog
 from single_mover_state import SingleMover, TIMING_POLICIES
 
 EXPECTED_DISPLAY_RECOVERY_POLICIES = ("recover-expected-display-changes-v1",
@@ -149,6 +151,10 @@ class ObserverEngine:
         self._detector_initialized = False
         self._last_full_ring_search = None
         self.reference = SceneReference(geometry.grid_px)
+        self.avatar_matcher = AvatarArtworkMatcher()
+        self._avatar_catalog_key = None
+        self._avatar_catalog_snapshot = None
+        self._avatar_evidence = {"ready": False, "applied": False, "reason": "no_catalog", "rejected": []}
         self.mover = mover
         self.initial_positions = deepcopy(mover.positions)
         self.confirmed_cells = {mini: geometry.describe(xy)["cell"] for mini, xy in mover.positions.items()}
@@ -572,6 +578,7 @@ class ObserverEngine:
                   "acquisition_missing": acquisition["missing"],
                   "reference_updates": self.reference.reference_updates,
                   "reference_evidence": deepcopy(self.reference.last_evidence),
+                  "avatar_artwork": deepcopy(self._avatar_evidence),
                   "foundry_token_output": False}
         diagnostics = getattr(self.detector, "last_diagnostics", None)
         if isinstance(diagnostics, dict):
@@ -608,10 +615,65 @@ class ObserverEngine:
         self.last_record = deepcopy(record)
         return record
 
+    def _update_avatar_catalog(self, catalog):
+        """Compile optional artwork evidence once per immutable catalog revision."""
+        try:
+            if catalog is None:
+                key = None
+            elif isinstance(catalog, dict):
+                key = (catalog.get("sceneId"), catalog.get("catalogId"), catalog.get("revision"),
+                       catalog.get("contentSha256") or _key(catalog),
+                       _key(self.geometry.view), self.geometry.width, self.geometry.height)
+            else:
+                raise ValueError("Avatar catalog must be an object")
+            # Transport snapshots are validated, but replay/direct callers can
+            # supply raw dictionaries. Compare actual content as well as its
+            # claimed digest. Unchanged PNG strings compare cheaply by identity;
+            # no full JSON serialization or image decode is needed per frame.
+            if key != self._avatar_catalog_key or catalog != self._avatar_catalog_snapshot:
+                self._avatar_catalog_key = key
+                decoded = (decode_avatar_catalog(catalog, self.geometry.view,
+                           (self.geometry.width, self.geometry.height)) if catalog is not None else None)
+                self._avatar_catalog_snapshot = deepcopy(catalog) if decoded is not None else None
+                if decoded is None:
+                    self.avatar_matcher.clear("no_matching_catalog")
+                else:
+                    self.avatar_matcher.set_catalog(decoded)
+        except (ValueError, TypeError, KeyError, OverflowError, cv2.error):
+            self._avatar_catalog_key = None
+            self._avatar_catalog_snapshot = None
+            self.avatar_matcher.clear("invalid_catalog")
+        self._avatar_evidence = {**deepcopy(self.avatar_matcher.last_catalog_status),
+                                "applied": False, "rejected": []}
+
+    def _filter_avatar_candidates(self, board, candidates, mask, unavailable, obstructed):
+        """Use artwork only to reject competing observations, never to assign IDs."""
+        if (not self._acquired or obstructed or unavailable
+                or not self.avatar_matcher.last_catalog_status.get("ready")):
+            return candidates
+        measured = self.mover._measurements(candidates)
+        anchors = self._anchor_matches(candidates, unavailable)
+        extras = [item for item in measured if not any(
+            item.allows(mini) and math.dist(item.xy, point) <= self.mover.anchor_gate
+            for mini, point in self.mover.positions.items())]
+        competing = len(extras) > 1 or (bool(extras) and len(anchors) == len(self.mover.positions))
+        if not competing:
+            self._avatar_evidence["reason"] = "no_competing_observations"
+            return candidates
+        try:
+            kept, evidence = self.avatar_matcher.filter_candidates(board, candidates, mask)
+        except (ValueError, TypeError, cv2.error):
+            self.avatar_matcher.clear("artwork_matching_unavailable")
+            self._avatar_evidence = {**self.avatar_matcher.last_catalog_status,
+                                    "applied": False, "rejected": []}
+            return candidates
+        self._avatar_evidence = {**evidence, "applied": True}
+        return kept
+
     def process(self, board_bgr, excluded_mask, timestamp, *, frame_index=None,
                 locked=True, geometry_key=None, scene_visual_revision=None,
                 expected_display_commands=(), confirmed_command_ids=(), unchanged_command_ids=(),
-                scene_visual_change=None, superseded_display_commands=()):
+                scene_visual_change=None, superseded_display_commands=(), avatar_catalog=None):
         now = float(timestamp)
         if not math.isfinite(now) or (self._last_timestamp is not None and now <= self._last_timestamp):
             raise ValueError("Observer capture timestamps must be finite and strictly increasing")
@@ -652,6 +714,7 @@ class ObserverEngine:
             for command in self._confirmed_display_commands:
                 self._expected_display_commands.pop(command, None)
         mask = np.where(excluded_mask > 0, 255, 0).astype(np.uint8)
+        self._update_avatar_catalog(avatar_catalog)
         self._watermark_evidence = {"mode": self.watermark_mode, "recognized": False,
                                     "provided_pixels": int(np.count_nonzero(mask))}
         self._last_timestamp = now
@@ -774,6 +837,10 @@ class ObserverEngine:
         else:
             self._acquisition_matches = ({} if obstructed
                                          else self._anchor_matches(raw_candidates, unavailable))
+        raw_count = len(raw_candidates)
+        raw_candidates = self._filter_avatar_candidates(board_bgr, raw_candidates, mask, unavailable, obstructed)
+        self._acquisition_matches = ({} if obstructed
+                                     else self._anchor_matches(raw_candidates, unavailable))
         candidates = self.reference.filter(board_bgr, raw_candidates, self.mover.positions, mask)
         active = self.mover.status.get("active_mini")
         if active is not None:
@@ -796,7 +863,7 @@ class ObserverEngine:
             self.events.append(deepcopy(event))
             events.append(event)
         self._previous, self._previous_mask = blur, mask.copy()
-        return self._record(now, index, candidates, len(raw_candidates), unavailable, obstructed, changed, events)
+        return self._record(now, index, candidates, raw_count, unavailable, obstructed, changed, events)
 
 
 def draw_observer_frame(image, record, geometry, *, foundry_token_output=False):

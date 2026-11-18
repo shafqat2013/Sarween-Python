@@ -20,6 +20,10 @@ const VIEWPORT_MARKER_IDS = [10, 11, 12, 13];
 const MAX_GRID_LABELS = 3000;
 const VISUAL_REFRESH_DELAY_MS = 100;
 const VISUAL_FALLBACK_MS = 350;
+const AVATAR_MAX_DIMENSION = 96;
+const AVATAR_MAX_TEMPLATES = 32;
+const AVATAR_MAX_TOKENS = 64;
+const AVATAR_MAX_DATA_CHARS = 900_000;
 
 let ws = null;
 let commandMessageChain = Promise.resolve();
@@ -33,6 +37,19 @@ let referenceCaptureBusy = false;
 let referenceCaptureErrors = 0;
 let referenceCaptureSequence = 0;
 let referenceCaptureSessionId = null;
+let avatarCatalogId = null;
+let avatarCatalogRevision = 0;
+let avatarCatalogSceneId = null;
+let avatarCatalogSignature = null;
+let avatarCatalogLastPayload = null;
+let avatarTemplateSequence = 0;
+let avatarCatalogEpoch = 0;
+let avatarCatalogBusy = false;
+let avatarCatalogRefreshTimer = null;
+const avatarCatalogPendingDraws = new Set();
+const avatarCatalogPendingRefreshes = new Set();
+const avatarRasterCache = new Map();
+const avatarContentIds = new Map();
 let markerOverlayEl = null;
 let gridLabelOverlayEl = null;
 let gridLabelRenderTimer = null;
@@ -1252,6 +1269,248 @@ function getViewportRegistration() {
   };
 }
 
+function resetAvatarCatalog({publish = false} = {}) {
+  if (publish && avatarCatalogSceneId && ws?.readyState === WebSocket.OPEN) {
+    sendToPython({type: "avatarCatalog", schemaVersion: 1, sceneId: avatarCatalogSceneId,
+      catalogId: avatarCatalogId ??= crypto.randomUUID(), revision: ++avatarCatalogRevision,
+      method: "isolated-token-sprite-v1", viewTransform: null, capturedAtEpochMs: Date.now(),
+      status: "unavailable", templates: [], unsupportedTokens: []});
+  }
+  avatarCatalogEpoch++;
+  if (avatarCatalogRefreshTimer) clearTimeout(avatarCatalogRefreshTimer);
+  avatarCatalogRefreshTimer = null;
+  avatarCatalogPendingDraws.clear();
+  avatarCatalogPendingRefreshes.clear();
+  avatarCatalogId = avatarCatalogSceneId = avatarCatalogSignature = avatarCatalogLastPayload = null;
+  avatarCatalogRevision = avatarTemplateSequence = 0;
+  avatarRasterCache.clear();
+  avatarContentIds.clear();
+}
+
+function scheduleAvatarCatalogRefresh() {
+  if (avatarCatalogRefreshTimer) clearTimeout(avatarCatalogRefreshTimer);
+  avatarCatalogRefreshTimer = null;
+  const socket = ws, sceneId = canvas?.scene?.id, epoch = avatarCatalogEpoch;
+  if (socket?.readyState !== WebSocket.OPEN || !canvas?.ready || !sceneId) return;
+  avatarCatalogRefreshTimer = setTimeout(() => {
+    avatarCatalogRefreshTimer = null;
+    if (socket === ws && socket.readyState === WebSocket.OPEN
+        && canvas?.scene?.id === sceneId && epoch === avatarCatalogEpoch) captureAvatarCatalog();
+  }, 100);
+}
+
+function invalidateAvatarCatalog({tokenId = null, waitForDraw = false} = {}) {
+  const sceneId = canvas?.scene?.id;
+  if (avatarCatalogSceneId && avatarCatalogSceneId !== sceneId) resetAvatarCatalog();
+  if (tokenId) avatarCatalogPendingRefreshes.add(tokenId);
+  if (waitForDraw && tokenId) avatarCatalogPendingDraws.add(tokenId);
+  // Revoke old artwork immediately, but preserve cached unchanged raster assets.
+  // Texture loading is asynchronous: catalog requests must not republish the old
+  // mesh while Foundry is still drawing its replacement.
+  avatarCatalogSignature = null;
+  if (ws?.readyState === WebSocket.OPEN && sceneId) {
+    avatarCatalogSceneId = sceneId;
+    avatarCatalogId ??= crypto.randomUUID();
+    if (avatarCatalogLastPayload?.status !== "unavailable") {
+      avatarCatalogLastPayload = {type: "avatarCatalog", schemaVersion: 1, sceneId,
+        catalogId: avatarCatalogId, revision: ++avatarCatalogRevision,
+        method: "isolated-token-sprite-v1", viewTransform: null, capturedAtEpochMs: Date.now(),
+        status: "unavailable", templates: [], unsupportedTokens: [], reason: "artwork_changed"};
+      sendToPython(avatarCatalogLastPayload);
+    }
+  }
+  scheduleAvatarCatalogRefresh();
+}
+
+function avatarTokenIsCurrent(token) {
+  const document = tokenDocument(token);
+  const sceneId = document?.parent?.id ?? document?.scene?.id;
+  return !sceneId || sceneId === canvas?.scene?.id;
+}
+
+function avatarArtworkUpdateNeedsRefresh(document, changes) {
+  return Object.keys(changes).some(key => {
+    // These document edits do not change the displayed sprite and Foundry need
+    // not emit a render refresh for them. Do not wait for a nonexistent event.
+    if (key === "rotation" && document.lockRotation) return false;
+    if ((key === "ring" || key.startsWith("ring.")) && document.ring?.enabled === false
+        && key !== "ring.enabled" && !(key === "ring" && changes.ring && "enabled" in changes.ring)) return false;
+    return /^(texture|tint|rotation|lockRotation|width|height|ring|alpha|hidden|actorId|actorLink)(\.|$)/.test(key);
+  });
+}
+
+function avatarSpriteSpecification(token) {
+  const mesh = token?.mesh;
+  const texture = mesh?.texture;
+  if (!texture?.baseTexture?.valid || !Number.isInteger(texture.baseTexture.uid)
+      || texture.baseTexture.uid < 0 || !mesh?.getBounds) throw new Error("texture_unavailable");
+  if (token.hasDynamicRing || token.document?.ring?.enabled || mesh.paddingX || mesh.paddingY) {
+    throw new Error("dynamic_ring_or_padding");
+  }
+  if (mesh.filters?.length || token.detectionFilter || (mesh.blendMode ?? 0) !== 0) {
+    throw new Error("custom_filter_or_blend");
+  }
+  const shader = mesh.shader?.constructor?.name;
+  if (shader && shader !== "PrimaryBaseSamplerShader") throw new Error("custom_shader");
+  const resource = texture.baseTexture.resource?.source;
+  if (resource?.tagName === "VIDEO" || resource?.videoWidth) throw new Error("animated_texture");
+  const alpha = Number(mesh.worldAlpha ?? mesh.alpha ?? 1);
+  if (!Number.isFinite(alpha) || alpha < .99) throw new Error("translucent_token");
+  const bounds = mesh.getBounds();
+  const logicalWidth = Number(bounds?.width), logicalHeight = Number(bounds?.height);
+  const scaleX = Number(mesh.scale?.x), scaleY = Number(mesh.scale?.y);
+  const rotation = Number(mesh.rotation ?? 0);
+  const anchorX = Number(mesh.anchor?.x ?? .5), anchorY = Number(mesh.anchor?.y ?? .5);
+  const tint = Number(mesh.tint ?? 0xFFFFFF);
+  const original = texture.orig ?? texture;
+  if (![logicalWidth, logicalHeight, scaleX, scaleY, rotation, anchorX, anchorY,
+        tint, original.width, original.height].every(Number.isFinite)
+      || logicalWidth <= 0 || logicalHeight <= 0 || logicalWidth > 8192 || logicalHeight > 8192
+      || !scaleX || !scaleY || original.width <= 0 || original.height <= 0
+      || original.width * original.height > 16_777_216 || !Number.isInteger(tint)
+      || tint < 0 || tint > 0xFFFFFF) throw new Error("invalid_sprite_geometry");
+  // The key remains local. Asset paths or signed URLs are never transported.
+  const appearanceKey = JSON.stringify([texture.uid, texture.baseTexture.uid,
+    texture._updateID ?? 0, texture.baseTexture.dirtyId ?? 0, texture.rotate ?? 0,
+    original.width, original.height, texture.frame?.x, texture.frame?.y,
+    texture.frame?.width, texture.frame?.height, texture.trim?.x, texture.trim?.y,
+    texture.trim?.width, texture.trim?.height, scaleX, scaleY, rotation, anchorX, anchorY, tint]);
+  return {mesh, texture, scaleX, scaleY, rotation, anchorX, anchorY, tint, appearanceKey,
+    logicalWidth: Math.round(logicalWidth * 10_000) / 10_000,
+    logicalHeight: Math.round(logicalHeight * 10_000) / 10_000};
+}
+
+function renderAvatarSprite(specification) {
+  const renderer = canvas.app?.renderer;
+  if (!renderer?.generateTexture || !renderer?.extract?.canvas
+      || !globalThis.PIXI?.Sprite || !globalThis.PIXI?.Container) {
+    throw new Error("renderer_unavailable");
+  }
+  let container = null, target = null;
+  try {
+    // Own objects only: extracting the live PrimarySpriteMesh can temporarily
+    // replace its transform and would also depend on scene occlusion shaders.
+    // This canonical sprite preserves texture alpha, tint, mirroring and
+    // rotation; unsupported rings/filters abstain rather than export background.
+    container = new PIXI.Container();
+    const sprite = new PIXI.Sprite(specification.texture);
+    sprite.anchor.set(specification.anchorX, specification.anchorY);
+    sprite.scale.set(specification.scaleX, specification.scaleY);
+    sprite.rotation = specification.rotation;
+    sprite.tint = specification.tint;
+    container.addChild(sprite);
+    const bounds = container.getLocalBounds();
+    const largest = Math.max(Number(bounds.width), Number(bounds.height));
+    if (!Number.isFinite(largest) || largest <= 0 || largest > 8192) throw new Error("invalid_sprite_bounds");
+    target = renderer.generateTexture(container, {region: bounds,
+      resolution: Math.min(1, AVATAR_MAX_DIMENSION / largest), multisample: 0});
+    const source = renderer.extract.canvas(target);
+    if (!source?.width || !source?.height || source.width > AVATAR_MAX_DIMENSION + 1
+        || source.height > AVATAR_MAX_DIMENSION + 1) throw new Error("invalid_sprite_snapshot");
+    const bounded = document.createElement("canvas");
+    const factor = Math.min(1, AVATAR_MAX_DIMENSION / Math.max(source.width, source.height));
+    bounded.width = Math.max(1, Math.round(source.width * factor));
+    bounded.height = Math.max(1, Math.round(source.height * factor));
+    bounded.getContext("2d").drawImage(source, 0, 0, bounded.width, bounded.height);
+    const image = bounded.toDataURL("image/png");
+    if (!image.startsWith("data:image/png;base64,") || image.length > 65_536) throw new Error("invalid_sprite_encoding");
+    return {image, width: bounded.width, height: bounded.height};
+  } finally {
+    try {target?.destroy(true);}
+    finally {container?.destroy({children: true, texture: false, baseTexture: false});}
+  }
+}
+
+function captureAvatarCatalog({force = false} = {}) {
+  const socket = ws;
+  if (avatarCatalogBusy || socket?.readyState !== WebSocket.OPEN || !canvas?.ready || !canvas.scene) return false;
+  if (avatarCatalogRefreshTimer) clearTimeout(avatarCatalogRefreshTimer);
+  avatarCatalogRefreshTimer = null;
+  const sceneId = canvas.scene.id;
+  if (avatarCatalogSceneId && avatarCatalogSceneId !== sceneId) resetAvatarCatalog();
+  if (avatarCatalogPendingDraws.size || avatarCatalogPendingRefreshes.size) return false;
+  avatarCatalogSceneId = sceneId;
+  avatarCatalogId ??= crypto.randomUUID();
+  const epoch = avatarCatalogEpoch;
+  avatarCatalogBusy = true;
+  try {
+    const rawView = buildViewTransformPayload();
+    const viewTransform = rawView ? {...rawView} : null;
+    if (!viewTransform) throw new Error("view_transform_unavailable");
+    if (viewTransform) delete viewTransform.sentAt;
+    const templates = [], unsupportedTokens = [], usedKeys = new Set(), usedContents = new Set();
+    const unique = new Map();
+    let dataChars = 0;
+    const documents = [...(canvas.scene.tokens ?? [])].slice(0, AVATAR_MAX_TOKENS);
+    for (const document of documents) {
+      const tokenId = document.id;
+      const token = canvas.tokens?.get?.(tokenId);
+      if (!token || token.visible === false || token.renderable === false
+          || token.mesh?.visible === false || token.mesh?.worldVisible === false) continue;
+      try {
+        const specification = avatarSpriteSpecification(token);
+        let raster = avatarRasterCache.get(specification.appearanceKey);
+        if (!raster) {
+          raster = renderAvatarSprite(specification);
+          avatarRasterCache.set(specification.appearanceKey, raster);
+        }
+        usedKeys.add(specification.appearanceKey);
+        const content = JSON.stringify([raster.image, raster.width, raster.height,
+          specification.logicalWidth, specification.logicalHeight]);
+        if (unique.has(content)) {
+          unique.get(content).tokenIds.push(tokenId);
+          continue;
+        }
+        if (templates.length >= AVATAR_MAX_TEMPLATES || dataChars + raster.image.length > AVATAR_MAX_DATA_CHARS) {
+          throw new Error("catalog_budget");
+        }
+        const templateId = avatarContentIds.get(content) ?? `avatar-${++avatarTemplateSequence}`;
+        avatarContentIds.set(content, templateId);
+        usedContents.add(content);
+        const item = {templateId, ...raster, logicalWidth: specification.logicalWidth,
+          logicalHeight: specification.logicalHeight, tokenIds: [tokenId]};
+        unique.set(content, item);
+        templates.push(item);
+        dataChars += raster.image.length;
+      } catch (err) {
+        const reason = String(err?.message ?? err);
+        const allowed = /^(texture_unavailable|dynamic_ring_or_padding|custom_filter_or_blend|custom_shader|animated_texture|translucent_token|invalid_sprite_geometry|renderer_unavailable|invalid_sprite_bounds|invalid_sprite_snapshot|invalid_sprite_encoding|catalog_budget)$/;
+        unsupportedTokens.push({tokenId, reason: allowed.test(reason) ? reason : "snapshot_failed"});
+      }
+    }
+    for (const key of avatarRasterCache.keys()) if (!usedKeys.has(key)) avatarRasterCache.delete(key);
+    for (const key of avatarContentIds.keys()) if (!usedContents.has(key)) avatarContentIds.delete(key);
+    const payload = {type: "avatarCatalog", schemaVersion: 1, sceneId, catalogId: avatarCatalogId,
+      method: "isolated-token-sprite-v1", viewTransform,
+      status: templates.length > 0 || !unsupportedTokens.length ? "available" : "unsupported",
+      templates, unsupportedTokens};
+    const signature = JSON.stringify(payload);
+    if (socket !== ws || socket.readyState !== WebSocket.OPEN || canvas.scene?.id !== sceneId || epoch !== avatarCatalogEpoch) return false;
+    if (signature === avatarCatalogSignature) {
+      if (force && avatarCatalogLastPayload) sendToPython(avatarCatalogLastPayload);
+      return false;
+    }
+    avatarCatalogSignature = signature;
+    avatarCatalogLastPayload = {...payload, revision: ++avatarCatalogRevision, capturedAtEpochMs: Date.now()};
+    sendToPython(avatarCatalogLastPayload);
+    return true;
+  } catch (err) {
+    // Catalog support is optional. A failed extraction never interrupts the
+    // camera/reference stream and never permits a stale catalog to keep vetoing.
+    if (socket === ws && socket.readyState === WebSocket.OPEN
+        && canvas.scene?.id === sceneId && epoch === avatarCatalogEpoch) {
+      const payload = {type: "avatarCatalog", schemaVersion: 1, sceneId, catalogId: avatarCatalogId,
+        revision: ++avatarCatalogRevision, method: "isolated-token-sprite-v1", viewTransform: null,
+        capturedAtEpochMs: Date.now(), status: "unsupported", templates: [], unsupportedTokens: [],
+        reason: "catalog_capture_failed"};
+      avatarCatalogLastPayload = payload;
+      avatarCatalogSignature = null;
+      sendToPython(payload);
+    }
+    return false;
+  } finally {avatarCatalogBusy = false;}
+}
+
 function stopReferenceCapture() {
   if (referenceCaptureTimer) clearInterval(referenceCaptureTimer);
   referenceCaptureTimer = null;
@@ -1411,7 +1670,10 @@ function buildViewTransformPayload(type = "viewTransform") {
 
 function sendViewTransform() {
   const payload = buildViewTransformPayload();
-  if (payload) sendToPython(payload);
+  if (payload) {
+    sendToPython(payload);
+    scheduleAvatarCatalogRefresh();
+  }
 }
 
 function sendSceneAndView() {
@@ -2112,6 +2374,10 @@ async function handlePythonMessage(data, socket = ws) {
     setReferenceCapture(Boolean(data.enabled));
     return;
   }
+  if (type === "avatarCatalogGet") {
+    captureAvatarCatalog({force: true});
+    return;
+  }
   if (type === "captureStatus") {
     await handleCaptureStatus(data);
     return;
@@ -2232,6 +2498,7 @@ function dispatchPythonMessage(data, socket) {
 function connectToPython() {
   if (!game.user.isGM) return;
   cancelPendingSceneVisualChange();
+  resetAvatarCatalog();
   const url = "ws://127.0.0.1:8765";
   const previous = ws;
   ws = null;
@@ -2256,12 +2523,13 @@ function connectToPython() {
     clearTimers();
     setStatus("connected");
     socket.send(JSON.stringify({type: "hello", source: "foundry-sarween", protocolVersion: 2,
-      physicalGridControls: true, vttControls: true}));
+      physicalGridControls: true, vttControls: true, avatarCatalog: true}));
     vttControlsRequested = true;
     if (testSequenceTargets.length) sendTestSequence();
     sendSceneAndView();
     sendPhysicalGridState();
     sendVttState();
+    captureAvatarCatalog({force: true});
     heartbeatTimer = setInterval(() => {
       if (socket === ws && socket.readyState === WebSocket.OPEN) {
         sendToPython({type: "ping", ts: Date.now()});
@@ -2277,6 +2545,7 @@ function connectToPython() {
     if (socket !== ws) return;
     clearTimers();
     stopReferenceCapture();
+    resetAvatarCatalog();
     ws = null;
     assignmentRequests = [];
     vttControlsRequested = false;
@@ -2319,6 +2588,7 @@ Hooks.once("ready", () => {
 
 Hooks.on("canvasReady", () => {
   cancelPendingSceneVisualChange();
+  resetAvatarCatalog();
   clearMovementSelection();
   if (captureIsActive()) stopGuidedCapture("sceneChanged");
   assignmentRequests = assignmentRequests.filter(request => request.sceneId === canvas?.scene?.id);
@@ -2335,6 +2605,7 @@ Hooks.on("canvasReady", () => {
     sendSceneAndView();
     sendPhysicalGridState();
     sendVttState();
+    captureAvatarCatalog({force: true});
   }, 50);
 });
 
@@ -2366,6 +2637,7 @@ Hooks.on("canvasPan", () => {
 
 Hooks.on("canvasTearDown", () => {
   cancelPendingSceneVisualChange();
+  resetAvatarCatalog({publish: true});
   if (gridLabelRenderTimer) clearTimeout(gridLabelRenderTimer);
   gridLabelRenderTimer = null;
   removeGridLabels();
@@ -2385,11 +2657,34 @@ Hooks.on("controlToken", (token, controlled) => {
 
 Hooks.on("updateToken", (document, changes, options = {}) => {
   recordSelectedMovement(document, changes, options);
+  const keys = Object.keys(changes);
+  if (avatarTokenIsCurrent(document) && avatarArtworkUpdateNeedsRefresh(document, changes)) {
+    const waitForDraw = keys.some(key => /^(actorId|actorLink|texture\.src|ring\.enabled|ring\.subject\.texture)$/.test(key))
+      || (changes.texture && "src" in changes.texture)
+      || (changes.ring && ("enabled" in changes.ring || changes.ring.subject && "texture" in changes.ring.subject));
+    invalidateAvatarCatalog({tokenId: document.id, waitForDraw: Boolean(waitForDraw)});
+  }
   if (Object.keys(changes).some(key => /^(x|y|rotation|elevation|hidden|width|height|sight|light)(\.|$)/.test(key))) {
     tokenVisualChanged(document, options.sarweenSource ? "sarweenTokenMove" : "tokenUpdated", {commandId: options.sarweenCommandId});
   }
   if (Object.keys(changes).some(key => /^(name|actorId|width|height|sight)(\.|$)/.test(key))) {
     sendSceneAndView(); sendVttState();
+  }
+});
+
+Hooks.on("drawToken", token => {
+  if (!avatarTokenIsCurrent(token)) return;
+  avatarCatalogPendingDraws.delete(token?.document?.id ?? token?.id);
+  scheduleAvatarCatalogRefresh();
+});
+
+Hooks.on("refreshToken", (token, flags = {}) => {
+  if (!avatarTokenIsCurrent(token)) return;
+  if (["refresh", "refreshMesh", "refreshSize", "refreshRotation", "refreshShader", "refreshState",
+       "refreshVisibility", "refreshRingVisuals"].some(key => flags[key])) {
+    const tokenId = token?.document?.id ?? token?.id;
+    if (!avatarCatalogPendingDraws.has(tokenId)) avatarCatalogPendingRefreshes.delete(tokenId);
+    scheduleAvatarCatalogRefresh();
   }
 });
 
@@ -2399,12 +2694,18 @@ Hooks.on("sightRefresh", perceptionRefreshed);
 Hooks.on("lightingRefresh", perceptionRefreshed);
 
 Hooks.on("deleteToken", document => {
+  if (avatarTokenIsCurrent(document)) {
+    avatarCatalogPendingDraws.delete(document.id);
+    avatarCatalogPendingRefreshes.delete(document.id);
+    invalidateAvatarCatalog();
+  }
   if (movementState?.tokenId === document?.id) clearMovementSelection();
   sendSceneAndView(); sendVttState();
   tokenVisualChanged(document, "tokenDeleted");
 });
 
 Hooks.on("createToken", document => {
+  if (avatarTokenIsCurrent(document)) invalidateAvatarCatalog({tokenId: document.id, waitForDraw: true});
   sendSceneAndView(); sendVttState();
   tokenVisualChanged(document, "tokenCreated");
 });

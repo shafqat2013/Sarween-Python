@@ -1523,6 +1523,8 @@ def begin_session(on_mini_moved, camera_index=None, show_windows=True, *, access
                             frame_index=bundle.frame_idx, calibration=sess.camera_calibration_metadata(),
                             registration=getattr(bundle, "registration_metadata", None),
                             metadata={"reference_status": reference_status,
+                                      "avatar_catalog": (fo.get_latest_avatar_catalog()
+                                          if hasattr(fo, "get_latest_avatar_catalog") else None),
                                       "camera_source": deepcopy(getattr(bundle, "camera_source_metadata", None)),
                                       "scene_visual_revision": delivery_evidence["scene_visual_change"]["revision"],
                                       **delivery_evidence})

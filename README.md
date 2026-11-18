@@ -399,8 +399,14 @@ searches check for unexplained objects. Local-only checks cannot update the
 whole background. Unexplained extra rings preserve uncertainty instead of being
 silently absorbed into the map. This rejects the recorded smaller purple avatar;
 it does not establish that arbitrary screen artwork can never resemble a ring.
-Avatar artwork is not blanket-masked, and no avatar-template exclusion is
-currently applied. Fog tracking still requires a fresh live acceptance test.
+An experimental artwork filter automatically caches small isolated Foundry
+avatar images. When ring observations compete, it can reject a strong match to
+exposed artwork before single-mover inference. It requires spatial-pattern,
+color and footprint agreement; a token location is never blanket-masked. Missing,
+unsupported or uncertain artwork leaves the physical tracker unchanged. Several
+saved camera examples still produce no artwork verdict. See the
+[artwork filter evidence and limits](docs/AVATAR_ARTWORK_FILTER_2026-11-18.md).
+Fog tracking still requires a fresh live acceptance test.
 
 The control panel's `Mini Library` button opens the player-mini roster. It shows
 all five planned ring colors, whether each mini has a usable tracker profile,

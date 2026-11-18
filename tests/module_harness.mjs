@@ -101,6 +101,7 @@ export async function createModuleHarness() {
       getMovement() {return movementState;},
       handlePythonMessage, dispatchPythonMessage, connectToPython, promptCaptureTarget, vttState,
       captureRenderedReference, setReferenceCapture,
+      captureAvatarCatalog, resetAvatarCatalog,
       buildViewTransformPayload, sendViewTransform,
     };`, {context});
   await module.link(specifier => {

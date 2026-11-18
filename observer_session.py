@@ -284,7 +284,8 @@ class LiveObserverController:
                                      superseded_display_commands=metadata.get("superseded_display_commands", ()),
                                      confirmed_command_ids=metadata.get("confirmed_command_ids", ()),
                                      unchanged_command_ids=metadata.get("unchanged_command_ids", ()),
-                                     scene_visual_change=metadata.get("scene_visual_change"))
+                                     scene_visual_change=metadata.get("scene_visual_change"),
+                                     avatar_catalog=metadata.get("avatar_catalog"))
         self._pending_display_commands.clear()
         self._pending_superseded_commands.clear()
         self._last_processed_timestamp = timestamp

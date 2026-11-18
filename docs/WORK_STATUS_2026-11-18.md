@@ -41,9 +41,10 @@ remain separate; live fog acceptance is still pending.
 - The maintained [backlog](BACKLOG.md) and [parked list](PARKED.md) distinguish
   implemented features awaiting acceptance, planned work and optional research.
 
-Automatic avatar-artwork rejection is not implemented. A manual comparison of
-one rendered avatar against three saved camera frames separated it from the
-physical rings, but it is only a proof of the additional candidate check.
+Automatic avatar-artwork rejection is absent from this frozen checkpoint.
+Subsequent experimental development is separate on `codex/avatar-artwork-filter`;
+see its [implementation and validation](AVATAR_ARTWORK_FILTER_2026-11-18.md).
+That work does not alter the candidate or Working V1 recovery references.
 
 ## Evidence and limits
 

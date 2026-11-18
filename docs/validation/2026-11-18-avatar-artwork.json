@@ -1,0 +1,183 @@
+{
+  "date": "2026-11-18",
+  "timezone": "Asia/Bangkok",
+  "kind": "experimental automatic avatar rejection; offline validation only",
+  "branch": "codex/avatar-artwork-filter",
+  "base_commit": "4a32746a27cdd2643ac7f719a71db4c57d5642dd",
+  "fresh_live_hardware_test": false,
+  "software_checks": {
+    "python": {
+      "command": "python -m unittest discover -s tests -p 'test_*.py'",
+      "run": 1382,
+      "skipped": 18,
+      "failures": 0,
+      "errors": 0,
+      "duration_seconds": 218.74
+    },
+    "javascript": {
+      "command": "node --experimental-vm-modules --test tests/test_*.mjs",
+      "node_version": "25.1.0",
+      "run": 100,
+      "passed": 100,
+      "failures": 0
+    },
+    "final_provenance_check": {
+      "change": "Add reference_health.py to recorded engine fingerprints; no algorithm changes after full Python run",
+      "journal_tests_run": 41,
+      "failures": 0,
+      "additional_manifest_assertion_passed": true
+    },
+    "git_diff_check": "passed"
+  },
+  "saved_movement_regression": {
+    "frames": 868,
+    "reviewed_moves": 15,
+    "matched_moves": 15,
+    "missed_moves": 0,
+    "unmatched_events": 0,
+    "cases": [
+      {
+        "case": "working",
+        "frames": 303,
+        "reviewed_moves": 7,
+        "matched_moves": 7,
+        "missed_moves": 0,
+        "unmatched_events": 0,
+        "avatar_catalog_input_frames": 0,
+        "avatar_matcher_ready_frames": 0,
+        "avatar_matcher_applied_frames": 0,
+        "source_sha256": {
+          "poc_ring_detector.py": "3810a654231608b6f51f57ba63ed77feac5d2bb5fa29b927807f81cd69324b6d",
+          "single_mover_state.py": "d5c7d654e8b7982d7adf7fb1d369c20c85394b2c94d95bb6a4dcbd23eeecb330",
+          "poc_scene_reference.py": "8fab6009e0eb4527266ea7e6f62c1f643ded7a8384c482b3915dfff7bc8f0650",
+          "avatar_artwork.py": "0e3a04b36f5ad08e37f2be8383abe9e5dbb97fa2a5a2ad13ae1c4622c1f58bd3",
+          "reference_health.py": "fdc35d9476fefa46790ca63d86f40b4740e076932bbb94cc0d8a35ae9d307553",
+          "avatar_catalog.py": "4289134f50510d796792f292c1e6bdd859c988bc8a2f49d4c780fde360b9ed71",
+          "observer_engine.py": "300b5933b5b8a0f465555f31f7fcb7794a7dbede3f10dd641a21ebea64ff18b0",
+          "annular_ring_detector.py": "c002e2a327fe83793f9ff02bfedb7e75c61208a3f0a6f739528b6cd0e97e8e88",
+          "hybrid_ring_detector.py": "39aad5f673768e75ac8937056db773f7fcdf33fb115dfbe4ed724ee71e900d85"
+        }
+      },
+      {
+        "case": "failure1",
+        "frames": 457,
+        "reviewed_moves": 6,
+        "matched_moves": 6,
+        "missed_moves": 0,
+        "unmatched_events": 0,
+        "avatar_catalog_input_frames": 0,
+        "avatar_matcher_ready_frames": 0,
+        "avatar_matcher_applied_frames": 0,
+        "source_sha256": {
+          "poc_ring_detector.py": "3810a654231608b6f51f57ba63ed77feac5d2bb5fa29b927807f81cd69324b6d",
+          "single_mover_state.py": "d5c7d654e8b7982d7adf7fb1d369c20c85394b2c94d95bb6a4dcbd23eeecb330",
+          "poc_scene_reference.py": "8fab6009e0eb4527266ea7e6f62c1f643ded7a8384c482b3915dfff7bc8f0650",
+          "avatar_artwork.py": "0e3a04b36f5ad08e37f2be8383abe9e5dbb97fa2a5a2ad13ae1c4622c1f58bd3",
+          "reference_health.py": "fdc35d9476fefa46790ca63d86f40b4740e076932bbb94cc0d8a35ae9d307553",
+          "avatar_catalog.py": "4289134f50510d796792f292c1e6bdd859c988bc8a2f49d4c780fde360b9ed71",
+          "observer_engine.py": "300b5933b5b8a0f465555f31f7fcb7794a7dbede3f10dd641a21ebea64ff18b0",
+          "annular_ring_detector.py": "c002e2a327fe83793f9ff02bfedb7e75c61208a3f0a6f739528b6cd0e97e8e88",
+          "hybrid_ring_detector.py": "39aad5f673768e75ac8937056db773f7fcdf33fb115dfbe4ed724ee71e900d85"
+        }
+      },
+      {
+        "case": "failure2",
+        "frames": 108,
+        "reviewed_moves": 2,
+        "matched_moves": 2,
+        "missed_moves": 0,
+        "unmatched_events": 0,
+        "avatar_catalog_input_frames": 0,
+        "avatar_matcher_ready_frames": 0,
+        "avatar_matcher_applied_frames": 0,
+        "source_sha256": {
+          "poc_ring_detector.py": "3810a654231608b6f51f57ba63ed77feac5d2bb5fa29b927807f81cd69324b6d",
+          "single_mover_state.py": "d5c7d654e8b7982d7adf7fb1d369c20c85394b2c94d95bb6a4dcbd23eeecb330",
+          "poc_scene_reference.py": "8fab6009e0eb4527266ea7e6f62c1f643ded7a8384c482b3915dfff7bc8f0650",
+          "avatar_artwork.py": "0e3a04b36f5ad08e37f2be8383abe9e5dbb97fa2a5a2ad13ae1c4622c1f58bd3",
+          "reference_health.py": "fdc35d9476fefa46790ca63d86f40b4740e076932bbb94cc0d8a35ae9d307553",
+          "avatar_catalog.py": "4289134f50510d796792f292c1e6bdd859c988bc8a2f49d4c780fde360b9ed71",
+          "observer_engine.py": "300b5933b5b8a0f465555f31f7fcb7794a7dbede3f10dd641a21ebea64ff18b0",
+          "annular_ring_detector.py": "c002e2a327fe83793f9ff02bfedb7e75c61208a3f0a6f739528b6cd0e97e8e88",
+          "hybrid_ring_detector.py": "39aad5f673768e75ac8937056db773f7fcdf33fb115dfbe4ed724ee71e900d85"
+        }
+      }
+    ],
+    "scope": "Historical exact-camera-input regression only; all 868 frames have no catalog, matcher never ready or applied. This does not establish improvement from avatar filtering, closed-loop delivery, fog tracking, or live behavior. Parallel runs are not used for performance claims."
+  },
+  "independent_artwork_fixtures": {
+    "cases": 48,
+    "assets": [
+      "aura.svg",
+      "eye.svg",
+      "mystery-man.svg",
+      "skull.svg",
+      "sword.svg",
+      "target.svg"
+    ],
+    "eligible_exposed": 8,
+    "eligible_exposed_rejected": 7,
+    "physical_or_occluded_false_rejections": 0,
+    "unrelated_physical_false_rejections": 0,
+    "six_templates_loaded_together": "same outcome, no budget exhaustion in these two-candidate fixtures",
+    "scope": "Synthetic composites made from actual Foundry SVG artwork; not a physical accuracy estimate."
+  },
+  "isolated_camera_probe": {
+    "frames": 7,
+    "exposed_frames": 5,
+    "exposed_rejected": 1,
+    "exposed_retained_unknown": 4,
+    "physical_false_rejections": 0,
+    "manual_template_crop": false,
+    "manual_candidate_center_selection": false,
+    "ring_verifier_bypassed": true,
+    "template_metadata_source": "Testing scene-specific token records; current recorded-world snapshot, historic appearance inferred",
+    "scope": "Independent matcher only; historical frames do not contain module-exported catalogs. The existing strict ring gate already rejects these avatars."
+  },
+  "limits": [
+    "Actual SVG-derived automatic source matches 1 of 5 exposed camera frames; four abstain. No physical false rejection in seven selected camera frames. Historical texture metadata is inferred from current scene records, not recorded catalog state.",
+    "Synthetic composites provide 7/8 eligible exposed rejects and zero physical/occluded/other-ring rejects across 48 cases, both single-template and six-template catalogs; not live accuracy.",
+    "Shared 96-comparison budget may skip later candidates in larger catalogs. Safe abstention, but not full catalog coverage guarantee.",
+    "No new physical test, no current iPhone/TV feed, no new fog-of-war loop was exercised."
+  ],
+  "operational_notes": [
+    "No camera, TV, live Foundry world, or installed app/module was changed during this task.",
+    "New source app and matching reloaded Foundry module required for automatic catalog support.",
+    "Stationary/ordinary one-departure frames skip artwork comparison; ambiguous checks have a shared 96-comparison cap.",
+    "Matching requires footprint, color, and full-pattern support; uncertain or partial matches are retained.",
+    "Scene/view/connection changes, corrupt snapshots and conflicting revisions clear artwork authority.",
+    "Journal catalogs are content-addressed inputs with byte budgets, tamper checks, and a four-entry replay cache."
+  ],
+  "preserved_recovery_refs": {
+    "working_v1": {
+      "branch": "codex/working-v1",
+      "tag": "working-v1-2026-11-09",
+      "commit": "5745cd66bdf5c13b840a3605e8b4d77ac4694861"
+    },
+    "candidate": {
+      "branch": "codex/ring-tracking-candidate-2026-11-18",
+      "tag": "ring-tracking-candidate-2026-11-18",
+      "commit": "4a32746a27cdd2643ac7f719a71db4c57d5642dd"
+    },
+    "unchanged": true
+  },
+  "code_sha256": {
+    "module.js": "41cd72820d9f1e4cba10d373916dfcf43879bdfe178cac92ca3ebe1a8781e521",
+    "foundryoutput.py": "6e34b93a1f536b2982a5e2e406300b173e0c087dfbc1949edf7bbc6c442274f2",
+    "avatar_catalog.py": "4289134f50510d796792f292c1e6bdd859c988bc8a2f49d4c780fde360b9ed71",
+    "avatar_artwork.py": "0e3a04b36f5ad08e37f2be8383abe9e5dbb97fa2a5a2ad13ae1c4622c1f58bd3",
+    "observer_engine.py": "300b5933b5b8a0f465555f31f7fcb7794a7dbede3f10dd641a21ebea64ff18b0",
+    "observer_session.py": "b4cdcc3c6b5e89d88f60a97f4119728706c60a1e8b383af2e18697df04af0954",
+    "observer_journal.py": "53a838f218a45a07c4b486b184df5a9f57c91d4234f977eb7862a1b9535e49ed",
+    "v3_tracking.py": "607658ec1be76310961539179330ca8e8285559fc03bd062adbde87a18a8d7b1",
+    "reference_health.py": "fdc35d9476fefa46790ca63d86f40b4740e076932bbb94cc0d8a35ae9d307553"
+  },
+  "local_audit_sha256": {
+    "validation-summary.json": "5fa46ecc0aaa7bf32cdea5c9166a78b47d8df696980d175c7dcf2272c8a4b024",
+    "matcher-fixture-results.json": "aec33ae87d822656a6cc3b9de92e8e80c7a28ad01082de3b850c5746082e3b20",
+    "real-matcher-results.json": "800614c2827d3adbacb885da1a13cac459c628afadde2b68a212f678486a3f84",
+    "multi-template-fixture-results.json": "e95368928aa36fb1853198ec4fcdac6da48edf105170604fbd5533f1912619a0",
+    "engine-cache-probe-fixed.json": "08726220356534ff74d507b929be9d75cf0b3aca0f7269c71cd354d35bd92291",
+    "catalog-cache-cost.json": "681eb91fc525328a2501c432fe69603428819ff4464ce971e68dbfe7da8b7620"
+  }
+}

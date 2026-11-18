@@ -149,7 +149,7 @@ test("local Foundry changes, get requests, and scene readiness synchronize deskt
   h.sent.length = 0;
   await h.hooks.get("canvasReady")();
   await h.flushTimers();
-  assert.equal(h.sent.at(-1).type, "physicalGridState");
+  assert.equal(h.sent.findLast(message => message.type === "physicalGridState").ready, true);
   h.scene.grid.size = 0;
   h.hooks.get("updateScene")(h.scene, {grid: {size: 0}});
   assert.equal(h.sent.findLast(message => message.type === "physicalGridState").ready, false);
@@ -159,9 +159,8 @@ test("connection advertises support and sends current state after the normal han
   const h = await harness();
   h.api.connectToPython();
   h.sockets.at(-1).onopen();
-  assert.deepEqual(h.sent[0], {type: "hello", source: "foundry-sarween", protocolVersion: 2, physicalGridControls: true, vttControls: true});
-  assert.equal(h.sent.at(-1).type, "vttState");
-  assert.equal(h.sent.at(-1).settings.displayDiagonalInches, 55);
+  assert.deepEqual(h.sent[0], {type: "hello", source: "foundry-sarween", protocolVersion: 2, physicalGridControls: true, vttControls: true, avatarCatalog: true});
+  assert.equal(h.sent.findLast(message => message.type === "vttState").settings.displayDiagonalInches, 55);
 });
 
 test("queued edits retain wire order and commands from an obsolete connection are discarded", async () => {

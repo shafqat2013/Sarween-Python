@@ -17,6 +17,7 @@ import json
 import marshal
 import math
 from pathlib import Path
+import re
 import time
 
 import cv2
@@ -24,11 +25,13 @@ import numpy as np
 
 from observer_engine import BoardGeometry, ObserverEngine, draw_observer_frame, DISPLAY_TRANSITION_POLICIES
 from app_paths import resource_path
+from avatar_catalog import MAX_CATALOG_BYTES
 
 
 ENGINE_SOURCES = ("observer_engine.py", "poc_ring_detector.py", "poc_scene_reference.py",
                   "single_mover_state.py", "annular_ring_detector.py", "hybrid_ring_detector.py",
-                  "watermark_detection.py")
+                  "watermark_detection.py", "avatar_catalog.py", "avatar_artwork.py",
+                  "reference_health.py")
 ENGINE_ASSETS = ("assets/watermarks/obs-caption-center.png",
                  "assets/watermarks/obs-caption-left.png")
 
@@ -98,6 +101,7 @@ class ObserverJournal:
         self.folder.mkdir(parents=True, exist_ok=False)
         (self.folder / "inputs").mkdir()
         self.frames = self.bytes = 0
+        self._catalog_assets = {}
         self.first_timestamp = None
         self.last_timestamp = None
         self.closed = False
@@ -107,7 +111,7 @@ class ObserverJournal:
                          "code_sha256": code_fingerprints, "frames": 0, "complete": False,
                          "foundry_token_output": bool(initialization.get("foundry_token_output", False)),
                          "scope": "recorded observer interval only",
-                         "byte_count_scope": "PNG and JSONL frame payloads; excludes manifest",
+                         "byte_count_scope": "PNG, avatar catalog assets and JSONL frame payloads; excludes manifest",
                          "limits": {"seconds": self.max_seconds, "bytes": self.max_bytes}}
         _save_json(self.folder / "manifest.json", self.manifest)
         self._inputs = (self.folder / "inputs.jsonl").open("w")
@@ -148,6 +152,26 @@ class ObserverJournal:
                  "metadata": deepcopy(metadata or {})}
         decision_line = canonical(record) + "\n"
         packets = []
+        catalog_asset = None
+        catalog = entry["metadata"].get("avatar_catalog")
+        if isinstance(catalog, dict):
+            # Immutable catalog snapshots are recording inputs, not a lookup
+            # into whichever Foundry world happens to be open during replay.
+            # Hash the actual input even when a caller supplies a claimed
+            # immutable ID. Raw/offline snapshots need not have passed through
+            # the relay, and changing their pixels must never reuse old input.
+            # This only serializes small assets; it never decodes PNG pixels.
+            data = canonical(catalog).encode()
+            if len(data) > MAX_CATALOG_BYTES:
+                raise ValueError("Observer avatar catalog exceeds the input size limit")
+            digest = hashlib.sha256(data).hexdigest()
+            descriptor = self._catalog_assets.get(digest)
+            if descriptor is None:
+                relative = f"avatars/{digest}.json"
+                descriptor = {"kind": "avatar-catalog-asset", "path": relative, "sha256": digest}
+                packets.append((relative, data))
+                catalog_asset = digest, descriptor
+            entry["metadata"]["avatar_catalog"] = descriptor
         for name, pixels in (("board", board), ("mask", mask)):
             ok, encoded = cv2.imencode(".png", pixels, [cv2.IMWRITE_PNG_COMPRESSION, 1])
             if not ok:
@@ -164,7 +188,14 @@ class ObserverJournal:
             self.close("recordingLimit")
             return False
         for relative, data in packets:
-            (self.folder / relative).write_bytes(data)
+            path = self.folder / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        if catalog_asset is not None:
+            key, descriptor = catalog_asset
+            if len(self._catalog_assets) >= 256:
+                self._catalog_assets.pop(next(iter(self._catalog_assets)))
+            self._catalog_assets[key] = descriptor
         self._inputs.write(input_line)
         self._decisions.write(decision_line)
         self._inputs.flush()
@@ -200,6 +231,50 @@ def _read_pixels(folder, entry, name):
     if pixels is None:
         raise ValueError(f"Observer {name} image cannot be decoded")
     return pixels
+
+
+def _read_avatar_catalog(folder, metadata, cache):
+    catalog = metadata.get("avatar_catalog")
+    if not isinstance(catalog, dict) or catalog.get("kind") != "avatar-catalog-asset":
+        return catalog
+    relative = catalog.get("path")
+    digest = catalog.get("sha256")
+    if (set(catalog) != {"kind", "path", "sha256"}
+            or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or not isinstance(relative, str) or relative != f"avatars/{digest}.json"):
+        raise ValueError("Observer avatar catalog descriptor is invalid")
+    folder = Path(folder).resolve()
+    path = (folder / relative).resolve()
+    if not path.is_relative_to(folder):
+        raise ValueError("Observer avatar catalog must stay inside its recording")
+    try:
+        stat = path.stat()
+        if not path.is_file():
+            raise ValueError("Observer avatar catalog asset is not a file")
+        if stat.st_size > MAX_CATALOG_BYTES:
+            raise ValueError("Observer avatar catalog exceeds the input size limit")
+        signature = stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+        cached = cache.get(digest)
+        if cached is not None and cached["signature"] == signature:
+            cache.pop(digest)
+            cache[digest] = cached
+            return cached["catalog"]
+        # A bounded read remains safe if an asset grows after its stat check.
+        with path.open("rb") as stream:
+            data = stream.read(MAX_CATALOG_BYTES + 1)
+        if len(data) > MAX_CATALOG_BYTES:
+            raise ValueError("Observer avatar catalog exceeds the input size limit")
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise ValueError("Observer avatar catalog fingerprint differs")
+        value = json.loads(data)
+        if not isinstance(value, dict):
+            raise ValueError("Observer avatar catalog asset must be a JSON object")
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Observer avatar catalog asset is missing or unreadable") from exc
+    if digest not in cache and len(cache) >= 4:
+        cache.pop(next(iter(cache)))
+    cache[digest] = {"signature": signature, "catalog": value}
+    return value
 
 
 def _resolve_detector(initialization):
@@ -368,6 +443,7 @@ def replay_journal(folder, *, require_same_code=True, write_preview=False,
     if not math.isfinite(time_limit) or time_limit <= 0 or duration > time_limit:
         raise ValueError("Observer input timestamps exceed the declared recording interval")
     discrepancies, elapsed = [], []
+    avatar_catalogs = {}
     output = Path(output_folder).resolve() if output_folder is not None else folder
     output.mkdir(parents=True, exist_ok=True)
     preview = _PreviewWriter(output, engine.geometry) if write_preview else None
@@ -386,6 +462,7 @@ def replay_journal(folder, *, require_same_code=True, write_preview=False,
                                     confirmed_command_ids=metadata.get("confirmed_command_ids", ()),
                                     unchanged_command_ids=metadata.get("unchanged_command_ids", ()),
                                     scene_visual_change=metadata.get("scene_visual_change"),
+                                    avatar_catalog=_read_avatar_catalog(folder, metadata, avatar_catalogs),
                                     geometry_key=entry.get("geometry_key"), frame_index=entry.get("frame_index"))
             elapsed.append((time.perf_counter() - started) * 1000)
             if index >= len(decisions) or canonical(record) != canonical(decisions[index]):

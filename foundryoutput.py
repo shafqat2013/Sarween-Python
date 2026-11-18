@@ -17,6 +17,7 @@ from guided_capture import GuidedCapture, regression_case
 from foundry_delivery import MoveOutbox
 from foundry_service import validated_scene_info
 from app_paths import atomic_write_json, data_path, initialize_user_data
+from avatar_catalog import validate_avatar_catalog
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Foundry configuration
@@ -107,6 +108,8 @@ _timeline_last_signature: str | None = None
 _reference_capture_lock = threading.Lock()
 _rendered_reference_status_entry: dict | None = None
 _latest_rendered_reference: dict | None = None
+_avatar_catalog_lock = threading.RLock()
+_avatar_catalog_state = {}
 _capture_lock = threading.Lock()
 _capture_session: GuidedCapture | None = None
 _capture_commands = deque()
@@ -189,6 +192,8 @@ def set_scene_params(scene_id=None, scene_w=None, scene_h=None, grid_px=None, sh
     )
 
     SCENE_ID = new_scene_id
+    if new_scene_id != previous_scene_id:
+        _reset_avatar_catalog()
     SCENE_W  = new_w
     SCENE_H  = new_h
     GRID_PX  = new_grid_px
@@ -1044,6 +1049,114 @@ def record_delivery_event(data):
             })
 
 
+def _reset_avatar_catalog(*, supported=None):
+    """Drop optional artwork authority across scene/connection generations."""
+    with _avatar_catalog_lock:
+        enabled = (_avatar_catalog_state.get("supported", False)
+                   if supported is None else bool(supported))
+        epoch = _avatar_catalog_state.get("epoch", 0) + 1
+        _avatar_catalog_state.clear()
+        _avatar_catalog_state.update(supported=enabled, epoch=epoch,
+                                     generation=_connection_generation, latest=None,
+                                     highWater=None, conflicted=None)
+
+
+def _avatar_catalog_connection_ready():
+    return bool(_active_socket is not None and _protocol_ready and _connection_ready
+                and SCENE_ID and _scene_info_generation == _connection_generation
+                and isinstance(_connection_scene_info, dict)
+                and _connection_scene_info.get("sceneId") == SCENE_ID
+                and _avatar_catalog_state.get("supported")
+                and _avatar_catalog_state.get("generation") == _connection_generation)
+
+
+def get_latest_avatar_catalog() -> dict | None:
+    """Copy the scene's validated static artwork, without claiming alignment.
+
+    Assets have no wall-clock age limit. The decoder must still match their
+    captured geometry to the current view before using their expected sizes.
+    """
+    with _avatar_catalog_lock:
+        latest = _avatar_catalog_state.get("latest")
+        if (not _avatar_catalog_connection_ready() or latest is None
+                or latest["sceneId"] != SCENE_ID):
+            return None
+        return copy.deepcopy(latest)
+
+
+def record_avatar_catalog(payload: dict) -> bool:
+    """Accept a bounded scene snapshot; optional failures only clear artwork.
+
+    Revision conflicts cannot revive an earlier image under the same version.
+    A later revision or a fresh catalog may establish new optional evidence.
+    """
+    with _avatar_catalog_lock:
+        if not _avatar_catalog_connection_ready():
+            return False
+        scene_id, generation = SCENE_ID, _connection_generation
+        epoch = _avatar_catalog_state["epoch"]
+        high_water = _avatar_catalog_state.get("highWater")
+        if (isinstance(payload, dict) and high_water is not None
+                and payload.get("catalogId") == high_water[0]
+                and isinstance(payload.get("revision"), int)
+                and not isinstance(payload["revision"], bool)
+                and payload["revision"] < high_water[1]):
+            return False
+    if isinstance(payload, dict) and payload.get("sceneId") not in (None, scene_id):
+        return False
+    try:
+        catalog = validate_avatar_catalog(payload, scene_id=scene_id)
+    except (ValueError, TypeError, OverflowError):
+        with _avatar_catalog_lock:
+            if (epoch == _avatar_catalog_state.get("epoch")
+                    and generation == _connection_generation and scene_id == SCENE_ID):
+                _avatar_catalog_state["latest"] = None
+                high_water = _avatar_catalog_state.get("highWater")
+                if high_water is not None:
+                    _avatar_catalog_state["conflicted"] = high_water[:2]
+        return False
+    with _avatar_catalog_lock:
+        if (not _avatar_catalog_connection_ready() or epoch != _avatar_catalog_state.get("epoch")
+                or generation != _connection_generation or scene_id != SCENE_ID):
+            return False
+        high_water = _avatar_catalog_state.get("highWater")
+        version = catalog["catalogId"], catalog["revision"]
+        if high_water is not None and high_water[0] == version[0]:
+            if version[1] < high_water[1]:
+                return False
+            if version[1] == high_water[1]:
+                if (catalog["contentSha256"] != high_water[2]
+                        or _avatar_catalog_state.get("conflicted") == version):
+                    _avatar_catalog_state.update(latest=None, conflicted=version)
+                    return False
+        _avatar_catalog_state.update(
+            latest=catalog if catalog["status"] == "available" else None,
+            highWater=(*version, catalog["contentSha256"]), conflicted=None)
+        return True
+
+
+def _queue_avatar_catalog_get():
+    with _avatar_catalog_lock:
+        if not _avatar_catalog_connection_ready():
+            return
+        scene_id, generation = SCENE_ID, _connection_generation
+        socket, queue, loop = _active_socket, _ctrl_queue, _loop
+    if queue is None or loop is None or loop.is_closed():
+        return
+
+    def enqueue():
+        with _avatar_catalog_lock:
+            if (not _avatar_catalog_connection_ready() or socket is not _active_socket
+                    or queue is not _ctrl_queue or scene_id != SCENE_ID
+                    or generation != _connection_generation):
+                return
+            queue.put_nowait({"type": "avatarCatalogGet", "sceneId": scene_id})
+    try:
+        loop.call_soon_threadsafe(enqueue)
+    except RuntimeError:
+        pass  # Optional artwork never affects the physical tracker or relay.
+
+
 def get_rendered_reference_status() -> dict:
     """Read evidence health, including source-clock age and geometry mismatch.
 
@@ -1804,6 +1917,11 @@ async def ctrl_loop(websocket):
         msg = await _ctrl_queue.get()
         if msg.get("type") == "miniTap" and observation_only():
             continue
+        if msg.get("type") == "avatarCatalogGet":
+            with _avatar_catalog_lock:
+                if (not _avatar_catalog_connection_ready() or websocket is not _active_socket
+                        or msg.get("sceneId") != SCENE_ID):
+                    continue
         if msg.get("type") == "vttCommand":
             with _vtt_lock:
                 pending = _vtt_state.get("pending")
@@ -1867,6 +1985,7 @@ async def recv_loop(websocket):
                 _connection_error = "" if _protocol_ready else "Reload Foundry: updated Sarween module required"
                 _reset_physical_grid(supported=_protocol_ready and data.get("physicalGridControls") is True)
                 _reset_vtt(supported=_protocol_ready and data.get("vttControls") is True)
+                _reset_avatar_catalog(supported=_protocol_ready and data.get("avatarCatalog") is True)
                 if _physical_grid_state["supported"]:
                     queue_control({"type": "physicalGridGet"})
                 if _vtt_state["supported"]:
@@ -1938,6 +2057,10 @@ async def recv_loop(websocket):
             _connection_scene_info = validated_scene_info(data)
             _scene_info_generation = (_connection_generation
                                       if _connection_scene_info is not None else None)
+            if _connection_scene_info is None or not _connection_ready:
+                _reset_avatar_catalog()
+            else:
+                _queue_avatar_catalog_get()
             if _connection_ready and _physical_grid_state.get("supported"):
                 queue_control({"type": "physicalGridGet"})
             if _connection_ready and _vtt_state.get("supported"):
@@ -1961,6 +2084,9 @@ async def recv_loop(websocket):
 
         elif msg_type == "renderedReferenceStatus":
             record_rendered_reference_status(data)
+
+        elif msg_type == "avatarCatalog":
+            record_avatar_catalog(data)
 
         elif msg_type == "sceneVisualChanged":
             if data.get("sceneId") not in (None, SCENE_ID):
@@ -2014,6 +2140,7 @@ async def handler(websocket):
     _connection_error = ""
     _reset_physical_grid()
     _reset_vtt()
+    _reset_avatar_catalog(supported=False)
     _assign_queue = asyncio.Queue()
     _ctrl_queue = asyncio.Queue()
     _delivery.retry(reconnect=True)
@@ -2040,6 +2167,7 @@ async def handler(websocket):
         _connection_ready = _protocol_ready = False
         _reset_physical_grid()
         _reset_vtt()
+        _reset_avatar_catalog(supported=False)
         with _capture_lock:
             if _capture_session is not None:
                 _capture_commands.append({"action": "stop", "reason": "disconnected"})
